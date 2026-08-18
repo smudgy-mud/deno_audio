@@ -2,10 +2,49 @@
 name = "deno_audio"
 version = "0.0.1"
 edition = "2021"
+rust-version = "1.91"
+publish = false
 license = "MIT"
-description = "Web Audio API extension for deno_core. Under active development; this release reserves the crate name."
+description = "Web Audio API extension for deno_core, currently in a compatibility-spike phase."
+repository = "https://github.com/smudgy-mud/deno_audio"
 keywords = ["deno", "webaudio", "audio"]
 categories = ["multimedia::audio"]
-include = ["/src", "/README.md", "/LICENSE"]
+include = [
+  "/src",
+  "/research",
+  "/tests",
+  "/CHANGELOG.md",
+  "/CONTRIBUTING.md",
+  "/deny.toml",
+  "/LICENSE",
+  "/README.md",
+  "/SECURITY.md",
+  "/THIRD_PARTY_NOTICES.md",
+]
+
+[features]
+default = ["cpal"]
+cpal = ["web-audio-api/cpal"]
+cpal-jack = ["cpal", "web-audio-api/cpal-jack"]
+cpal-pipewire = ["cpal", "web-audio-api/cpal-pipewire"]
+cpal-asio = ["cpal", "web-audio-api/cpal-asio"]
+cubeb = ["web-audio-api/cubeb"]
+diagnostics = ["web-audio-api/diagnostics"]
+
+[dependencies]
+deno_core = "=0.410.0"
+deno_error = "=0.7.1"
+deno_web = "=0.288.0"
+deno_webidl = "=0.257.0"
+serde_v8 = "=0.319.0"
+web-audio-api = { git = "https://github.com/smudgy-mud/web-audio-api-rs", rev = "2af21af6ff2bbee17201b2dd2a5ebc56f55c3511", default-features = false }
+
+[dev-dependencies]
+trybuild = "=1.0.116"
+web-audio-api = { git = "https://github.com/smudgy-mud/web-audio-api-rs", rev = "2af21af6ff2bbee17201b2dd2a5ebc56f55c3511", default-features = false, features = ["diagnostics"] }
 
 [workspace]
+resolver = "2"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }

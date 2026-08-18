@@ -1,0 +1,13 @@
+error[E0603]: module `io` is private
+  --> $DIR/output_backend_module_is_private.rs:1:20
+   |
+ 1 | use web_audio_api::io::AudioBackendManager;
+   |                    ^^  ------------------- trait `AudioBackendManager` is not publicly re-exported
+   |                    |
+   |                    private module
+   |
+note: the module `io` is defined here
+  --> $DIR/lib.rs:59:1
+   |
+59 | mod io;
+   | ^^^^^^
