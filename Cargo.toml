@@ -1,0 +1,11 @@
+[package]
+name = "deno_audio"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "Web Audio API extension for deno_core. Under active development; this release reserves the crate name."
+keywords = ["deno", "webaudio", "audio"]
+categories = ["multimedia::audio"]
+include = ["/src", "/README.md", "/LICENSE"]
+
+[workspace]
