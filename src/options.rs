@@ -29,6 +29,7 @@ pub struct AudioLimits {
     max_offline_render_jobs: Option<usize>,
     max_graph_nodes: Option<usize>,
     max_scheduled_sources: Option<usize>,
+    max_queued_control_commands: Option<usize>,
     max_queued_events: Option<usize>,
 }
 
@@ -49,6 +50,7 @@ impl Default for AudioLimits {
             max_offline_render_jobs: Some(2),
             max_graph_nodes: Some(1024),
             max_scheduled_sources: Some(512),
+            max_queued_control_commands: Some(256),
             max_queued_events: Some(256),
         }
     }
@@ -71,6 +73,7 @@ impl AudioLimits {
             max_offline_render_jobs: None,
             max_graph_nodes: None,
             max_scheduled_sources: None,
+            max_queued_control_commands: None,
             max_queued_events: None,
         }
     }
@@ -159,6 +162,14 @@ impl AudioLimits {
         self
     }
 
+    /// Sets the maximum number of queued or in-flight exact graph-control commands for this
+    /// isolate. Commands staged while a context is suspended remain charged.
+    #[must_use]
+    pub const fn max_queued_control_commands(mut self, limit: Option<usize>) -> Self {
+        self.max_queued_control_commands = limit;
+        self
+    }
+
     /// Sets the maximum number of queued native event records for this isolate.
     #[must_use]
     pub const fn max_queued_events(mut self, limit: Option<usize>) -> Self {
@@ -212,6 +223,10 @@ impl AudioLimits {
 
     pub(crate) const fn scheduled_sources(&self) -> Option<usize> {
         self.max_scheduled_sources
+    }
+
+    pub(crate) const fn queued_control_commands(&self) -> Option<usize> {
+        self.max_queued_control_commands
     }
 
     pub(crate) const fn queued_events(&self) -> Option<usize> {

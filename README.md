@@ -12,7 +12,11 @@ work, offline rendering, shared `AudioHost` accounting, online lifecycle
 ownership, render-death handling, scheduled-source reconciliation, and bounded
 off-thread decoding. Exact oscillator graph nodes are reserved against both
 isolate and shared-host ceilings before native construction and remain charged
-through physical source retirement. A bounded fake process mixer additionally
+through physical source retirement. Its seven-command construction batch and
+one-command Start/Stop batches likewise reserve isolate and shared-host capacity
+before wrapper or native mutation, remain charged while suspended or in flight,
+and release only with typed rollback or off-render-thread batch reclamation. A
+bounded fake process mixer additionally
 proves that two isolated hosted graphs and a native input can share one
 physical-output owner without coupling their clocks or retirement. It does not
 install Web Audio globals and is not ready for application use. These private
@@ -28,9 +32,9 @@ The research baseline is deliberately locked to one compatibility set:
 - `deno_error` 0.7.1
 - `serde_v8` 0.319.0
 - the Smudgy `web-audio-api` fork at commit
-  `dd83ee6530136a71caff97da06269302f129cb09` (the reviewed hosted-output
-  compatibility stack plus the fixed scheduled-source saturation capacity,
-  based on 1.7.0)
+  `c7244534cbc28992b0b2c8c88a3e647061b7a215` (the reviewed hosted-output
+  compatibility stack plus fixed scheduled-source capacity and opaque graph-node/control-command
+  reservation lifetimes, including the permanent hosted bootstrap, based on 1.7.0)
 
 The Deno crates move as a coordinated tuple. Upgrade them together in one
 reviewed change, and keep `Cargo.lock` committed so Phase 0 evidence remains
@@ -73,7 +77,11 @@ private Phase 0D proof surface uses this same ownership shape. Decode requests
 reserve their encoded copy, concurrent job, result dimensions, and every
 wrapper-owned PCM allocation before spawning or growing. Offline render
 requests likewise reserve dimensions, output PCM, and a job slot before native
-context construction. These objects remain available only through unsafe native
+context construction. The finite per-isolate command default covers the 21-command permanent
+graph bootstrap and every currently exposed user graph batch, including suspended staging.
+Lifecycle barriers and mandatory teardown records remain governed by their separate bounded
+upstream channels so cleanup never depends on user quota. These objects
+remain available only through unsafe native
 exposure in tests and are not a supported JavaScript API.
 
 The engine revision is currently available only in the maintainer's local fork

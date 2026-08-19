@@ -11,10 +11,14 @@ use web_audio_api::context::{
     AudioContext, AudioContextBuildError, AudioContextBuildErrorKind, AudioContextLifecycleError,
     AudioContextOptions, AudioContextShutdownOutcome, AudioContextShutdownReceipt,
     AudioContextState, AudioContextStateChangeOutcome, AudioContextStateChangeReceipt,
+    AudioControlBatchReservation,
 };
 use web_audio_api::output::AudioOutputFactory;
 
-use crate::host::{release_atomic, AudioHost, AudioHostLimitError, AudioHostOnlineContextPermit};
+use crate::host::{
+    release_atomic, AudioHost, AudioHostLimitError, AudioHostOnlineContextPermit,
+    AudioHostReservation, AudioHostResourceKind,
+};
 use crate::options::{AudioLimits, AudioPermissions};
 use crate::scheduled::ContextEventHub;
 
@@ -28,6 +32,7 @@ pub(crate) struct AudioRuntimeState {
     offline_render_jobs: AtomicUsize,
     graph_nodes: AtomicUsize,
     scheduled_sources: AtomicUsize,
+    queued_control_commands: AtomicUsize,
     queued_events: AtomicUsize,
 }
 
@@ -48,6 +53,7 @@ impl AudioRuntimeState {
             offline_render_jobs: AtomicUsize::new(0),
             graph_nodes: AtomicUsize::new(0),
             scheduled_sources: AtomicUsize::new(0),
+            queued_control_commands: AtomicUsize::new(0),
             queued_events: AtomicUsize::new(0),
         }
     }
@@ -91,6 +97,32 @@ impl AudioRuntimeState {
         self.try_reserve_resource(IsolateResourceKind::QueuedEvents, 1)
     }
 
+    pub(crate) fn try_reserve_queued_control_commands(
+        self: &Arc<Self>,
+        amount: usize,
+    ) -> Result<IsolateReservation, JsErrorBox> {
+        self.try_reserve_resource(IsolateResourceKind::QueuedControlCommands, amount)
+    }
+
+    pub(crate) fn try_reserve_control_commands(
+        self: &Arc<Self>,
+        amount: usize,
+    ) -> Result<ControlCommandReservations, JsErrorBox> {
+        let isolate = self.try_reserve_queued_control_commands(amount)?;
+        let host = self
+            .host
+            .try_reserve(AudioHostResourceKind::QueuedControlCommands, amount)
+            .map_err(|error| {
+                JsErrorBox::range_error(format!(
+                    "AudioHost queued graph-control command limit exceeded: {error}"
+                ))
+            })?;
+        Ok(ControlCommandReservations {
+            _isolate: isolate,
+            _host: host,
+        })
+    }
+
     fn try_reserve_resource(
         self: &Arc<Self>,
         resource: IsolateResourceKind,
@@ -114,6 +146,11 @@ impl AudioRuntimeState {
                 &self.scheduled_sources,
                 self.limits.scheduled_sources(),
                 "scheduled source",
+            ),
+            IsolateResourceKind::QueuedControlCommands => (
+                &self.queued_control_commands,
+                self.limits.queued_control_commands(),
+                "queued graph-control command",
             ),
             IsolateResourceKind::QueuedEvents => (
                 &self.queued_events,
@@ -196,6 +233,7 @@ enum IsolateResourceKind {
     OfflineRenderJobs,
     GraphNodes,
     ScheduledSources,
+    QueuedControlCommands,
     QueuedEvents,
 }
 
@@ -205,6 +243,11 @@ pub(crate) struct IsolateReservation {
     amount: usize,
 }
 
+pub(crate) struct ControlCommandReservations {
+    _isolate: IsolateReservation,
+    _host: AudioHostReservation,
+}
+
 impl Drop for IsolateReservation {
     fn drop(&mut self) {
         let counter = match self.resource {
@@ -212,6 +255,7 @@ impl Drop for IsolateReservation {
             IsolateResourceKind::OfflineRenderJobs => &self.runtime.offline_render_jobs,
             IsolateResourceKind::GraphNodes => &self.runtime.graph_nodes,
             IsolateResourceKind::ScheduledSources => &self.runtime.scheduled_sources,
+            IsolateResourceKind::QueuedControlCommands => &self.runtime.queued_control_commands,
             IsolateResourceKind::QueuedEvents => &self.runtime.queued_events,
         };
         release_atomic(counter, self.amount);
@@ -421,6 +465,10 @@ impl NativePhase0OnlineContext {
             .host
             .try_reserve_online_context()
             .map_err(|error| map_host_limit(&error))?;
+        let initial_control_reservation =
+            AudioControlBatchReservation::new(runtime.try_reserve_control_commands(
+                web_audio_api::context::AudioContextBuilder::INITIAL_GRAPH_CONTROL_COMMAND_COUNT,
+            )?);
         let (observer_sender, observer_join) = spawn_lifecycle_observer()?;
 
         let options = exact_context_options(sample_rate);
@@ -430,6 +478,7 @@ impl NativePhase0OnlineContext {
                 .number_of_channels(2)
                 .initially_suspended(initially_suspended)
                 .diagnostic_label("deno_audio online context")
+                .initial_control_reservation(initial_control_reservation)
                 .build()
         }));
 

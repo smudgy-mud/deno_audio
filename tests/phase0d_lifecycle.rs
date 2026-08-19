@@ -20,6 +20,27 @@ struct CountingSystemFactory {
     system: SystemAudioOutput,
 }
 
+struct CommandObservingFactory {
+    calls: Arc<AtomicUsize>,
+    observed_commands: Arc<AtomicUsize>,
+    host: Arc<AudioHost>,
+    system: SystemAudioOutput,
+}
+
+impl AudioOutputFactory for CommandObservingFactory {
+    fn prepare(
+        &self,
+        request: &AudioOutputRequest,
+    ) -> Result<Box<dyn PreparedAudioOutput>, AudioOutputError> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        self.observed_commands.store(
+            self.host.usage().queued_control_commands(),
+            Ordering::Release,
+        );
+        self.system.prepare(request)
+    }
+}
+
 impl CountingSystemFactory {
     fn new(calls: Arc<AtomicUsize>) -> Self {
         Self {
@@ -179,6 +200,94 @@ async fn shared_host_rejects_before_construction_and_releases_only_after_shutdow
     assert_eq!(host.usage().online_contexts(), 1);
     drop(second);
     wait_until(|| host.usage().online_contexts() == 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn magic_control_batch_reserves_before_factory_and_refuses_without_leaking() {
+    const MAGIC_COMMANDS: usize =
+        web_audio_api::context::AudioContextBuilder::INITIAL_GRAPH_CONTROL_COMMAND_COUNT;
+
+    let host = Arc::new(AudioHost::new(
+        AudioHostLimits::default().max_queued_control_commands(Some(MAGIC_COMMANDS)),
+    ));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::new(AtomicUsize::new(0));
+    let mut accepted = runtime_with_limits(
+        Arc::clone(&host),
+        Arc::new(CommandObservingFactory {
+            calls: Arc::clone(&calls),
+            observed_commands: Arc::clone(&observed),
+            host: Arc::clone(&host),
+            system: SystemAudioOutput::new(),
+        }),
+        AudioLimits::default().max_queued_control_commands(Some(MAGIC_COMMANDS)),
+    );
+    construct(&mut accepted, "magicControlContext");
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    assert_eq!(observed.load(Ordering::Acquire), MAGIC_COMMANDS);
+    assert_eq!(host.usage().queued_control_commands(), 0);
+    close(&mut accepted, "magicControlContext").await;
+    wait_until(|| host.usage().online_contexts() == 0);
+
+    let isolate_calls = Arc::new(AtomicUsize::new(0));
+    let isolate_host = Arc::new(AudioHost::default());
+    let mut isolate_refused = runtime_with_limits(
+        Arc::clone(&isolate_host),
+        Arc::new(CountingSystemFactory::new(Arc::clone(&isolate_calls))),
+        AudioLimits::default().max_queued_control_commands(Some(MAGIC_COMMANDS - 1)),
+    );
+    isolate_refused
+        .execute_script(
+            "phase0d_magic_isolate_refusal.js",
+            r#"
+              for (let attempt = 0; attempt < 2; attempt++) {
+                let refused = false;
+                try {
+                  new Deno.core.ops.NativePhase0OnlineContext(48000, false);
+                } catch (error) {
+                  refused = String(error).includes(
+                    "per-isolate queued graph-control command limit",
+                  );
+                }
+                if (!refused) throw new Error("magic isolate refusal was not typed");
+              }
+            "#,
+        )
+        .expect("magic admission must lose the isolate budget before factory invocation");
+    assert_eq!(isolate_calls.load(Ordering::Acquire), 0);
+    assert_eq!(isolate_host.usage().online_contexts(), 0);
+    assert_eq!(isolate_host.usage().queued_control_commands(), 0);
+
+    let host_calls = Arc::new(AtomicUsize::new(0));
+    let limited_host = Arc::new(AudioHost::new(
+        AudioHostLimits::default().max_queued_control_commands(Some(MAGIC_COMMANDS - 1)),
+    ));
+    let mut host_refused = runtime_with_limits(
+        Arc::clone(&limited_host),
+        Arc::new(CountingSystemFactory::new(Arc::clone(&host_calls))),
+        AudioLimits::default().max_queued_control_commands(Some(MAGIC_COMMANDS)),
+    );
+    host_refused
+        .execute_script(
+            "phase0d_magic_host_refusal.js",
+            r#"
+              for (let attempt = 0; attempt < 2; attempt++) {
+                let refused = false;
+                try {
+                  new Deno.core.ops.NativePhase0OnlineContext(48000, false);
+                } catch (error) {
+                  refused = String(error).includes(
+                    "AudioHost queued graph-control command limit",
+                  );
+                }
+                if (!refused) throw new Error("magic host refusal was not typed");
+              }
+            "#,
+        )
+        .expect("host refusal must release each partially acquired isolate reservation");
+    assert_eq!(host_calls.load(Ordering::Acquire), 0);
+    assert_eq!(limited_host.usage().online_contexts(), 0);
+    assert_eq!(limited_host.usage().queued_control_commands(), 0);
 }
 
 struct UnconfirmedPrepared {
@@ -796,4 +905,249 @@ async fn per_isolate_graph_node_budget_rejects_before_a_second_oscillator() {
 
     close(&mut runtime, "isolateGraphContext").await;
     wait_until(|| host.usage().graph_nodes() == 0 && host.usage().scheduled_sources() == 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one end-to-end test must retain both isolates through saturation, rollback, and recovery"
+)]
+async fn suspended_control_commands_are_shared_retained_and_recovered_across_isolates() {
+    let host = Arc::new(AudioHost::new(
+        AudioHostLimits::default()
+            .max_graph_nodes(Some(21))
+            .max_scheduled_sources(Some(7))
+            .max_queued_control_commands(Some(44)),
+    ));
+    let mut first = runtime(Arc::clone(&host), Arc::new(SystemAudioOutput::new()));
+    construct_with_state(&mut first, "firstControlContext", true);
+    first
+        .execute_script(
+            "phase0d_first_suspended_commands.js",
+            r"
+              globalThis.__firstControlSources = Array.from(
+                { length: 3 },
+                () => new Deno.core.ops.NativePhase0Oscillator(
+                  globalThis.firstControlContext,
+                ),
+              );
+              globalThis.__firstControlSources[0].schedule(0, 0.01);
+            ",
+        )
+        .expect("three constructors plus one start/stop pair should reserve 23 commands");
+    assert_eq!(host.usage().queued_control_commands(), 23);
+    assert_eq!(host.usage().graph_nodes(), 9);
+    assert_eq!(host.usage().scheduled_sources(), 3);
+
+    let second_limits = AudioLimits::default()
+        .max_graph_nodes(Some(12))
+        .max_scheduled_sources(Some(4))
+        .max_queued_control_commands(Some(28));
+    let mut second = runtime_with_limits(
+        Arc::clone(&host),
+        Arc::new(SystemAudioOutput::new()),
+        second_limits,
+    );
+    construct_with_state(&mut second, "secondControlContext", true);
+    second
+        .execute_script(
+            "phase0d_shared_control_rejection.js",
+            r#"
+              globalThis.__secondControlSources = Array.from(
+                { length: 3 },
+                () => new Deno.core.ops.NativePhase0Oscillator(
+                  globalThis.secondControlContext,
+                ),
+              );
+              for (let attempt = 0; attempt < 2; attempt++) {
+                let rejected = false;
+                try {
+                  new Deno.core.ops.NativePhase0Oscillator(globalThis.secondControlContext);
+                } catch (error) {
+                  rejected = String(error).includes(
+                    "AudioHost queued graph-control command limit",
+                  );
+                }
+                if (!rejected) {
+                  throw new Error("shared suspended command budget did not reject");
+                }
+              }
+            "#,
+        )
+        .expect("both attempts should release partial isolate admission before returning");
+    assert_eq!(host.usage().queued_control_commands(), 44);
+    assert_eq!(host.usage().graph_nodes(), 18);
+    assert_eq!(host.usage().scheduled_sources(), 6);
+    drop(second);
+    wait_until(|| {
+        let usage = host.usage();
+        usage.queued_control_commands() == 23
+            && usage.graph_nodes() == 9
+            && usage.scheduled_sources() == 3
+    });
+
+    first
+        .execute_script(
+            "phase0d_resume_control_context.js",
+            r"
+              globalThis.__firstControlResume = Deno.core.ops.op_phase0_online_resume(
+                globalThis.firstControlContext,
+              ).then((state) => {
+                if (state !== 0) throw new Error(`unexpected resume outcome ${state}`);
+                globalThis.__firstControlResumed = true;
+              });
+            ",
+        )
+        .expect("Resume should own the staged command flush");
+    first
+        .run_event_loop(deno_core::PollEventLoopOptions::default())
+        .await
+        .expect("Resume should apply every staged batch");
+    wait_until(|| host.usage().queued_control_commands() == 0);
+
+    close(&mut first, "firstControlContext").await;
+    wait_until(|| {
+        let usage = host.usage();
+        usage.queued_control_commands() == 0
+            && usage.graph_nodes() == 0
+            && usage.scheduled_sources() == 0
+            && usage.online_contexts() == 0
+    });
+
+    let mut recovered = runtime(Arc::clone(&host), Arc::new(SystemAudioOutput::new()));
+    construct_with_state(&mut recovered, "recoveredControlContext", true);
+    recovered
+        .execute_script(
+            "phase0d_recovered_control_constructor.js",
+            r#"
+              globalThis.__recoveredControlSource = new Deno.core.ops.NativePhase0Oscillator(
+                globalThis.recoveredControlContext,
+              );
+              if (globalThis.__recoveredControlSource.sourceId !== 1) {
+                throw new Error("rejected construction consumed a wrapper source identity");
+              }
+            "#,
+        )
+        .expect("off-render-thread reclamation should restore the shared command budget");
+    assert_eq!(host.usage().queued_control_commands(), 7);
+    assert_eq!(host.usage().graph_nodes(), 3);
+    assert_eq!(host.usage().scheduled_sources(), 1);
+
+    close(&mut recovered, "recoveredControlContext").await;
+    wait_until(|| {
+        let usage = host.usage();
+        usage.queued_control_commands() == 0
+            && usage.graph_nodes() == 0
+            && usage.scheduled_sources() == 0
+            && usage.online_contexts() == 0
+    });
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn isolate_control_refusal_precedes_schedule_state_and_close_extracts_staging() {
+    let host = Arc::new(AudioHost::new(
+        AudioHostLimits::default()
+            .max_graph_nodes(Some(9))
+            .max_scheduled_sources(Some(3))
+            .max_queued_control_commands(Some(23)),
+    ));
+    let limits = AudioLimits::default().max_queued_control_commands(Some(22));
+    let mut runtime = runtime_with_limits(
+        Arc::clone(&host),
+        Arc::new(SystemAudioOutput::new()),
+        limits,
+    );
+    construct_with_state(&mut runtime, "isolateControlContext", true);
+    runtime
+        .execute_script(
+            "phase0d_isolate_control_refusal.js",
+            r#"
+              globalThis.__isolateControlSources = Array.from(
+                { length: 3 },
+                () => new Deno.core.ops.NativePhase0Oscillator(
+                  globalThis.isolateControlContext,
+                ),
+              );
+              for (let attempt = 0; attempt < 2; attempt++) {
+                let rejected = false;
+                try {
+                  globalThis.__isolateControlSources[0].schedule(0, 0.01);
+                } catch (error) {
+                  rejected = String(error).includes(
+                    "per-isolate queued graph-control command limit",
+                  );
+                }
+                if (!rejected) {
+                  throw new Error("isolate command limit did not reject before schedule state");
+                }
+              }
+            "#,
+        )
+        .expect("both attempts should see budget refusal rather than duplicate-start state");
+    assert_eq!(host.usage().queued_control_commands(), 21);
+    assert_eq!(host.usage().graph_nodes(), 9);
+    assert_eq!(host.usage().scheduled_sources(), 3);
+
+    close(&mut runtime, "isolateControlContext").await;
+    wait_until(|| {
+        let usage = host.usage();
+        usage.queued_control_commands() == 0
+            && usage.graph_nodes() == 0
+            && usage.scheduled_sources() == 0
+            && usage.online_contexts() == 0
+    });
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn host_control_refusal_precedes_schedule_state_and_releases_partial_isolate_reservation() {
+    let host = Arc::new(AudioHost::new(
+        AudioHostLimits::default()
+            .max_graph_nodes(Some(9))
+            .max_scheduled_sources(Some(3))
+            .max_queued_control_commands(Some(22)),
+    ));
+    let mut runtime = runtime_with_limits(
+        Arc::clone(&host),
+        Arc::new(SystemAudioOutput::new()),
+        AudioLimits::default().max_queued_control_commands(Some(23)),
+    );
+    construct_with_state(&mut runtime, "hostControlContext", true);
+    runtime
+        .execute_script(
+            "phase0d_host_control_refusal.js",
+            r#"
+              globalThis.__hostControlSources = Array.from(
+                { length: 3 },
+                () => new Deno.core.ops.NativePhase0Oscillator(
+                  globalThis.hostControlContext,
+                ),
+              );
+              for (let attempt = 0; attempt < 2; attempt++) {
+                let rejected = false;
+                try {
+                  globalThis.__hostControlSources[0].schedule(0, 0.01);
+                } catch (error) {
+                  rejected = String(error).includes(
+                    "AudioHost queued graph-control command limit",
+                  );
+                }
+                if (!rejected) {
+                  throw new Error("host command limit did not reject before schedule state");
+                }
+              }
+            "#,
+        )
+        .expect("host refusal should roll back each already-acquired isolate reservation");
+    assert_eq!(host.usage().queued_control_commands(), 21);
+    assert_eq!(host.usage().graph_nodes(), 9);
+    assert_eq!(host.usage().scheduled_sources(), 3);
+
+    close(&mut runtime, "hostControlContext").await;
+    wait_until(|| {
+        let usage = host.usage();
+        usage.queued_control_commands() == 0
+            && usage.graph_nodes() == 0
+            && usage.scheduled_sources() == 0
+            && usage.online_contexts() == 0
+    });
 }

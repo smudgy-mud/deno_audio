@@ -49,8 +49,8 @@ new contract. A green baseline suite alone is not evidence of readiness.
 
 ## Selected production fork
 
-Phase 0B selected reviewed fork commit
-`dd83ee6530136a71caff97da06269302f129cb09`. It retains the upstream package
+The current Phase 0 dependency is reviewed fork commit
+`c7244534cbc28992b0b2c8c88a3e647061b7a215`. It retains the upstream package
 name and the legacy behavior characterized above while adding a public hosted
 `AudioContext` builder, bounded exact lifecycle/control ownership, a public
 `AudioOutputFactory`, and `SystemAudioOutput` implementations for the silent,
@@ -106,6 +106,7 @@ the ownership model that the public `WebIDL` facade will use:
 | Render death | `phase0d_lifecycle::render_callback_death_poison_closes_and_releases_after_acknowledgement` | A callback protocol death occurs without V8 access, closes the context through the same native lifecycle, rejects later resume, and releases the permit only after confirmed teardown. |
 | Cross-isolate bytes | `phase0d_lifecycle::shared_audio_bytes_exhaust_and_recover_across_isolates` | Canonical and exposed `AudioBuffer` bytes reserve both per-isolate and shared counters before allocation; a second isolate is rejected while the first remains live and recovers after destruction. |
 | Graph-node lifetime | `phase0d_lifecycle::{per_isolate_graph_node_budget_rejects_before_a_second_oscillator,shared_graph_node_budget_rejects_before_oscillator_construction_and_recovers}` | The exact oscillator's three native nodes reserve isolate and shared-host capacity before upstream construction. Both ceilings reject without consuming wrapper identity; confirmed source/context retirement returns the represented node count to zero and permits a later isolate to construct. |
+| Queued/in-flight graph control | `phase0d_lifecycle::{magic_control_batch_reserves_before_factory_and_refuses_without_leaking,suspended_control_commands_are_shared_retained_and_recovered_across_isolates,isolate_control_refusal_precedes_schedule_state_and_close_extracts_staging,host_control_refusal_precedes_schedule_state_and_releases_partial_isolate_reservation}` | The permanent 21-command graph bootstrap reserves both counters before the output factory and releases after prepublication application. The exact seven-command oscillator constructor and two one-command schedule mutations reserve before wrapper/native mutation; suspended batches retain their charges through renderer/GC ownership. Shared and isolate refusal leave graph/source/schedule state unchanged, Resume reclaims applied batches, and confirmed Close extracts staged work back to zero. |
 | Lossy ended reconciliation | `phase0d_lifecycle::saturated_scheduled_sources_dispatch_once_or_release_on_close` | Three hundred exact oscillators end at one common render quantum while the isolate is blocked. The native wake queue stays bounded at 256, one reconciliation dispatches a unique bounded batch from authoritative completion tokens, and confirmed close releases every undispatched root and reservation. |
 | Decode dimensions and PCM | `phase0d_decode::every_decode_dimension_and_pcm_stage_refuses_and_recovers` | Channel, cumulative-frame, logical-sample, canonical chunk, overlapping final assembly, and source-plus-target resampling reservations each reject at the fork's preallocation boundary; every outer byte/job reservation returns to zero. |
 | Decode input and jobs | `phase0d_decode::encoded_job_corrupt_and_canceled_requests_release_all_reservations` | Encoded bytes and a decode-job slot are reserved before the single owned copy or blocking spawn. Oversize, concurrent-job refusal, corrupt input, and a discarded JavaScript waiter all leave the isolate responsive and release the represented resources. |

@@ -8,7 +8,7 @@ use std::time::Duration;
 use deno_core::unsync::spawn_blocking;
 use deno_core::{op2, v8, GarbageCollected};
 use deno_error::JsErrorBox;
-use web_audio_api::context::AudioNodeLifetimeReservation;
+use web_audio_api::context::{AudioControlBatchReservation, AudioNodeLifetimeReservation};
 use web_audio_api::node::{
     AudioScheduledSourceNode as _, AudioScheduledSourceNodeExt as _, OscillatorNode,
 };
@@ -24,6 +24,10 @@ const RECONCILE_INTERVAL: Duration = Duration::from_millis(25);
 // The reviewed exact oscillator transaction creates the oscillator plus its
 // frequency and detune AudioParams as three independently reclaimed graph nodes.
 const OSCILLATOR_GRAPH_NODE_COST: usize = 3;
+// Register frequency, initial frequency, register detune, initial detune, register oscillator,
+// and the two hidden parameter-owner edges form one exact construction batch.
+const OSCILLATOR_CONSTRUCTION_COMMAND_COST: usize = 7;
+const OSCILLATOR_SCHEDULE_COMMAND_COST: usize = 2;
 
 struct NativeEventWake {
     _source_id: u64,
@@ -140,13 +144,18 @@ impl ContextEventHub {
             .map_err(|error| {
                 JsErrorBox::range_error(format!("AudioHost graph-node limit exceeded: {error}"))
             })?;
+        let construction_commands = self
+            .runtime
+            .try_reserve_control_commands(OSCILLATOR_CONSTRUCTION_COMMAND_COST)?;
         let native_context = context.native_context()?;
         let graph_lifetime = AudioNodeLifetimeReservation::new(GraphNodeReservations {
             _isolate: isolate_graph_nodes,
             _host: host_graph_nodes,
         });
+        let construction_commands = AudioControlBatchReservation::new(construction_commands);
         let oscillator = match panic::catch_unwind(AssertUnwindSafe(move || {
-            native_context.create_oscillator_with_lifetime_reservation(graph_lifetime)
+            native_context
+                .create_oscillator_with_reservations(graph_lifetime, construction_commands)
         })) {
             Ok(oscillator) => oscillator,
             Err(payload) => {
@@ -313,6 +322,7 @@ impl Drop for ContextEventHub {
 pub(crate) struct NativePhase0Oscillator {
     root: Arc<ScheduledSourceRoot>,
     context: Arc<NativeOnlineContextState>,
+    runtime: Arc<AudioRuntimeState>,
 }
 
 // SAFETY: the object contains no V8 or CppGC pointers. Native source ownership
@@ -336,6 +346,7 @@ impl NativePhase0Oscillator {
         Ok(NativePhase0Oscillator {
             root: hub.register_oscillator(context)?,
             context: context.lifecycle_state(),
+            runtime: Arc::clone(&hub.runtime),
         })
     }
 
@@ -356,7 +367,26 @@ impl NativePhase0Oscillator {
                 "scheduled source times must be finite, nonnegative, and ordered",
             ));
         }
-        if self.root.scheduled.swap(true, Ordering::AcqRel) {
+        if self.root.scheduled.load(Ordering::Acquire) {
+            return Err(JsErrorBox::generic(
+                "scheduled source has already been started",
+            ));
+        }
+        let control_commands = self
+            .runtime
+            .try_reserve_control_commands(OSCILLATOR_SCHEDULE_COMMAND_COST)?;
+        // Preallocate both opaque attachments before publishing scheduled=true. A panic cannot
+        // leave wrapper state changed without complete reservation owners ready for both exact
+        // runtime batches.
+        let shared_reservation = Arc::new(control_commands);
+        let start_reservation = AudioControlBatchReservation::new(Arc::clone(&shared_reservation));
+        let stop_reservation = AudioControlBatchReservation::new(shared_reservation);
+        if self
+            .root
+            .scheduled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return Err(JsErrorBox::generic(
                 "scheduled source has already been started",
             ));
@@ -370,8 +400,12 @@ impl NativePhase0Oscillator {
             let payload = payload
                 .as_mut()
                 .ok_or_else(|| JsErrorBox::generic("scheduled source has retired"))?;
-            payload.oscillator.start_at(start_when);
-            payload.oscillator.stop_at(stop_when);
+            payload
+                .oscillator
+                .start_at_with_control_reservation(start_when, start_reservation);
+            payload
+                .oscillator
+                .stop_at_with_control_reservation(stop_when, stop_reservation);
             Ok::<(), JsErrorBox>(())
         }));
         match result {
