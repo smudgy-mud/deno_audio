@@ -6,7 +6,7 @@ use std::sync::Arc;
 use deno_core::cppgc::GcCell;
 use deno_core::{op2, v8, GarbageCollected, OpState};
 use deno_error::JsErrorBox;
-use web_audio_api::{AudioBuffer, AudioBufferOptions, MAX_CHANNELS};
+use web_audio_api::{AudioBuffer, AudioBufferOptions, AudioBufferStorageLease, MAX_CHANNELS};
 
 use crate::host::{
     release_atomic, AudioHost, AudioHostLimitError, AudioHostReservation, AudioHostResourceKind,
@@ -221,10 +221,6 @@ impl v8::cppgc::Traced for NativeAudioBufferState {
 pub(crate) struct NativeAudioBuffer {
     state: GcCell<NativeAudioBufferState>,
     budget: Arc<NativeAudioByteBudget>,
-    // Decoded buffers carry their exact reservations inside the engine AudioBuffer's
-    // accounting lease so cheap native clones cannot outlive the charge. Constructed
-    // and rendered buffers retain the wrapper-owned reservation here instead.
-    _canonical_reservation: Option<NativeAudioByteReservation>,
 }
 
 // SAFETY: every V8 handle is a TracedReference inside `state`, and `trace`
@@ -420,10 +416,11 @@ fn check_sample(
 
 impl NativeAudioBuffer {
     pub(crate) fn from_canonical(
-        canonical: AudioBuffer,
+        mut canonical: AudioBuffer,
         budget: Arc<NativeAudioByteBudget>,
         canonical_reservation: NativeAudioByteReservation,
     ) -> Self {
+        canonical.attach_storage_lease(AudioBufferStorageLease::new(canonical_reservation));
         let channel_count = canonical.number_of_channels();
         Self {
             state: GcCell::new(NativeAudioBufferState {
@@ -431,7 +428,6 @@ impl NativeAudioBuffer {
                 exposed: (0..channel_count).map(|_| None).collect(),
             }),
             budget,
-            _canonical_reservation: Some(canonical_reservation),
         }
     }
 
@@ -446,7 +442,6 @@ impl NativeAudioBuffer {
                 exposed: (0..channel_count).map(|_| None).collect(),
             }),
             budget,
-            _canonical_reservation: None,
         }
     }
 }
@@ -472,7 +467,8 @@ impl NativeAudioBuffer {
             ))
         })?;
         let channel_count = options.number_of_channels;
-        let canonical = AudioBuffer::new(options);
+        let mut canonical = AudioBuffer::new(options);
+        canonical.attach_storage_lease(AudioBufferStorageLease::new(canonical_reservation));
 
         Ok(NativeAudioBuffer {
             state: GcCell::new(NativeAudioBufferState {
@@ -480,7 +476,6 @@ impl NativeAudioBuffer {
                 exposed: (0..channel_count).map(|_| None).collect(),
             }),
             budget,
-            _canonical_reservation: Some(canonical_reservation),
         })
     }
 
