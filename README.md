@@ -5,9 +5,11 @@ A [Web Audio API](https://webaudio.github.io/web-audio-api/) extension for
 standard Web Platform extensions, delegating DSP and rendering to
 the [Smudgy `web-audio-api-rs` fork](https://github.com/smudgy-mud/web-audio-api-rs).
 
-**Status: Phase 0 compatibility spike.** The crate currently provides only an
-empty extension and a runtime compatibility test. It does not install Web Audio
-globals and is not ready for application use.
+**Status: Phase 0 binding spike.** The native engine and both hosted-output
+paths have passed the Phase 0B acceptance gate. The crate still provides only an
+empty Deno extension: it does not install Web Audio globals and is not ready for
+application use. Phase 0C is proving the CppGC, `AudioBuffer`, asynchronous-work,
+and offline-rendering boundaries before the JavaScript surface is built.
 
 The research baseline is deliberately locked to one compatibility set:
 
@@ -17,7 +19,8 @@ The research baseline is deliberately locked to one compatibility set:
 - `deno_error` 0.7.1
 - `serde_v8` 0.319.0
 - the Smudgy `web-audio-api` fork at commit
-  `2af21af6ff2bbee17201b2dd2a5ebc56f55c3511` (currently the 1.7.0 baseline)
+  `2c2b260516a7557b5ee487bc89cc1dd08c048d35` (the reviewed hosted-output
+  compatibility stack based on 1.7.0)
 
 The Deno crates move as a coordinated tuple. Upgrade them together in one
 reviewed change, and keep `Cargo.lock` committed so Phase 0 evidence remains
@@ -27,10 +30,10 @@ The audio fork is intentionally a pinned Git dependency and has no separate
 crates.io identity. Consequently, functional `deno_audio` versions are consumed
 from this repository at an immutable tag or revision rather than from crates.io.
 
-The baseline engine compiles its complete Symphonia decoder set unconditionally:
+The selected engine compiles its complete Symphonia decoder set unconditionally:
 AAC, ADPCM, ALAC, FLAC, MPEG layers I/II/III, PCM, and Vorbis, with AIFF, CAF,
 ISO MP4/M4A, Matroska/WebM, Ogg, and WAV containers. These are native dependency
-capabilities, not a claim that the current empty extension exposes
+capabilities, not a claim that the current extension exposes
 `decodeAudioData`; supported JavaScript behavior will be documented as it lands.
 
 ## Development
@@ -47,8 +50,14 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo deny check
 ```
 
-The default feature selects CPAL. An offline/no-default-features configuration
-is still being evaluated and is not yet a supported configuration.
+The default feature selects CPAL. The dependency graph and hosted silent output
+also pass without default features; Phase 0C still has to prove the complete
+offline JavaScript path before that configuration is declared supported.
+
+The engine revision is currently available only in the maintainer's local fork
+history. A fresh external checkout cannot resolve the canonical Git dependency
+until that exact reviewed revision is published; no moving branch is an
+acceptable substitute.
 
 Phase 0 evidence is recorded in [`research/upstream-baseline.md`](research/upstream-baseline.md)
 and [`research/existing-deno-audio-packages.md`](research/existing-deno-audio-packages.md).

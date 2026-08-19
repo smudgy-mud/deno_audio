@@ -657,7 +657,6 @@ dependencies = [
  "deno_web",
  "deno_webidl",
  "serde_v8",
- "trybuild",
  "web-audio-api",
 ]
 
@@ -2935,12 +2934,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
-name = "target-triple"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3a6bfce3d99adfa72d24750a61f782f3036a81e7f86d8841ee1326deaebd171"
-
-[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2985,15 +2978,6 @@ dependencies = [
  "timezone_provider",
  "tinystr",
  "writeable",
-]
-
-[[package]]
-name = "termcolor"
-version = "1.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
-dependencies = [
- "winapi-util",
 ]
 
 [[package]]
@@ -3161,21 +3145,6 @@ checksum = "1ad61aed86bc3faea4300c7aee358b4c6d0c8d6ccc36524c96e4c92ccf26e77e"
 dependencies = [
  "num-integer",
  "strength_reduce",
-]
-
-[[package]]
-name = "trybuild"
-version = "1.0.116"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47c635f0191bd3a2941013e5062667100969f8c4e9cd787c14f977265d73616e"
-dependencies = [
- "glob",
- "serde",
- "serde_derive",
- "serde_json",
- "target-triple",
- "termcolor",
- "toml",
 ]
 
 [[package]]
@@ -3386,7 +3355,7 @@ dependencies = [
 [[package]]
 name = "web-audio-api"
 version = "1.7.0"
-source = "git+https://github.com/smudgy-mud/web-audio-api-rs?rev=2af21af6ff2bbee17201b2dd2a5ebc56f55c3511#2af21af6ff2bbee17201b2dd2a5ebc56f55c3511"
+source = "git+https://github.com/smudgy-mud/web-audio-api-rs?rev=2c2b260516a7557b5ee487bc89cc1dd08c048d35#2c2b260516a7557b5ee487bc89cc1dd08c048d35"
 dependencies = [
  "almost",
  "arc-swap",
@@ -3411,6 +3380,7 @@ dependencies = [
  "rubato 0.16.2",
  "smallvec",
  "symphonia 0.6.1",
+ "symphonia-common",
  "vecmath",
 ]
 

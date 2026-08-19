@@ -1,5 +1,0 @@
-error[E0432]: unresolved import `web_audio_api::AudioBackendManager`
- --> tests/ui/output_backend_is_private.rs:1:5
-  |
-1 | use web_audio_api::AudioBackendManager;
-  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `AudioBackendManager` in the root
