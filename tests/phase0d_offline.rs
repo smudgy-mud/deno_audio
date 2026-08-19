@@ -43,6 +43,7 @@ fn dimensions_jobs_and_output_bytes_reject_before_render_construction() {
         Arc::clone(&host),
         AudioLimits::unlimited()
             .max_channels(Some(2))
+            .max_sample_rate(Some(44_100))
             .max_offline_frames(Some(128))
             .max_offline_samples(Some(128))
             .max_offline_render_jobs(Some(1))
@@ -52,12 +53,12 @@ fn dimensions_jobs_and_output_bytes_reject_before_render_construction() {
         .execute_script(
             "phase0d_offline_limits.js",
             r#"
-              const rejected = (channels, frames) => {
+              const rejected = (channels, frames, sampleRate = 44100) => {
                 try {
                   new Deno.core.ops.NativePhase0OfflineRenderRequest(
                     channels,
                     frames,
-                    48000,
+                    sampleRate,
                   );
                   return false;
                 } catch { return true; }
@@ -65,11 +66,14 @@ fn dimensions_jobs_and_output_bytes_reject_before_render_construction() {
               if (!rejected(3, 42)) throw new Error("channel limit did not reject");
               if (!rejected(1, 129)) throw new Error("frame limit did not reject");
               if (!rejected(2, 65)) throw new Error("sample limit did not reject");
+              if (!rejected(1, 1, 48000)) {
+                throw new Error("sample-rate limit did not reject");
+              }
 
               globalThis.__heldOffline = new Deno.core.ops.NativePhase0OfflineRenderRequest(
                 1,
                 128,
-                48000,
+                44100,
               );
               if (!rejected(1, 1)) throw new Error("offline job limit did not reject");
             "#,

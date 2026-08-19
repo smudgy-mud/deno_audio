@@ -173,6 +173,49 @@ async fn every_decode_dimension_and_pcm_stage_refuses_and_recovers() {
     .await;
 }
 
+#[test]
+fn configured_decode_sample_rate_rejects_before_input_copy() {
+    let host = Arc::new(AudioHost::default());
+    let mut runtime = runtime(
+        Arc::clone(&host),
+        AudioLimits::unlimited().max_sample_rate(Some(44_100)),
+    );
+    runtime
+        .execute_script(
+            "phase1_decode_sample_rate_limit.js",
+            r#"
+              let configured;
+              try {
+                new Deno.core.ops.NativePhase0DecodeRequest(
+                  new Uint8Array(16),
+                  48000,
+                );
+              } catch (error) {
+                configured = String(error);
+              }
+              if (!configured?.includes("configured decode sample-rate limit")) {
+                throw new Error(`unexpected configured-limit error: ${configured}`);
+              }
+
+              let nominal;
+              try {
+                new Deno.core.ops.NativePhase0DecodeRequest(
+                  new Uint8Array(16),
+                  1,
+                );
+              } catch (error) {
+                nominal = String(error);
+              }
+              if (!nominal?.includes("inclusive range 3000..=768000")) {
+                throw new Error(`hard range did not retain precedence: ${nominal}`);
+              }
+            "#,
+        )
+        .expect("decode sample-rate policy should reject synchronously");
+    assert_eq!(host.usage().decode_jobs(), 0);
+    assert_eq!(host.usage().live_audio_bytes(), 0);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn encoded_job_corrupt_and_canceled_requests_release_all_reservations() {
     let host = Arc::new(AudioHost::new(

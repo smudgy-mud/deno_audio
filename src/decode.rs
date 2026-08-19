@@ -224,9 +224,19 @@ impl NativePhase0DecodeRequest {
         #[buffer] encoded: JsBuffer,
         sample_rate: f64,
     ) -> Result<NativePhase0DecodeRequest, JsErrorBox> {
-        let sample_rate = validate_sample_rate(sample_rate)?;
-        let encoded = encoded.into_parts();
         let runtime = Arc::clone(state.borrow::<Arc<AudioRuntimeState>>());
+        let validated_sample_rate = validate_sample_rate(sample_rate)?;
+        if runtime
+            .limits()
+            .sample_rate()
+            .is_some_and(|limit| sample_rate > f64::from(limit))
+        {
+            return Err(JsErrorBox::range_error(
+                "configured decode sample-rate limit exceeded",
+            ));
+        }
+        let sample_rate = validated_sample_rate;
+        let encoded = encoded.into_parts();
         let byte_budget = Arc::clone(state.borrow::<Arc<NativeAudioByteBudget>>());
         let encoded_len = encoded.len();
         if runtime

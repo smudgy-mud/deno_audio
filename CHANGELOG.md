@@ -10,6 +10,16 @@ Web Audio surface.
 
 ### Added
 
+- The first Phase 1 public Web Audio surface: a primordial-safe, snapshot-safe
+  `AudioBuffer` global with Web IDL construction, descriptors, brand checks,
+  typed errors, channel-copy methods, same-object channel views, and explicit
+  duplicate-global handling.
+- Rust-owned canonical `AudioBuffer` storage with separately reserved V8
+  channel exposures, garbage-collection recovery, overlap-safe copies, shared
+  typed-array rejection, and `DataCloneError` rather than lossy direct
+  structured cloning.
+- Configurable per-buffer logical-sample and sample-rate limits, with the
+  existing channel and live-byte ceilings enforced before native allocation.
 - Phase 0 repository skeleton and provenance records.
 - Exact Deno 2.9.5-compatible dependency tuple.
 - Exact-revision Git dependency on the Smudgy `web-audio-api-rs` fork.

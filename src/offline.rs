@@ -151,8 +151,17 @@ impl NativePhase0OfflineRenderRequest {
         let output_bytes = samples
             .checked_mul(size_of::<f32>())
             .ok_or_else(|| JsErrorBox::range_error("offline render byte count overflowed"))?;
-        let sample_rate = validate_sample_rate(sample_rate)?;
-
+        let validated_sample_rate = validate_sample_rate(sample_rate)?;
+        if runtime
+            .limits()
+            .sample_rate()
+            .is_some_and(|limit| sample_rate > f64::from(limit))
+        {
+            return Err(JsErrorBox::range_error(
+                "configured offline sample-rate limit exceeded",
+            ));
+        }
+        let sample_rate = validated_sample_rate;
         let isolate_job = runtime.try_reserve_offline_render_job()?;
         let host_job = runtime
             .host()
@@ -276,6 +285,10 @@ mod tests {
                 ),
                 crate::deno_audio::init(crate::AudioExtensionOptions::default()),
             ],
+            // V8 flags are process-global and this unit-test binary also runs
+            // CppGC reclamation tests. Every test-created isolate must agree
+            // on exposing the testing GC regardless of scheduling order.
+            unsafe_expose_natives_and_gc: true,
             ..RuntimeOptions::default()
         });
 

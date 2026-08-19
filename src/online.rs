@@ -444,6 +444,32 @@ fn exact_context_options(sample_rate: f64) -> AudioContextOptions {
     }
 }
 
+fn validate_online_dimensions(
+    runtime: &AudioRuntimeState,
+    sample_rate: f64,
+) -> Result<(), JsErrorBox> {
+    if !(3_000.0..=768_000.0).contains(&sample_rate) {
+        return Err(JsErrorBox::range_error(
+            "sampleRate must be in the inclusive range 3000..=768000",
+        ));
+    }
+    if runtime
+        .limits()
+        .sample_rate()
+        .is_some_and(|limit| sample_rate > f64::from(limit))
+    {
+        return Err(JsErrorBox::range_error(
+            "configured online sample-rate limit exceeded",
+        ));
+    }
+    if runtime.limits().channels().is_some_and(|limit| limit < 2) {
+        return Err(JsErrorBox::range_error(
+            "configured channel limit does not admit stereo online output",
+        ));
+    }
+    Ok(())
+}
+
 #[op2]
 impl NativePhase0OnlineContext {
     #[constructor]
@@ -453,12 +479,8 @@ impl NativePhase0OnlineContext {
         sample_rate: f64,
         initially_suspended: bool,
     ) -> Result<NativePhase0OnlineContext, JsErrorBox> {
-        if !(3_000.0..=768_000.0).contains(&sample_rate) {
-            return Err(JsErrorBox::range_error(
-                "sampleRate must be in the inclusive range 3000..=768000",
-            ));
-        }
         let runtime = Arc::clone(state.borrow::<Arc<AudioRuntimeState>>());
+        validate_online_dimensions(&runtime, sample_rate)?;
         runtime.permissions.check_playback("AudioContext")?;
         let isolate_permit = runtime.try_reserve_online_context()?;
         let host_permit = runtime

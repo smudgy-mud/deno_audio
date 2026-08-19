@@ -1,8 +1,7 @@
 //! Web Audio API extension for `deno_core`.
 //!
-//! This crate is in its Phase 0 binding spike. It declares its ordering
-//! dependencies on `deno_webidl` and `deno_web` and contains private native
-//! binding primitives; no Web Audio globals are installed yet.
+//! The crate contains the proven native ownership foundation and installs the
+//! Web Audio globals implemented by the current public vertical slice.
 //!
 //! This project is not affiliated with, endorsed by, or maintained by
 //! Deno Land Inc.
@@ -43,6 +42,13 @@ deno_core::extension!(
         online::NativePhase0OnlineContext,
         scheduled::NativePhase0Oscillator,
     ],
+    esm_entry_point = "ext:deno_audio/99_main.js",
+    esm = [
+        dir "js",
+        "00_webidl.js",
+        "01_audio_buffer.js",
+        "99_main.js",
+    ],
     options = {
         options: AudioExtensionOptions,
     },
@@ -52,9 +58,12 @@ deno_core::extension!(
             .live_audio_bytes()
             .unwrap_or(usize::MAX);
         state.put(std::sync::Arc::new(binding::NativeBindingMetrics::default()));
-        state.put(std::sync::Arc::new(buffer::NativeAudioByteBudget::new(
+        state.put(std::sync::Arc::new(buffer::NativeAudioByteBudget::with_limits(
             native_audio_byte_limit,
             std::sync::Arc::clone(&host),
+            limits.channels(),
+            limits.audio_buffer_samples(),
+            limits.sample_rate(),
         )));
         state.put(std::sync::Arc::new(online::AudioRuntimeState::new(
             host,

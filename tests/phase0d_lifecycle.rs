@@ -120,6 +120,40 @@ fn construct_with_state(runtime: &mut JsRuntime, global_name: &str, initially_su
         .expect("the private hosted context should construct");
 }
 
+#[test]
+fn configured_online_dimensions_reject_before_output_factory() {
+    for limits in [
+        AudioLimits::unlimited().max_channels(Some(1)),
+        AudioLimits::unlimited().max_sample_rate(Some(44_100)),
+    ] {
+        let host = Arc::new(AudioHost::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut runtime = runtime_with_limits(
+            Arc::clone(&host),
+            Arc::new(CountingSystemFactory::new(Arc::clone(&calls))),
+            limits,
+        );
+        runtime
+            .execute_script(
+                "phase1_online_dimension_limit.js",
+                r#"
+                  let rejected = false;
+                  try {
+                    new Deno.core.ops.NativePhase0OnlineContext(48000, false);
+                  } catch {
+                    rejected = true;
+                  }
+                  if (!rejected) {
+                    throw new Error("configured online dimension was accepted");
+                  }
+                "#,
+            )
+            .expect("configured dimensions should fail before output preparation");
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+        assert_eq!(host.usage().online_contexts(), 0);
+    }
+}
+
 async fn close(runtime: &mut JsRuntime, global_name: &str) {
     runtime
         .execute_script(

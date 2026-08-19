@@ -20,6 +20,8 @@ pub struct AudioLimits {
     max_online_contexts: Option<usize>,
     max_live_audio_bytes: Option<usize>,
     max_channels: Option<usize>,
+    max_audio_buffer_samples: Option<usize>,
+    max_sample_rate: Option<u32>,
     max_decoded_frames: Option<usize>,
     max_decoded_samples: Option<usize>,
     max_encoded_bytes: Option<usize>,
@@ -40,7 +42,12 @@ impl Default for AudioLimits {
             // while still allowing trusted embedders to opt out explicitly.
             max_online_contexts: Some(6),
             max_live_audio_bytes: Some(64 * 1024 * 1024),
+            // Preserve Web Audio's nominal 32-channel and 768 kHz ranges. A
+            // 16M-sample f32 buffer is 64 MiB of canonical PCM, so one buffer
+            // cannot silently exceed the default aggregate byte ceiling.
             max_channels: Some(web_audio_api::MAX_CHANNELS),
+            max_audio_buffer_samples: Some(16 * 1024 * 1024),
+            max_sample_rate: Some(768_000),
             max_decoded_frames: Some(16 * 1024 * 1024),
             max_decoded_samples: Some(16 * 1024 * 1024),
             max_encoded_bytes: Some(32 * 1024 * 1024),
@@ -64,6 +71,8 @@ impl AudioLimits {
             max_online_contexts: None,
             max_live_audio_bytes: None,
             max_channels: None,
+            max_audio_buffer_samples: None,
+            max_sample_rate: None,
             max_decoded_frames: None,
             max_decoded_samples: None,
             max_encoded_bytes: None,
@@ -96,6 +105,20 @@ impl AudioLimits {
     #[must_use]
     pub const fn max_channels(mut self, limit: Option<usize>) -> Self {
         self.max_channels = limit;
+        self
+    }
+
+    /// Sets the maximum logical sample count accepted by one `AudioBuffer`.
+    #[must_use]
+    pub const fn max_audio_buffer_samples(mut self, limit: Option<usize>) -> Self {
+        self.max_audio_buffer_samples = limit;
+        self
+    }
+
+    /// Sets the maximum sample rate accepted by buffer, decode, and render work.
+    #[must_use]
+    pub const fn max_sample_rate(mut self, limit: Option<u32>) -> Self {
+        self.max_sample_rate = limit;
         self
     }
 
@@ -187,6 +210,14 @@ impl AudioLimits {
 
     pub(crate) const fn channels(&self) -> Option<usize> {
         self.max_channels
+    }
+
+    pub(crate) const fn audio_buffer_samples(&self) -> Option<usize> {
+        self.max_audio_buffer_samples
+    }
+
+    pub(crate) const fn sample_rate(&self) -> Option<u32> {
+        self.max_sample_rate
     }
 
     pub(crate) const fn decoded_frames(&self) -> Option<usize> {

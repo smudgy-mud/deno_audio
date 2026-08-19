@@ -5,24 +5,38 @@ A [Web Audio API](https://webaudio.github.io/web-audio-api/) extension for
 standard Web Platform extensions, delegating DSP and rendering to
 the [Smudgy `web-audio-api-rs` fork](https://github.com/smudgy-mud/web-audio-api-rs).
 
-**Status: Phase 0 binding spike.** The native engine and both hosted-output
-paths have passed the Phase 0B acceptance gate. The extension now contains
-private proof objects and ops for `CppGC`, `AudioBuffer`, owned asynchronous
+**Status: Phase 1 in progress.** The native engine, bounded ownership model,
+and hosted silent/CPAL/Cubeb output paths have passed their Phase 0 acceptance
+gates. The extension now installs its first public Web Audio global,
+`AudioBuffer`. Contexts and nodes are not public yet, so this is a real but
+deliberately incomplete JavaScript surface rather than an application-ready Web
+Audio implementation.
+
+The public `AudioBuffer` implements Web IDL conversion, nominal-range and brand
+checks, standard prototype descriptors, `getChannelData()`,
+`copyFromChannel()`, and `copyToChannel()`. Canonical PCM remains Rust-owned.
+Each first channel exposure creates a separately budgeted V8 copy and returns
+the same view until the native acquire algorithm detaches it. Copy methods use
+canonical storage directly when a channel has never been exposed. Shared typed
+arrays are rejected, directly structured-cloning a buffer raises `DataCloneError`,
+and configured channel, logical-sample, sample-rate, per-isolate byte, and
+shared-host byte ceilings reject before their represented allocation.
+
+Extension JavaScript uses Deno's captured primordials. Installation is
+idempotent for the same constructor and refuses to overwrite an unrelated
+global. A startup-snapshot smoke test proves that immutable class bootstrap does
+not capture an `AudioHost` or other runtime-native authority.
+
+The remaining private proof objects and ops cover `CppGC`, owned asynchronous
 work, offline rendering, shared `AudioHost` accounting, online lifecycle
 ownership, render-death handling, scheduled-source reconciliation, and bounded
-off-thread decoding. Exact oscillator graph nodes are reserved against both
-isolate and shared-host ceilings before native construction and remain charged
-through physical source retirement. Its seven-command construction batch and
-one-command Start/Stop batches likewise reserve isolate and shared-host capacity
-before wrapper or native mutation, remain charged while suspended or in flight,
-and release only with typed rollback or off-render-thread batch reclamation. A
-bounded fake process mixer additionally
-proves that two isolated hosted graphs and a native input can share one
-physical-output owner without coupling their clocks or retirement. It does not
-install Web Audio globals and is not ready for application use. These private
-seams exist to make
-the eventual JavaScript surface reviewable rather than to provide an interim
-API.
+off-thread decoding. Exact oscillator graph nodes and their construction and
+runtime commands are reserved against isolate and shared-host ceilings before
+mutation and remain charged through typed rollback or physical retirement. A
+bounded fake process mixer proves that independent hosted graphs and native
+input can share one physical-output owner without coupling clocks or
+retirement. These seams remain private until their corresponding Phase 1 or
+Phase 2 JavaScript classes land.
 
 The research baseline is deliberately locked to one compatibility set:
 
@@ -48,7 +62,8 @@ The selected engine compiles its complete Symphonia decoder set unconditionally:
 AAC, ADPCM, ALAC, FLAC, MPEG layers I/II/III, PCM, and Vorbis, with AIFF, CAF,
 ISO MP4/M4A, Matroska/WebM, Ogg, and WAV containers. These are native dependency
 capabilities, not a claim that the current extension exposes
-`decodeAudioData`; supported JavaScript behavior will be documented as it lands.
+`decodeAudioData`; supported JavaScript behavior is limited to the surface
+listed above and will expand as each vertical slice passes its gate.
 
 ## Development
 
@@ -80,9 +95,10 @@ requests likewise reserve dimensions, output PCM, and a job slot before native
 context construction. The finite per-isolate command default covers the 21-command permanent
 graph bootstrap and every currently exposed user graph batch, including suspended staging.
 Lifecycle barriers and mandatory teardown records remain governed by their separate bounded
-upstream channels so cleanup never depends on user quota. These objects
-remain available only through unsafe native
-exposure in tests and are not a supported JavaScript API.
+upstream channels so cleanup never depends on user quota. These objects remain
+available only through unsafe native exposure in tests and are not a supported
+JavaScript API. `AudioBuffer` is the sole supported global in the current
+slice; in particular, `AudioContext` and `OfflineAudioContext` remain absent.
 
 The engine revision is currently available only in the maintainer's local fork
 history. A fresh external checkout cannot resolve the canonical Git dependency

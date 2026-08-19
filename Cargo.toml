@@ -5,11 +5,12 @@ edition = "2021"
 rust-version = "1.91"
 publish = false
 license = "MIT"
-description = "Web Audio API extension for deno_core, currently in a compatibility-spike phase."
+description = "Resource-bounded Web Audio API extension for deno_core."
 repository = "https://github.com/smudgy-mud/deno_audio"
 keywords = ["deno", "webaudio", "audio"]
 categories = ["multimedia::audio"]
 include = [
+  "/js",
   "/src",
   "/research",
   "/tests",

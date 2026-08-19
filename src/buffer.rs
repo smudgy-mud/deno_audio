@@ -18,15 +18,65 @@ pub(crate) struct NativeAudioByteBudget {
     limit: usize,
     used: AtomicUsize,
     host: Arc<AudioHost>,
+    max_channels: Option<usize>,
+    max_audio_buffer_samples: Option<usize>,
+    max_sample_rate: Option<u32>,
 }
 
 impl NativeAudioByteBudget {
+    #[cfg(test)]
     pub(crate) fn new(limit: usize, host: Arc<AudioHost>) -> Self {
+        Self::with_limits(limit, host, None, None, None)
+    }
+
+    pub(crate) fn with_limits(
+        limit: usize,
+        host: Arc<AudioHost>,
+        max_channels: Option<usize>,
+        max_audio_buffer_samples: Option<usize>,
+        max_sample_rate: Option<u32>,
+    ) -> Self {
         Self {
             limit,
             used: AtomicUsize::new(0),
             host,
+            max_channels,
+            max_audio_buffer_samples,
+            max_sample_rate,
         }
+    }
+
+    fn validate_audio_buffer(
+        &self,
+        channels: usize,
+        length: usize,
+        sample_rate: f64,
+    ) -> Result<(), JsErrorBox> {
+        if self.max_channels.is_some_and(|limit| channels > limit) {
+            return Err(JsErrorBox::range_error(
+                "configured AudioBuffer channel limit exceeded",
+            ));
+        }
+        let samples = channels
+            .checked_mul(length)
+            .ok_or_else(|| JsErrorBox::range_error("AudioBuffer sample count overflow"))?;
+        if self
+            .max_audio_buffer_samples
+            .is_some_and(|limit| samples > limit)
+        {
+            return Err(JsErrorBox::range_error(
+                "configured AudioBuffer logical sample limit exceeded",
+            ));
+        }
+        if self
+            .max_sample_rate
+            .is_some_and(|limit| sample_rate > f64::from(limit))
+        {
+            return Err(JsErrorBox::range_error(
+                "configured AudioBuffer sample-rate limit exceeded",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn reserve(
@@ -165,9 +215,9 @@ impl v8::cppgc::Traced for NativeAudioBufferState {
     }
 }
 
-/// Private native `AudioBuffer` storage used by the JavaScript facade in later
-/// phases. Canonical PCM is Rust-owned; only explicitly exposed channels gain
-/// traced V8 copies.
+/// Private native storage behind the public JavaScript `AudioBuffer` facade.
+/// Canonical PCM is Rust-owned; only explicitly exposed channels gain traced
+/// V8 copies.
 pub(crate) struct NativeAudioBuffer {
     state: GcCell<NativeAudioBufferState>,
     budget: Arc<NativeAudioByteBudget>,
@@ -267,6 +317,75 @@ fn set_view_sample(view: &v8::Float32Array, index: usize, value: f32) -> bool {
     true
 }
 
+fn copy_view_samples(
+    source: &v8::Float32Array,
+    source_offset: usize,
+    destination: &v8::Float32Array,
+    destination_offset: usize,
+    count: usize,
+) -> Result<(), JsErrorBox> {
+    if count == 0 {
+        return Ok(());
+    }
+
+    let source_store = source
+        .get_backing_store()
+        .ok_or_else(|| JsErrorBox::type_error("source Float32Array is detached"))?;
+    let destination_store = destination
+        .get_backing_store()
+        .ok_or_else(|| JsErrorBox::type_error("destination Float32Array is detached"))?;
+    let source_sample_offset = source_offset
+        .checked_mul(BYTES_PER_SAMPLE)
+        .ok_or_else(|| JsErrorBox::range_error("source Float32Array offset overflow"))?;
+    let source_start = source
+        .byte_offset()
+        .checked_add(source_sample_offset)
+        .ok_or_else(|| JsErrorBox::range_error("source Float32Array offset overflow"))?;
+    let destination_sample_offset = destination_offset
+        .checked_mul(BYTES_PER_SAMPLE)
+        .ok_or_else(|| JsErrorBox::range_error("destination Float32Array offset overflow"))?;
+    let destination_start = destination
+        .byte_offset()
+        .checked_add(destination_sample_offset)
+        .ok_or_else(|| JsErrorBox::range_error("destination Float32Array offset overflow"))?;
+    let byte_count = count
+        .checked_mul(BYTES_PER_SAMPLE)
+        .ok_or_else(|| JsErrorBox::range_error("Float32Array copy length overflow"))?;
+    let source_end = source_start
+        .checked_add(byte_count)
+        .ok_or_else(|| JsErrorBox::range_error("source Float32Array range overflow"))?;
+    let destination_end = destination_start
+        .checked_add(byte_count)
+        .ok_or_else(|| JsErrorBox::range_error("destination Float32Array range overflow"))?;
+    let same_store = source_store.data() == destination_store.data();
+    let copy_backwards = same_store
+        && destination_start > source_start
+        && destination_start < source_end
+        && source_start < destination_end;
+
+    let copy_one = |index: usize| {
+        let value = view_sample(source, source_offset + index)
+            .ok_or_else(|| JsErrorBox::type_error("source Float32Array is detached"))?;
+        if !set_view_sample(destination, destination_offset + index, value) {
+            return Err(JsErrorBox::type_error(
+                "destination Float32Array is detached",
+            ));
+        }
+        Ok(())
+    };
+
+    if copy_backwards {
+        for index in (0..count).rev() {
+            copy_one(index)?;
+        }
+    } else {
+        for index in 0..count {
+            copy_one(index)?;
+        }
+    }
+    Ok(())
+}
+
 fn view_is_detached<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     view: v8::Local<'s, v8::Float32Array>,
@@ -310,6 +429,7 @@ impl NativeAudioBuffer {
         let canonical_bytes = checked_pcm_bytes(options.number_of_channels, options.length)
             .ok_or_else(|| JsErrorBox::range_error("AudioBuffer dimensions overflow"))?;
         let budget = Arc::clone(state.borrow::<Arc<NativeAudioByteBudget>>());
+        budget.validate_audio_buffer(options.number_of_channels, options.length, sample_rate)?;
         let canonical_reservation = budget.reserve(canonical_bytes).map_err(|error| {
             JsErrorBox::range_error(format!(
                 "native audio byte budget exceeded before allocation: {error}"
@@ -338,6 +458,16 @@ impl NativeAudioBuffer {
     fn length(&self, isolate: &mut v8::Isolate) -> u32 {
         u32::try_from(self.state.get(isolate).canonical.length())
             .expect("validated AudioBuffer length must fit u32")
+    }
+
+    #[getter]
+    fn sample_rate(&self, isolate: &mut v8::Isolate) -> f32 {
+        self.state.get(isolate).canonical.sample_rate()
+    }
+
+    #[getter]
+    fn duration(&self, isolate: &mut v8::Isolate) -> f64 {
+        self.state.get(isolate).canonical.duration()
     }
 
     #[getter]
@@ -379,6 +509,100 @@ impl NativeAudioBuffer {
             .ok_or_else(|| JsErrorBox::range_error("failed to create Float32Array"))?;
         self.state.get_mut(scope).exposed[channel] = Some(v8::TracedReference::new(scope, view));
         Ok(view)
+    }
+
+    #[fast]
+    fn copy_from_channel(
+        &self,
+        scope: &mut v8::PinScope<'_, '_>,
+        destination: v8::Local<'_, v8::Float32Array>,
+        channel: u32,
+        buffer_offset: u32,
+    ) -> Result<(), JsErrorBox> {
+        let channel = check_channel(self.state.get(scope), channel)?;
+        let buffer_offset = buffer_offset as usize;
+        let available = self
+            .state
+            .get(scope)
+            .canonical
+            .length()
+            .saturating_sub(buffer_offset);
+        let count = available.min(destination.length());
+        if count == 0 {
+            return Ok(());
+        }
+
+        let exposed = self.state.get_mut(scope).exposed[channel].take();
+        let Some(exposed) = exposed else {
+            let source = self.state.get(scope).canonical.get_channel_data(channel);
+            for (index, value) in source[buffer_offset..buffer_offset + count]
+                .iter()
+                .copied()
+                .enumerate()
+            {
+                if !set_view_sample(&destination, index, value) {
+                    return Err(JsErrorBox::type_error(
+                        "destination Float32Array is detached",
+                    ));
+                }
+            }
+            return Ok(());
+        };
+
+        let result = exposed
+            .get(scope)
+            .ok_or_else(|| JsErrorBox::generic("traced AudioBuffer channel view disappeared"))
+            .and_then(|source| copy_view_samples(&source, buffer_offset, &destination, 0, count));
+        self.state.get_mut(scope).exposed[channel] = Some(exposed);
+        result
+    }
+
+    #[fast]
+    fn copy_to_channel(
+        &self,
+        scope: &mut v8::PinScope<'_, '_>,
+        source: v8::Local<'_, v8::Float32Array>,
+        channel: u32,
+        buffer_offset: u32,
+    ) -> Result<(), JsErrorBox> {
+        let channel = check_channel(self.state.get(scope), channel)?;
+        let buffer_offset = buffer_offset as usize;
+        let available = self
+            .state
+            .get(scope)
+            .canonical
+            .length()
+            .saturating_sub(buffer_offset);
+        let count = available.min(source.length());
+        if count == 0 {
+            return Ok(());
+        }
+
+        let exposed = self.state.get_mut(scope).exposed[channel].take();
+        let Some(exposed) = exposed else {
+            let destination = self
+                .state
+                .get_mut(scope)
+                .canonical
+                .get_channel_data_mut(channel);
+            for (index, destination) in destination[buffer_offset..buffer_offset + count]
+                .iter_mut()
+                .enumerate()
+            {
+                *destination = view_sample(&source, index)
+                    .ok_or_else(|| JsErrorBox::type_error("source Float32Array is detached"))?;
+            }
+            return Ok(());
+        };
+
+        let result = exposed
+            .get(scope)
+            .ok_or_else(|| JsErrorBox::generic("traced AudioBuffer channel view disappeared"))
+            .and_then(|destination| {
+                copy_view_samples(&source, 0, &destination, buffer_offset, count)
+            });
+        self.state.get_mut(scope).exposed[channel] = Some(exposed);
+        result
     }
 
     #[fast]
