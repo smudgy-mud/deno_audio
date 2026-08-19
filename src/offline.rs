@@ -1,13 +1,19 @@
+use std::ffi::CStr;
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
-use deno_core::op2;
 use deno_core::serde::Serialize;
 use deno_core::unsync::spawn_blocking;
+use deno_core::{op2, v8, GarbageCollected, OpState};
 use deno_error::JsErrorBox;
 use web_audio_api::context::{BaseAudioContext, OfflineAudioContext};
 use web_audio_api::node::{AudioNode, AudioScheduledSourceNode};
 use web_audio_api::MAX_CHANNELS;
+
+use crate::buffer::{NativeAudioByteBudget, NativeAudioByteReservation};
+use crate::host::{AudioHostReservation, AudioHostResourceKind};
+use crate::online::{AudioRuntimeState, IsolateReservation};
 
 #[derive(Serialize)]
 #[serde(crate = "deno_core::serde", rename_all = "camelCase")]
@@ -69,31 +75,143 @@ where
     }
 }
 
-/// Phase 0 proof op. Every value captured across the await is an owned Rust
-/// scalar; context construction, graph mutation, rendering, and destruction
-/// all occur on the blocking worker.
+struct OfflineRenderPayload {
+    number_of_channels: usize,
+    length: usize,
+    sample_rate: f32,
+    isolate_thread: thread::ThreadId,
+    _output_bytes: NativeAudioByteReservation,
+    _isolate_job: IsolateReservation,
+    _host_job: AudioHostReservation,
+}
+
+/// Private single-use offline-render proof. Dimensions, output bytes, and job
+/// ownership are reserved before an upstream context can be constructed.
+pub(crate) struct NativePhase0OfflineRenderRequest {
+    payload: Mutex<Option<OfflineRenderPayload>>,
+}
+
+// SAFETY: this object contains no V8 or CppGC pointers. It owns only fixed
+// render dimensions and Send reservation guards behind a mutex.
+unsafe impl GarbageCollected for NativePhase0OfflineRenderRequest {
+    fn trace(&self, _visitor: &mut v8::cppgc::Visitor) {}
+
+    fn get_name(&self) -> &'static CStr {
+        c"NativePhase0OfflineRenderRequest"
+    }
+}
+
+#[op2]
+impl NativePhase0OfflineRenderRequest {
+    #[constructor]
+    #[cppgc]
+    fn new(
+        state: &mut OpState,
+        number_of_channels: u32,
+        length: u32,
+        sample_rate: f64,
+    ) -> Result<NativePhase0OfflineRenderRequest, JsErrorBox> {
+        let runtime = Arc::clone(state.borrow::<Arc<AudioRuntimeState>>());
+        let number_of_channels = number_of_channels as usize;
+        if !(1..=MAX_CHANNELS).contains(&number_of_channels)
+            || runtime
+                .limits()
+                .channels()
+                .is_some_and(|limit| number_of_channels > limit)
+        {
+            return Err(JsErrorBox::range_error(
+                "numberOfChannels exceeds the configured offline limit",
+            ));
+        }
+        let length = length as usize;
+        if length == 0 {
+            return Err(JsErrorBox::range_error("length must be greater than zero"));
+        }
+        if runtime
+            .limits()
+            .offline_frames()
+            .is_some_and(|limit| length > limit)
+        {
+            return Err(JsErrorBox::range_error(
+                "offline render frame limit exceeded",
+            ));
+        }
+        let samples = number_of_channels
+            .checked_mul(length)
+            .ok_or_else(|| JsErrorBox::range_error("offline render sample count overflowed"))?;
+        if runtime
+            .limits()
+            .offline_samples()
+            .is_some_and(|limit| samples > limit)
+        {
+            return Err(JsErrorBox::range_error(
+                "offline render logical sample limit exceeded",
+            ));
+        }
+        let output_bytes = samples
+            .checked_mul(size_of::<f32>())
+            .ok_or_else(|| JsErrorBox::range_error("offline render byte count overflowed"))?;
+        let sample_rate = validate_sample_rate(sample_rate)?;
+
+        let isolate_job = runtime.try_reserve_offline_render_job()?;
+        let host_job = runtime
+            .host()
+            .try_reserve(AudioHostResourceKind::OfflineRenderJobs, 1)
+            .map_err(|error| {
+                JsErrorBox::range_error(format!(
+                    "AudioHost offline-render-job limit exceeded: {error}"
+                ))
+            })?;
+        let byte_budget = Arc::clone(state.borrow::<Arc<NativeAudioByteBudget>>());
+        let output_bytes = byte_budget.reserve(output_bytes).map_err(|error| {
+            JsErrorBox::range_error(format!(
+                "offline render output byte reservation failed: {error}"
+            ))
+        })?;
+
+        Ok(NativePhase0OfflineRenderRequest {
+            payload: Mutex::new(Some(OfflineRenderPayload {
+                number_of_channels,
+                length,
+                sample_rate,
+                isolate_thread: thread::current().id(),
+                _output_bytes: output_bytes,
+                _isolate_job: isolate_job,
+                _host_job: host_job,
+            })),
+        })
+    }
+}
+
+impl NativePhase0OfflineRenderRequest {
+    fn take(&self) -> Result<OfflineRenderPayload, JsErrorBox> {
+        self.payload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| JsErrorBox::generic("offline render request has already been consumed"))
+    }
+}
+
+/// Phase 0 proof op. Context construction, graph mutation, rendering, and
+/// destruction all occur on the blocking worker after reservations transfer.
 #[op2]
 #[serde]
 pub(crate) async fn op_phase0_render_off_thread(
-    number_of_channels: u32,
-    length: u32,
-    sample_rate: f64,
+    #[cppgc] request: &NativePhase0OfflineRenderRequest,
 ) -> Result<Phase0RenderSummary, JsErrorBox> {
-    let number_of_channels = number_of_channels as usize;
-    if !(1..=MAX_CHANNELS).contains(&number_of_channels) {
-        return Err(JsErrorBox::range_error(
-            "numberOfChannels must be in the inclusive range 1..=32",
-        ));
-    }
-    let length = length as usize;
-    if length == 0 {
-        return Err(JsErrorBox::range_error("length must be greater than zero"));
-    }
-    let sample_rate = validate_sample_rate(sample_rate)?;
-    let isolate_thread = thread::current().id();
-
+    let payload = request.take()?;
     resolve_blocking("offline audio render", move || {
         blocking_outcome(|| {
+            let OfflineRenderPayload {
+                number_of_channels,
+                length,
+                sample_rate,
+                isolate_thread,
+                _output_bytes,
+                _isolate_job,
+                _host_job,
+            } = payload;
             let mut context = OfflineAudioContext::new(number_of_channels, length, sample_rate);
             let mut oscillator = context.create_oscillator();
             oscillator.frequency().set_value(440.0);
@@ -193,11 +311,12 @@ mod tests {
                       throw new Error(`unexpected decode summary: ${JSON.stringify(decoded)}`);
                     }
 
-                    const rendered = await Deno.core.ops.op_phase0_render_off_thread(
+                    const renderRequest = new Deno.core.ops.NativePhase0OfflineRenderRequest(
                       1,
                       128,
                       48000,
                     );
+                    const rendered = await Deno.core.ops.op_phase0_render_off_thread(renderRequest);
                     if (rendered.numberOfChannels !== 1 || rendered.length !== 128 ||
                         rendered.peak <= 0.01 || !rendered.offIsolateThread) {
                       throw new Error(`unexpected render summary: ${JSON.stringify(rendered)}`);

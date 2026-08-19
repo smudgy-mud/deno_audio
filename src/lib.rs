@@ -39,6 +39,7 @@ deno_core::extension!(
         binding::NativePhase0Probe,
         buffer::NativeAudioBuffer,
         decode::NativePhase0DecodeRequest,
+        offline::NativePhase0OfflineRenderRequest,
         online::NativePhase0OnlineContext,
         scheduled::NativePhase0Oscillator,
     ],

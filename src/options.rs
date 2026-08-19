@@ -24,6 +24,9 @@ pub struct AudioLimits {
     max_decoded_samples: Option<usize>,
     max_encoded_bytes: Option<usize>,
     max_decode_jobs: Option<usize>,
+    max_offline_frames: Option<usize>,
+    max_offline_samples: Option<usize>,
+    max_offline_render_jobs: Option<usize>,
     max_scheduled_sources: Option<usize>,
     max_queued_events: Option<usize>,
 }
@@ -40,6 +43,9 @@ impl Default for AudioLimits {
             max_decoded_samples: Some(16 * 1024 * 1024),
             max_encoded_bytes: Some(32 * 1024 * 1024),
             max_decode_jobs: Some(4),
+            max_offline_frames: Some(16 * 1024 * 1024),
+            max_offline_samples: Some(16 * 1024 * 1024),
+            max_offline_render_jobs: Some(2),
             max_scheduled_sources: Some(512),
             max_queued_events: Some(256),
         }
@@ -58,6 +64,9 @@ impl AudioLimits {
             max_decoded_samples: None,
             max_encoded_bytes: None,
             max_decode_jobs: None,
+            max_offline_frames: None,
+            max_offline_samples: None,
+            max_offline_render_jobs: None,
             max_scheduled_sources: None,
             max_queued_events: None,
         }
@@ -77,7 +86,7 @@ impl AudioLimits {
         self
     }
 
-    /// Sets the maximum channel count accepted from decoded media.
+    /// Sets the maximum channel count accepted by native buffer and render work.
     #[must_use]
     pub const fn max_channels(mut self, limit: Option<usize>) -> Self {
         self.max_channels = limit;
@@ -109,6 +118,27 @@ impl AudioLimits {
     #[must_use]
     pub const fn max_decode_jobs(mut self, limit: Option<usize>) -> Self {
         self.max_decode_jobs = limit;
+        self
+    }
+
+    /// Sets the maximum frame count accepted by one offline render.
+    #[must_use]
+    pub const fn max_offline_frames(mut self, limit: Option<usize>) -> Self {
+        self.max_offline_frames = limit;
+        self
+    }
+
+    /// Sets the maximum logical sample count accepted by one offline render.
+    #[must_use]
+    pub const fn max_offline_samples(mut self, limit: Option<usize>) -> Self {
+        self.max_offline_samples = limit;
+        self
+    }
+
+    /// Sets the concurrent offline-render-job ceiling for this isolate.
+    #[must_use]
+    pub const fn max_offline_render_jobs(mut self, limit: Option<usize>) -> Self {
+        self.max_offline_render_jobs = limit;
         self
     }
 
@@ -152,6 +182,18 @@ impl AudioLimits {
 
     pub(crate) const fn decode_jobs(&self) -> Option<usize> {
         self.max_decode_jobs
+    }
+
+    pub(crate) const fn offline_frames(&self) -> Option<usize> {
+        self.max_offline_frames
+    }
+
+    pub(crate) const fn offline_samples(&self) -> Option<usize> {
+        self.max_offline_samples
+    }
+
+    pub(crate) const fn offline_render_jobs(&self) -> Option<usize> {
+        self.max_offline_render_jobs
     }
 
     pub(crate) const fn scheduled_sources(&self) -> Option<usize> {

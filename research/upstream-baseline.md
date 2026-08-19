@@ -109,6 +109,7 @@ the ownership model that the public `WebIDL` facade will use:
 | Decode dimensions and PCM | `phase0d_decode::every_decode_dimension_and_pcm_stage_refuses_and_recovers` | Channel, cumulative-frame, logical-sample, canonical chunk, overlapping final assembly, and source-plus-target resampling reservations each reject at the fork's preallocation boundary; every outer byte/job reservation returns to zero. |
 | Decode input and jobs | `phase0d_decode::encoded_job_corrupt_and_canceled_requests_release_all_reservations` | Encoded bytes and a decode-job slot are reserved before the single owned copy or blocking spawn. Oversize, concurrent-job refusal, corrupt input, and a discarded JavaScript waiter all leave the isolate responsive and release the represented resources. |
 | Cross-isolate decode recovery | `phase0d_decode::shared_encoded_bytes_and_jobs_exhaust_before_copy_and_recover` | Two runtimes sharing one host exhaust decode jobs and encoded live bytes before the rejected request copies input; dropping the owning runtime restores both shared counters. |
+| Offline render ownership | All `phase0d_offline` tests | Channels, frames, logical samples, output PCM, and isolate/shared job slots are reserved before native context construction. Single-use transfer and discarded waiters complete off-isolate; limit failures and cross-isolate contention recover every shared byte and job counter. |
 
 The saturation proof exposed an incompatible 256 ordinary-node ceiling in the
 otherwise reviewed hosted engine: one exact oscillator consumes three lifetime

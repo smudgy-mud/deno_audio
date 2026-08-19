@@ -65,9 +65,10 @@ one `Arc<AudioHost>` across options makes the configured aggregate limits span
 isolates; output and permission services remain separate authorities. The
 private Phase 0D proof surface uses this same ownership shape. Decode requests
 reserve their encoded copy, concurrent job, result dimensions, and every
-wrapper-owned PCM allocation before spawning or growing. These objects remain
-available only through unsafe native exposure in tests and are not a supported
-JavaScript API.
+wrapper-owned PCM allocation before spawning or growing. Offline render
+requests likewise reserve dimensions, output PCM, and a job slot before native
+context construction. These objects remain available only through unsafe native
+exposure in tests and are not a supported JavaScript API.
 
 The engine revision is currently available only in the maintainer's local fork
 history. A fresh external checkout cannot resolve the canonical Git dependency

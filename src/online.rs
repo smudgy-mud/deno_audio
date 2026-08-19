@@ -25,6 +25,7 @@ pub(crate) struct AudioRuntimeState {
     output: Arc<dyn AudioOutputFactory>,
     online_contexts: AtomicUsize,
     decode_jobs: AtomicUsize,
+    offline_render_jobs: AtomicUsize,
     scheduled_sources: AtomicUsize,
     queued_events: AtomicUsize,
 }
@@ -43,6 +44,7 @@ impl AudioRuntimeState {
             output,
             online_contexts: AtomicUsize::new(0),
             decode_jobs: AtomicUsize::new(0),
+            offline_render_jobs: AtomicUsize::new(0),
             scheduled_sources: AtomicUsize::new(0),
             queued_events: AtomicUsize::new(0),
         }
@@ -60,6 +62,12 @@ impl AudioRuntimeState {
         self: &Arc<Self>,
     ) -> Result<IsolateReservation, JsErrorBox> {
         self.try_reserve_resource(IsolateResourceKind::DecodeJobs, 1)
+    }
+
+    pub(crate) fn try_reserve_offline_render_job(
+        self: &Arc<Self>,
+    ) -> Result<IsolateReservation, JsErrorBox> {
+        self.try_reserve_resource(IsolateResourceKind::OfflineRenderJobs, 1)
     }
 
     pub(crate) fn try_reserve_scheduled_source(
@@ -83,6 +91,11 @@ impl AudioRuntimeState {
             IsolateResourceKind::DecodeJobs => {
                 (&self.decode_jobs, self.limits.decode_jobs(), "decode job")
             }
+            IsolateResourceKind::OfflineRenderJobs => (
+                &self.offline_render_jobs,
+                self.limits.offline_render_jobs(),
+                "offline render job",
+            ),
             IsolateResourceKind::ScheduledSources => (
                 &self.scheduled_sources,
                 self.limits.scheduled_sources(),
@@ -166,6 +179,7 @@ impl AudioRuntimeState {
 #[derive(Clone, Copy)]
 enum IsolateResourceKind {
     DecodeJobs,
+    OfflineRenderJobs,
     ScheduledSources,
     QueuedEvents,
 }
@@ -180,6 +194,7 @@ impl Drop for IsolateReservation {
     fn drop(&mut self) {
         let counter = match self.resource {
             IsolateResourceKind::DecodeJobs => &self.runtime.decode_jobs,
+            IsolateResourceKind::OfflineRenderJobs => &self.runtime.offline_render_jobs,
             IsolateResourceKind::ScheduledSources => &self.runtime.scheduled_sources,
             IsolateResourceKind::QueuedEvents => &self.runtime.queued_events,
         };
