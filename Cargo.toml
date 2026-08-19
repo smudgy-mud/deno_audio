@@ -38,12 +38,12 @@ deno_error = "=0.7.1"
 deno_web = "=0.288.0"
 deno_webidl = "=0.257.0"
 serde_v8 = "=0.319.0"
-web-audio-api = { git = "https://github.com/smudgy-mud/web-audio-api-rs", rev = "dd2416065645751a5210181dfc33639b234734a7", default-features = false }
+web-audio-api = { git = "https://github.com/smudgy-mud/web-audio-api-rs", rev = "3455e57bde836a142faa3083cfbd3635dcf21b79", default-features = false }
 
 [dev-dependencies]
 deno_core = { version = "=0.410.0", features = ["unsafe_runtime_options"] }
 tokio = { version = "=1.53.1", features = ["macros", "rt"] }
-web-audio-api = { git = "https://github.com/smudgy-mud/web-audio-api-rs", rev = "dd2416065645751a5210181dfc33639b234734a7", default-features = false, features = ["diagnostics"] }
+web-audio-api = { git = "https://github.com/smudgy-mud/web-audio-api-rs", rev = "3455e57bde836a142faa3083cfbd3635dcf21b79", default-features = false, features = ["diagnostics"] }
 
 [workspace]
 resolver = "2"
