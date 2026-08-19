@@ -16,7 +16,7 @@
       "path": "webaudio/the-audio-api/the-audiobuffer-interface/audiobuffer-copy-channel.html",
       "category": "AudioBuffer",
       "status": "skip",
-      "reason": "The file constructs online AudioContext; Phase 1 copyFromChannel/copyToChannel behavior is covered by native integration tests until the Phase 2 online context lands."
+      "reason": "The file requires AudioBufferSourceNode rendering, which is not yet in the current Phase 2 online slice; copyFromChannel/copyToChannel remain covered by integration tests."
     },
     {
       "path": "webaudio/the-audio-api/the-offlineaudiocontext-interface/ctor-offlineaudiocontext.html",
@@ -27,13 +27,13 @@
       "path": "webaudio/the-audio-api/the-gainnode-interface/ctor-gain.html",
       "category": "constructors",
       "status": "skip",
-      "reason": "The upstream file hard-codes AudioContext; GainNode is available in Phase 1 only through OfflineAudioContext and is covered by the integration suite."
+      "reason": "GainNode is available online and offline, but the upstream file exercises option combinations outside the current exact hosted channel-configuration slice; constructor behavior remains covered by integration tests."
     },
     {
       "path": "webaudio/the-audio-api/the-oscillatornode-interface/ctor-oscillator.html",
       "category": "constructors",
       "status": "skip",
-      "reason": "The file requires online AudioContext and custom PeriodicWave support; Phase 1 exposes only fixed-wave offline oscillators."
+      "reason": "The file requires custom PeriodicWave support; the current online and offline slices expose only fixed-wave oscillators."
     },
     {
       "path": "webaudio/the-audio-api/the-audionode-interface/audionode-connect-return-value.html",
@@ -50,7 +50,7 @@
       "path": "webaudio/the-audio-api/the-audionode-interface/audionode-disconnect-audioparam.html",
       "category": "connect/disconnect",
       "status": "skip",
-      "reason": "The file requires AudioBufferSourceNode, ChannelSplitterNode, offline suspend/resume, and online AudioContext, none of which are claimed by the Phase 1 slice."
+      "reason": "The file requires AudioBufferSourceNode and ChannelSplitterNode, which are not yet in the current public slices."
     },
     {
       "path": "webaudio/the-audio-api/the-offlineaudiocontext-interface/current-time-block-size.html",

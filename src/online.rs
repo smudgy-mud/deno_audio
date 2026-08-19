@@ -8,18 +8,20 @@ use deno_core::futures::FutureExt as _;
 use deno_core::{op2, v8, GarbageCollected, OpState};
 use deno_error::JsErrorBox;
 use web_audio_api::context::{
-    AudioContext, AudioContextBuildError, AudioContextBuildErrorKind, AudioContextLifecycleError,
-    AudioContextOptions, AudioContextShutdownOutcome, AudioContextShutdownReceipt,
-    AudioContextState, AudioContextStateChangeOutcome, AudioContextStateChangeReceipt,
-    AudioControlBatchReservation,
+    AudioContext, AudioContextBuildError, AudioContextBuildErrorKind, AudioContextLatencyCategory,
+    AudioContextLifecycleError, AudioContextOptions, AudioContextShutdownOutcome,
+    AudioContextShutdownReceipt, AudioContextState, AudioContextStateChangeOutcome,
+    AudioContextStateChangeReceipt, AudioControlBatchReservation,
 };
+use web_audio_api::node::{ChannelCountMode, ChannelInterpretation, OscillatorType};
 use web_audio_api::output::AudioOutputFactory;
 
 use crate::host::{
     release_atomic, AudioHost, AudioHostLimitError, AudioHostOnlineContextPermit,
     AudioHostReservation, AudioHostResourceKind,
 };
-use crate::options::{AudioLimits, AudioPermissions};
+use crate::node::{NativeAudioNode, OnlineGraph};
+use crate::options::{AudioEventPumpLiveness, AudioLimits, AudioPermissions};
 use crate::scheduled::ContextEventHub;
 
 pub(crate) struct AudioRuntimeState {
@@ -27,6 +29,7 @@ pub(crate) struct AudioRuntimeState {
     permissions: Arc<dyn AudioPermissions>,
     limits: AudioLimits,
     output: Arc<dyn AudioOutputFactory>,
+    event_pump_liveness: AudioEventPumpLiveness,
     online_contexts: AtomicUsize,
     decode_jobs: AtomicUsize,
     offline_render_jobs: AtomicUsize,
@@ -44,12 +47,14 @@ impl AudioRuntimeState {
         permissions: Arc<dyn AudioPermissions>,
         limits: AudioLimits,
         output: Arc<dyn AudioOutputFactory>,
+        event_pump_liveness: AudioEventPumpLiveness,
     ) -> Self {
         Self {
             host,
             permissions,
             limits,
             output,
+            event_pump_liveness,
             online_contexts: AtomicUsize::new(0),
             decode_jobs: AtomicUsize::new(0),
             offline_render_jobs: AtomicUsize::new(0),
@@ -68,6 +73,10 @@ impl AudioRuntimeState {
 
     pub(crate) fn limits(&self) -> &AudioLimits {
         &self.limits
+    }
+
+    pub(crate) const fn event_pump_refed(&self) -> bool {
+        self.event_pump_liveness.is_refed()
     }
 
     pub(crate) fn try_reserve_decode_job(
@@ -375,13 +384,17 @@ pub(crate) struct NativeOnlineContextState {
 }
 
 impl NativeOnlineContextState {
-    fn context(&self) -> Result<Arc<AudioContext>, JsErrorBox> {
+    pub(crate) fn context(&self) -> Result<Arc<AudioContext>, JsErrorBox> {
         self.context
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map(Arc::clone)
             .ok_or_else(|| JsErrorBox::generic("AudioContext is poisoned or retired"))
+    }
+
+    pub(crate) fn event_hub(&self) -> Arc<ContextEventHub> {
+        Arc::clone(&self.event_hub)
     }
 
     pub(crate) fn poison(&self) {
@@ -409,13 +422,10 @@ impl Drop for NativeOnlineContextState {
 /// same lifecycle state rather than a raw upstream context.
 pub(crate) struct NativePhase0OnlineContext {
     state: Arc<NativeOnlineContextState>,
+    graph: Arc<OnlineGraph>,
 }
 
 impl NativePhase0OnlineContext {
-    pub(crate) fn native_context(&self) -> Result<Arc<AudioContext>, JsErrorBox> {
-        self.state.context()
-    }
-
     pub(crate) fn event_hub(&self) -> Arc<ContextEventHub> {
         Arc::clone(&self.state.event_hub)
     }
@@ -464,21 +474,61 @@ fn abandon_committed(
 
 #[allow(
     clippy::cast_possible_truncation,
-    reason = "the Web Audio f64 surface is range-checked before conversion to the engine's f32 rate"
+    clippy::cast_precision_loss,
+    reason = "both requested and configured rates are range-checked below 768001, where integral values are exactly representable as f32"
 )]
-fn exact_context_options(sample_rate: f64) -> AudioContextOptions {
-    AudioContextOptions {
-        sample_rate: Some(sample_rate as f32),
-        sink_id: "none".to_owned(),
+fn exact_context_options(
+    runtime: &AudioRuntimeState,
+    sample_rate: f64,
+    sink_id: Option<String>,
+    latency_hint: Option<u32>,
+    custom_latency: Option<f64>,
+) -> Result<AudioContextOptions, JsErrorBox> {
+    let sample_rate = if sample_rate == 0.0 {
+        match runtime.limits().sample_rate() {
+            None | Some(768_000..) => None,
+            Some(limit) if limit >= 3_000 => Some(limit.min(48_000) as f32),
+            Some(_) => {
+                return Err(JsErrorBox::range_error(
+                    "configured online sample-rate limit admits no Web Audio rate",
+                ));
+            }
+        }
+    } else {
+        Some(sample_rate as f32)
+    };
+    let latency_hint = match latency_hint.unwrap_or(1) {
+        0 => AudioContextLatencyCategory::Balanced,
+        1 => AudioContextLatencyCategory::Interactive,
+        2 => AudioContextLatencyCategory::Playback,
+        3 => {
+            let value = custom_latency.ok_or_else(|| {
+                JsErrorBox::type_error("custom latencyHint is missing its numeric value")
+            })?;
+            if !value.is_finite() || value < 0.0 {
+                return Err(JsErrorBox::range_error(
+                    "custom latencyHint must be finite and non-negative",
+                ));
+            }
+            AudioContextLatencyCategory::Custom(value)
+        }
+        _ => return Err(JsErrorBox::type_error("unknown AudioContext latencyHint")),
+    };
+    Ok(AudioContextOptions {
+        latency_hint,
+        sample_rate,
+        // The private Phase 0 constructor historically selected the silent
+        // endpoint. The public facade always supplies its WebIDL default "".
+        sink_id: sink_id.unwrap_or_else(|| "none".to_owned()),
         ..AudioContextOptions::default()
-    }
+    })
 }
 
 fn validate_online_dimensions(
     runtime: &AudioRuntimeState,
     sample_rate: f64,
 ) -> Result<(), JsErrorBox> {
-    if !(3_000.0..=768_000.0).contains(&sample_rate) {
+    if sample_rate != 0.0 && !(3_000.0..=768_000.0).contains(&sample_rate) {
         return Err(JsErrorBox::range_error(
             "sampleRate must be in the inclusive range 3000..=768000",
         ));
@@ -486,7 +536,7 @@ fn validate_online_dimensions(
     if runtime
         .limits()
         .sample_rate()
-        .is_some_and(|limit| sample_rate > f64::from(limit))
+        .is_some_and(|limit| sample_rate != 0.0 && sample_rate > f64::from(limit))
     {
         return Err(JsErrorBox::range_error(
             "configured online sample-rate limit exceeded",
@@ -500,6 +550,54 @@ fn validate_online_dimensions(
     Ok(())
 }
 
+fn channel_count_mode(value: u32) -> Result<ChannelCountMode, JsErrorBox> {
+    match value {
+        0 => Ok(ChannelCountMode::Max),
+        1 => Ok(ChannelCountMode::ClampedMax),
+        2 => Ok(ChannelCountMode::Explicit),
+        _ => Err(JsErrorBox::type_error("unknown channelCountMode")),
+    }
+}
+
+fn channel_interpretation(value: u32) -> Result<ChannelInterpretation, JsErrorBox> {
+    match value {
+        0 => Ok(ChannelInterpretation::Speakers),
+        1 => Ok(ChannelInterpretation::Discrete),
+        _ => Err(JsErrorBox::type_error("unknown channelInterpretation")),
+    }
+}
+
+fn oscillator_type(value: u32) -> Result<OscillatorType, JsErrorBox> {
+    match value {
+        0 => Ok(OscillatorType::Sine),
+        1 => Ok(OscillatorType::Square),
+        2 => Ok(OscillatorType::Sawtooth),
+        3 => Ok(OscillatorType::Triangle),
+        _ => Err(JsErrorBox::generic(
+            "InvalidStateError: custom oscillator type is unavailable",
+        )),
+    }
+}
+
+fn install_state_wake_handler(
+    context: &AudioContext,
+    event_hub: &Arc<ContextEventHub>,
+) -> Result<(), JsErrorBox> {
+    let weak_hub = Arc::downgrade(event_hub);
+    panic::catch_unwind(AssertUnwindSafe(|| {
+        use web_audio_api::context::BaseAudioContext as _;
+        context.set_onstatechange(move |_| {
+            if let Some(hub) = weak_hub.upgrade() {
+                hub.enqueue_state_wake();
+            }
+        });
+    }))
+    .map_err(|payload| {
+        std::mem::forget(payload);
+        JsErrorBox::generic("state-handler installation panicked and poisoned its AudioContext")
+    })
+}
+
 #[op2]
 impl NativePhase0OnlineContext {
     #[constructor]
@@ -508,9 +606,14 @@ impl NativePhase0OnlineContext {
         state: &mut OpState,
         sample_rate: f64,
         initially_suspended: bool,
+        #[string] sink_id: Option<String>,
+        latency_hint: Option<u32>,
+        custom_latency: Option<f64>,
     ) -> Result<NativePhase0OnlineContext, JsErrorBox> {
         let runtime = Arc::clone(state.borrow::<Arc<AudioRuntimeState>>());
         validate_online_dimensions(&runtime, sample_rate)?;
+        let options =
+            exact_context_options(&runtime, sample_rate, sink_id, latency_hint, custom_latency)?;
         runtime.permissions.check_playback("AudioContext")?;
         let isolate_permit = runtime.try_reserve_online_context()?;
         let host_permit = runtime
@@ -523,7 +626,6 @@ impl NativePhase0OnlineContext {
             )?);
         let (observer_sender, observer_join) = spawn_lifecycle_observer()?;
 
-        let options = exact_context_options(sample_rate);
         let build = panic::catch_unwind(AssertUnwindSafe(|| {
             AudioContext::builder(Arc::clone(&runtime.output))
                 .options(options)
@@ -607,12 +709,17 @@ impl NativePhase0OnlineContext {
         }
         drop(observer_join);
 
-        Ok(NativePhase0OnlineContext {
-            state: Arc::new(NativeOnlineContextState {
-                context: Mutex::new(Some(Arc::new(context))),
-                event_hub,
-            }),
-        })
+        if let Err(error) = install_state_wake_handler(&context, &event_hub) {
+            drop(context);
+            return Err(error);
+        }
+
+        let state = Arc::new(NativeOnlineContextState {
+            context: Mutex::new(Some(Arc::new(context))),
+            event_hub,
+        });
+        let graph = OnlineGraph::new(Arc::clone(&state), Arc::clone(&runtime));
+        Ok(NativePhase0OnlineContext { state, graph })
     }
 
     #[getter]
@@ -643,6 +750,74 @@ impl NativePhase0OnlineContext {
     fn rooted_source_count(&self) -> u32 {
         u32::try_from(self.state.event_hub.rooted_source_count())
             .expect("bounded scheduled-source count fits u32")
+    }
+
+    #[getter]
+    fn base_latency(&self) -> Result<f64, JsErrorBox> {
+        Ok(self.state.context()?.base_latency())
+    }
+
+    #[getter]
+    fn output_latency(&self) -> Result<f64, JsErrorBox> {
+        Ok(self.state.context()?.output_latency())
+    }
+
+    #[getter]
+    #[string]
+    fn sink_id(&self) -> Result<String, JsErrorBox> {
+        Ok(self.state.context()?.sink_id())
+    }
+
+    #[getter]
+    #[smi]
+    fn number_of_channels(&self) -> u32 {
+        2
+    }
+
+    #[getter]
+    fn event_pump_refed(&self) -> bool {
+        self.graph.event_pump_refed()
+    }
+
+    #[cppgc]
+    fn destination(&self) -> Result<NativeAudioNode, JsErrorBox> {
+        self.graph.destination()
+    }
+
+    #[cppgc]
+    fn create_gain(
+        &self,
+        gain: f32,
+        channel_count: u32,
+        count_mode: u32,
+        interpretation: u32,
+    ) -> Result<NativeAudioNode, JsErrorBox> {
+        self.graph.create_gain(
+            gain,
+            channel_count as usize,
+            channel_count_mode(count_mode)?,
+            channel_interpretation(interpretation)?,
+        )
+    }
+
+    #[cppgc]
+    fn create_oscillator(
+        &self,
+        oscillator_type_value: u32,
+        frequency: f32,
+        detune: f32,
+        channel_count: u32,
+        count_mode: u32,
+        interpretation: u32,
+    ) -> Result<NativeAudioNode, JsErrorBox> {
+        self.graph.create_oscillator(
+            oscillator_type(oscillator_type_value)?,
+            frequency,
+            detune,
+            channel_count as usize,
+            channel_count_mode(count_mode)?,
+            channel_interpretation(interpretation)?,
+        )
     }
 }
 
@@ -788,6 +963,7 @@ mod tests {
             Arc::new(crate::AllowAllAudioPermissions),
             AudioLimits::default().max_online_contexts(Some(1)),
             Arc::new(web_audio_api::output::SystemAudioOutput::new()),
+            AudioEventPumpLiveness::Unref,
         ));
         drop(runtime.try_reserve_online_context().unwrap());
         assert_eq!(runtime.online_contexts(), 0);

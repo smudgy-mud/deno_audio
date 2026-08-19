@@ -48,8 +48,9 @@ fn extension_loads_after_web_platform_dependencies() {
             typeof OscillatorNode !== "function") {
           throw new Error("Phase 1 offline graph globals were not installed");
         }
-        if (typeof AudioContext !== "undefined") {
-          throw new Error("incomplete Phase 2 AudioContext was installed");
+        if (typeof AudioContext !== "function" ||
+            !(AudioContext.prototype instanceof BaseAudioContext)) {
+          throw new Error("Phase 2 AudioContext global was not installed");
         }
       "#,
         )

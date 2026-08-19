@@ -120,8 +120,8 @@ fn construct_with_state(runtime: &mut JsRuntime, global_name: &str, initially_su
         .expect("the private hosted context should construct");
 }
 
-#[test]
-fn configured_online_dimensions_reject_before_output_factory() {
+#[tokio::test(flavor = "current_thread")]
+async fn configured_online_dimensions_reject_before_output_factory() {
     for limits in [
         AudioLimits::unlimited().max_channels(Some(1)),
         AudioLimits::unlimited().max_sample_rate(Some(44_100)),
@@ -392,8 +392,8 @@ impl AudioOutputFactory for UnconfirmedFactory {
     }
 }
 
-#[test]
-fn unconfirmed_isolate_drop_retains_the_shared_permit() {
+#[tokio::test(flavor = "current_thread")]
+async fn unconfirmed_isolate_drop_retains_the_shared_permit() {
     let host = Arc::new(AudioHost::new(
         AudioHostLimits::default().max_online_contexts(Some(1)),
     ));
@@ -410,8 +410,8 @@ fn unconfirmed_isolate_drop_retains_the_shared_permit() {
     );
 }
 
-#[test]
-fn shared_audio_bytes_exhaust_and_recover_across_isolates() {
+#[tokio::test(flavor = "current_thread")]
+async fn shared_audio_bytes_exhaust_and_recover_across_isolates() {
     let host = Arc::new(AudioHost::new(
         AudioHostLimits::default().max_live_audio_bytes(Some(12)),
     ));
@@ -595,6 +595,10 @@ async fn render_callback_death_poison_closes_and_releases_after_acknowledgement(
 
     factory.trigger();
     wait_until(|| host.usage().online_contexts() == 0);
+    // The event observer is deliberately unreferenced so an otherwise idle
+    // AudioContext cannot pin Deno's event loop. Give its already-signaled
+    // blocking reconciliation task time to publish before polling the realm.
+    std::thread::sleep(Duration::from_millis(100));
     runtime
         .execute_script(
             "phase0d_render_death.js",
@@ -615,6 +619,114 @@ async fn render_callback_death_poison_closes_and_releases_after_acknowledgement(
         .run_event_loop(deno_core::PollEventLoopOptions::default())
         .await
         .expect("post-death rejection should settle without V8 from the callback");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_context_observes_endpoint_death_without_an_active_source() {
+    let host = Arc::new(AudioHost::new(
+        AudioHostLimits::default().max_online_contexts(Some(1)),
+    ));
+    let factory = Arc::new(DeathFactory::new());
+    let mut runtime = runtime(Arc::clone(&host), factory.clone());
+    runtime
+        .execute_script(
+            "phase2_public_render_death_setup.js",
+            r"
+              const context = new AudioContext({ sampleRate: 48000 });
+              let stateChanges = 0;
+              context.onstatechange = () => stateChanges++;
+              globalThis.__publicDeathContext = context;
+              globalThis.__publicDeathStateChanges = () => stateChanges;
+            ",
+        )
+        .expect("the public hosted context should construct");
+
+    factory.trigger();
+    wait_until(|| host.usage().online_contexts() == 0);
+    runtime
+        .run_event_loop(deno_core::PollEventLoopOptions::default())
+        .await
+        .expect("the unreferenced state observer should dispatch ready terminal work");
+    runtime
+        .execute_script(
+            "phase2_public_render_death_result.js",
+            r#"
+              if (globalThis.__publicDeathContext.state !== "closed") {
+                throw new Error("endpoint death did not close the public context");
+              }
+              if (globalThis.__publicDeathStateChanges() !== 1) {
+                throw new Error("endpoint death did not dispatch statechange exactly once");
+              }
+            "#,
+        )
+        .expect("public terminal state should be observable without a source pump");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn endpoint_death_terminal_batch_releases_started_javascript_source_roots() {
+    let host = Arc::new(AudioHost::new(
+        AudioHostLimits::default().max_online_contexts(Some(1)),
+    ));
+    let factory = Arc::new(DeathFactory::new());
+    let mut runtime = runtime(Arc::clone(&host), factory.clone());
+    runtime
+        .execute_script(
+            "phase2_public_started_render_death_setup.js",
+            r"
+              globalThis.__publicStartedDeathContext = new AudioContext({
+                sampleRate: 48000,
+              });
+              const source = __publicStartedDeathContext.createOscillator();
+              source.start();
+            ",
+        )
+        .expect("a public started source should construct");
+    assert_eq!(host.usage().graph_nodes(), 3);
+    assert_eq!(host.usage().scheduled_sources(), 1);
+
+    factory.trigger();
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    while host.usage().online_contexts() != 0 {
+        runtime
+            .run_event_loop(deno_core::PollEventLoopOptions::default())
+            .await
+            .expect("terminal event reconciliation should remain healthy");
+        assert!(
+            Instant::now() < deadline,
+            "endpoint death did not retire its public context"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    runtime
+        .run_event_loop(deno_core::PollEventLoopOptions::default())
+        .await
+        .expect("the terminal event batch should settle");
+    runtime
+        .execute_script(
+            "phase2_public_started_render_death_result.js",
+            r#"
+              if (__publicStartedDeathContext.state !== "closed") {
+                throw new Error("endpoint death did not close the public context");
+              }
+            "#,
+        )
+        .expect("the public context should expose terminal state");
+
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    loop {
+        runtime
+            .v8_isolate()
+            .request_garbage_collection_for_testing(deno_core::v8::GarbageCollectionType::Full);
+        let usage = host.usage();
+        if usage.graph_nodes() == 0 && usage.scheduled_sources() == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "terminal event retirement retained JavaScript source roots: {usage:?}"
+        );
+        std::thread::yield_now();
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -815,13 +927,10 @@ async fn saturated_scheduled_sources_dispatch_once_or_release_on_close() {
         host.usage().scheduled_sources(),
         SOURCE_COUNT - DISPATCHED_BEFORE_CLOSE
     );
-    // Dropping reconciled wrappers requests exact node teardown; graph-node reservations remain
-    // charged until the renderer acknowledgement and lifetime cleanup complete off the isolate.
-    wait_until(|| host.usage().graph_nodes() == (SOURCE_COUNT - DISPATCHED_BEFORE_CLOSE) * 3);
-    assert_eq!(
-        host.usage().graph_nodes(),
-        (SOURCE_COUNT - DISPATCHED_BEFORE_CLOSE) * 3
-    );
+    // Reconciliation releases the scheduled-source roots, but the test deliberately retains all
+    // JavaScript wrappers. Public source objects remain readable after `ended`, so their exact
+    // graph lifetimes stay charged until wrapper GC or whole-context retirement.
+    assert_eq!(host.usage().graph_nodes(), SOURCE_COUNT * 3);
 
     close(&mut runtime, "eventContext").await;
     wait_until(|| {

@@ -5,17 +5,18 @@ A [Web Audio API](https://webaudio.github.io/web-audio-api/) extension for
 standard Web Platform extensions, delegating DSP and rendering to
 the [Smudgy `web-audio-api-rs` fork](https://github.com/smudgy-mud/web-audio-api-rs).
 
-**Status: Phase 1 complete and unreleased.** The native engine, bounded
+**Status: Phase 2 in progress and unreleased.** The native engine, bounded
 ownership model, and hosted silent/CPAL/Cubeb output paths have passed their
-Phase 0 acceptance gates. The Phase 1 extension exposes `AudioBuffer` and a
-production-bounded offline graph: `OfflineAudioContext`, the base node
-interfaces, `GainNode`, fixed-wave `OscillatorNode`, their `AudioParam`s,
-explicit connections, automation, rendering, and completion events. Its
-deterministic integration, constructor/brand/error, teardown, resource-limit,
-and pinned WPT acceptance gates pass with and without default features. Online
-`AudioContext`, decoding, additional node families, custom `PeriodicWave`, and
-full browser conformance remain later slices, so this is useful offline Web
-Audio rather than a complete API.
+Phase 0 acceptance gates, and the deterministic Phase 1 offline graph is
+complete. The extension now also exposes the first production-bounded online
+slice: `AudioContext`, destination, `GainNode`, fixed-wave `OscillatorNode`,
+scalar `AudioParam.value`, explicit connections, lifecycle methods,
+`statechange`, and exactly-once `ended`. The same JavaScript surface renders
+through built-in system output or an embedder-supplied `AudioOutputFactory`.
+`AudioBufferSourceNode`, `ConstantSourceNode`, `decodeAudioData`, custom
+`PeriodicWave`, online parameter automation, additional node families, and
+full browser conformance remain later Phase 2/3 slices, so this is not yet a
+complete Web Audio API.
 
 The public `AudioBuffer` implements Web IDL conversion, nominal-range and brand
 checks, standard prototype descriptors, `getChannelData()`,
@@ -46,15 +47,14 @@ global. A startup-snapshot smoke test proves that immutable class bootstrap does
 not capture an `AudioHost` or other runtime-native authority.
 
 The remaining private proof objects and ops cover `CppGC`, owned asynchronous
-work, shared `AudioHost` accounting, online lifecycle
-ownership, render-death handling, scheduled-source reconciliation, and bounded
-off-thread decoding. Exact oscillator graph nodes and their construction and
-runtime commands are reserved against isolate and shared-host ceilings before
-mutation and remain charged through typed rollback or physical retirement. A
-bounded fake process mixer proves that independent hosted graphs and native
-input can share one physical-output owner without coupling clocks or
-retirement. These seams remain private until their corresponding Phase 1 or
-Phase 2 JavaScript classes land.
+work, shared `AudioHost` accounting, and bounded off-thread decoding. Online
+lifecycle ownership, render-death handling, scheduled-source reconciliation,
+exact oscillator graph nodes, and exact connection/control reservations now
+back the public `AudioContext` slice. Their resources are reserved against
+isolate and shared-host ceilings before mutation and remain charged through
+typed rollback or physical retirement. A bounded fake process mixer proves
+that independent hosted graphs and native input can share one physical-output
+owner without coupling clocks or retirement.
 
 The research baseline is deliberately locked to one compatibility set:
 
@@ -64,9 +64,9 @@ The research baseline is deliberately locked to one compatibility set:
 - `deno_error` 0.7.1
 - `serde_v8` 0.319.0
 - the Smudgy `web-audio-api` fork at commit
-  `c7244534cbc28992b0b2c8c88a3e647061b7a215` (the reviewed hosted-output
-  compatibility stack plus fixed scheduled-source capacity and opaque graph-node/control-command
-  reservation lifetimes, including the permanent hosted bootstrap, based on 1.7.0)
+  `3455e57bde836a142faa3083cfbd3635dcf21b79` (the reviewed hosted-output
+  compatibility stack plus exact node, connection, scheduled-source, and
+  control-command reservation lifetimes, based on 1.7.0)
 
 The Deno crates move as a coordinated tuple. Upgrade them together in one
 reviewed change, and keep `Cargo.lock` committed so Phase 0 evidence remains
@@ -115,7 +115,11 @@ connect/disconnect, and offline rendering.
 Each extension instance is initialized with `AudioExtensionOptions`. Sharing
 one `Arc<AudioHost>` across options makes the configured aggregate limits span
 isolates; output and permission services remain separate authorities. The
-private Phase 0D proof surface uses this same ownership shape. Decode requests
+default `AudioEventPumpLiveness::Unref` lets an otherwise idle `JsRuntime`
+finish even while a context is open; session-style embedders can select
+`AudioEventPumpLiveness::Ref` to keep the event loop alive until online context
+observers retire. Neither mode weakens cancellation-independent native
+teardown. Decode requests
 reserve their encoded copy, concurrent job, result dimensions, and every
 wrapper-owned PCM allocation before spawning or growing. Offline render
 requests likewise reserve dimensions, output PCM, and a job slot before native
@@ -124,9 +128,8 @@ graph bootstrap and every currently exposed user graph batch, including suspende
 Lifecycle barriers and mandatory teardown records remain governed by their separate bounded
 upstream channels so cleanup never depends on user quota. The raw proof objects
 remain available only through unsafe native exposure in tests and are not a
-supported JavaScript API. Public offline code should use `OfflineAudioContext`;
-the audible `AudioContext` remains absent until the online lifecycle surface is
-completed.
+supported JavaScript API. Public code should use `OfflineAudioContext` for
+deterministic rendering and `AudioContext` for the supported audible subset.
 
 The engine revision is currently available only in the maintainer's local fork
 history. A fresh external checkout cannot resolve the canonical Git dependency

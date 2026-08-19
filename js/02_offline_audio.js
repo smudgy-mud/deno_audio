@@ -11,7 +11,7 @@ import {
   createAudioBuffer,
 } from "ext:deno_audio/01_audio_buffer.js";
 
-const { NativeOfflineAudioContext } = core.ops;
+const { NativeOfflineAudioContext, NativePhase0OnlineContext } = core.ops;
 const { markNotSerializable } = core.loadExtScript(
   "ext:deno_web/13_message_port.js",
 );
@@ -24,14 +24,19 @@ const {
 const {
   ArrayPrototypePush,
   Float32Array,
+  MapPrototypeDelete,
+  MapPrototypeGet,
+  MapPrototypeSet,
   NumberIsFinite,
   ObjectPrototypeIsPrototypeOf,
   RangeError,
   RangeErrorPrototype,
   ReflectApply,
+  SafeMap,
   SafeSet,
   SafeSetIterator,
   SafeWeakMap,
+  SafeWeakRef,
   SetPrototypeAdd,
   SetPrototypeClear,
   SetPrototypeDelete,
@@ -43,6 +48,7 @@ const {
   TypeErrorPrototype,
   WeakMapPrototypeGet,
   WeakMapPrototypeSet,
+  WeakRefPrototypeDeref,
 } = primordials;
 
 const MAX_AUTOMATION_CURVE_SAMPLES = 1_048_576;
@@ -72,6 +78,66 @@ webidl.converters.AutomationRate = webidl.createEnumConverter(
 webidl.converters.OscillatorType = webidl.createEnumConverter(
   "OscillatorType",
   ["sine", "square", "sawtooth", "triangle", "custom"],
+);
+webidl.converters.AudioContextLatencyCategory = webidl.createEnumConverter(
+  "AudioContextLatencyCategory",
+  ["balanced", "interactive", "playback"],
+);
+webidl.converters.AudioSinkType = webidl.createEnumConverter(
+  "AudioSinkType",
+  ["none"],
+);
+
+webidl.converters.AudioSinkOptions = webidl.createDictionaryConverter(
+  "AudioSinkOptions",
+  [{
+    key: "type",
+    converter: webidl.converters.AudioSinkType,
+    required: true,
+  }],
+);
+
+function convertLatencyHint(value, prefix, context) {
+  if (typeof value === "number") {
+    value = webidl.converters.double(value, prefix, context);
+    if (!NumberIsFinite(value) || value <= 0) {
+      throw new RangeError("A numeric latencyHint must be finite and positive.");
+    }
+    return value;
+  }
+  return webidl.converters.AudioContextLatencyCategory(
+    value,
+    prefix,
+    context,
+  );
+}
+
+function convertSinkId(value, prefix, context) {
+  if (value !== null && typeof value === "object") {
+    webidl.converters.AudioSinkOptions(value, prefix, context);
+    return "none";
+  }
+  return webidl.converters.DOMString(value, prefix, context);
+}
+
+webidl.converters.AudioContextOptions = webidl.createDictionaryConverter(
+  "AudioContextOptions",
+  [
+    {
+      key: "latencyHint",
+      converter: convertLatencyHint,
+      defaultValue: "interactive",
+    },
+    {
+      key: "sampleRate",
+      converter: webidl.converters.float,
+    },
+    {
+      key: "sinkId",
+      converter: convertSinkId,
+      defaultValue: "",
+    },
+  ],
 );
 
 const audioNodeOptionsMembers = [
@@ -243,7 +309,10 @@ function rethrowNativeError(error, operation) {
     "IndexSizeError",
     "InvalidAccessError",
     "InvalidStateError",
+    "NotAllowedError",
+    "NotFoundError",
     "NotSupportedError",
+    "QuotaExceededError",
   ];
   for (let i = 0; i < names.length; ++i) {
     if (StringPrototypeIncludes(message, names[i])) {
@@ -345,6 +414,112 @@ function createDestination(context, native) {
   return destination;
 }
 
+function contextStateName(value) {
+  switch (value) {
+    case 0:
+      return "suspended";
+    case 1:
+      return "running";
+    default:
+      return "closed";
+  }
+}
+
+function updateOnlineState(context, record) {
+  let state;
+  try {
+    state = contextStateName(record.native.contextState);
+  } catch {
+    state = "closed";
+  }
+  if (state !== record.state) {
+    record.state = state;
+    dispatch(context, new Event("statechange"));
+  }
+}
+
+function dispatchEndedIds(record, ids) {
+  for (let i = 0; i < ids.length; ++i) {
+    const source = MapPrototypeGet(record.sourceById, ids[i]);
+    if (source === undefined) continue;
+    MapPrototypeDelete(record.sourceById, ids[i]);
+    SetPrototypeDelete(record.sources, source);
+    const sourceRecord = nodeRecord(source);
+    if (!sourceRecord.ended) {
+      sourceRecord.ended = true;
+      dispatch(source, new Event("ended"));
+    }
+  }
+}
+
+function releaseOnlineSources(record) {
+  record.sourceById = new SafeMap();
+  SetPrototypeClear(record.sources);
+}
+
+function publishOnlineEventWait(contextRef, pending) {
+  const context = WeakRefPrototypeDeref(contextRef);
+  if (context === undefined) return;
+  const record = contextRecord(context);
+  record.eventPumpPending = pending;
+  if (record.eventPumpClosing) core.refOpPromise(pending);
+}
+
+function clearOnlineEventWait(contextRef, pending) {
+  const context = WeakRefPrototypeDeref(contextRef);
+  if (context === undefined) return;
+  const record = contextRecord(context);
+  if (record.eventPumpPending === pending) {
+    record.eventPumpPending = undefined;
+  }
+}
+
+function dispatchOnlineEventBatch(contextRef, batch) {
+  const context = WeakRefPrototypeDeref(contextRef);
+  if (context === undefined) return false;
+  const record = contextRecord(context);
+  dispatchEndedIds(record, batch.endedIds);
+  if (batch.stateChanged || batch.closed) {
+    updateOnlineState(context, record);
+  }
+  if (batch.closed) {
+    record.eventPumpRetired = true;
+    releaseOnlineSources(record);
+  }
+  return !batch.closed;
+}
+
+function finishOnlineEventPump(contextRef, error = undefined) {
+  const context = WeakRefPrototypeDeref(contextRef);
+  if (context === undefined) return;
+  const record = contextRecord(context);
+  record.eventPumpError = error;
+}
+
+async function pumpOnlineEvents(contextRef, native, refed) {
+  let failure;
+  try {
+    while (true) {
+      let batch;
+      let pending;
+      try {
+        pending = core.ops.op_online_wait_events(native);
+        if (!refed) core.unrefOpPromise(pending);
+        publishOnlineEventWait(contextRef, pending);
+        batch = await pending;
+      } catch (error) {
+        failure = error;
+        return;
+      } finally {
+        if (pending !== undefined) clearOnlineEventWait(contextRef, pending);
+      }
+      if (!dispatchOnlineEventBatch(contextRef, batch)) return;
+    }
+  } finally {
+    finishOnlineEventPump(contextRef, failure);
+  }
+}
+
 function ensureSameContext(source, destination) {
   if (source.context !== destination.context) {
     throw domException(
@@ -384,7 +559,9 @@ class BaseAudioContext extends EventTarget {
   }
 
   get state() {
-    return contextRecord(this).state;
+    const record = contextRecord(this);
+    if (record.online) updateOnlineState(this, record);
+    return record.state;
   }
 
   createBuffer(numberOfChannels, length, sampleRate) {
@@ -478,6 +655,7 @@ class OfflineAudioContext extends BaseAudioContext {
       __proto__: null,
       destination: undefined,
       native,
+      online: false,
       rendering: false,
       sources: new SafeSet(),
       state: "suspended",
@@ -541,6 +719,140 @@ class OfflineAudioContext extends BaseAudioContext {
   }
 }
 
+class AudioContext extends BaseAudioContext {
+  constructor(options = undefined) {
+    super(constructContext);
+    const prefix = "Failed to construct 'AudioContext'";
+    options = webidl.converters.AudioContextOptions(
+      options,
+      prefix,
+      "Argument 1",
+    );
+    if (
+      options.sampleRate !== undefined &&
+      (options.sampleRate < 3000 || options.sampleRate > 768000)
+    ) {
+      throw domException(
+        "The AudioContext sampleRate is outside the supported range.",
+        "NotSupportedError",
+      );
+    }
+    const latencyHint = options.latencyHint;
+    const latencyCode = typeof latencyHint === "number"
+      ? 3
+      : latencyHint === "balanced"
+      ? 0
+      : latencyHint === "playback"
+      ? 2
+      : 1;
+    const native = callNative("AudioContext construction", () =>
+      new NativePhase0OnlineContext(
+        options.sampleRate ?? 0,
+        false,
+        options.sinkId,
+        latencyCode,
+        typeof latencyHint === "number" ? latencyHint : undefined,
+      ));
+    const record = {
+      __proto__: null,
+      closePromise: undefined,
+      destination: undefined,
+      eventPumpClosing: false,
+      eventPumpError: undefined,
+      eventPumpPending: undefined,
+      eventPumpPromise: undefined,
+      eventPumpRefed: native.eventPumpRefed,
+      eventPumpRetired: false,
+      native,
+      online: true,
+      sourceById: new SafeMap(),
+      sources: new SafeSet(),
+      state: contextStateName(native.contextState),
+    };
+    WeakMapPrototypeSet(nativeContexts, this, record);
+    record.destination = createDestination(this, native.destination());
+    record.eventPumpPromise = pumpOnlineEvents(
+      new SafeWeakRef(this),
+      native,
+      record.eventPumpRefed,
+    );
+  }
+
+  get baseLatency() {
+    return contextRecord(this).native.baseLatency;
+  }
+
+  get outputLatency() {
+    return contextRecord(this).native.outputLatency;
+  }
+
+  get sinkId() {
+    return contextRecord(this).native.sinkId;
+  }
+
+  async suspend() {
+    const record = contextRecord(this);
+    if (record.state === "closed") {
+      throw domException("The AudioContext is closed.", "InvalidStateError");
+    }
+    try {
+      await core.ops.op_phase0_online_suspend(record.native);
+    } catch (error) {
+      updateOnlineState(this, record);
+      rethrowNativeError(error, "AudioContext suspend");
+    }
+    updateOnlineState(this, record);
+  }
+
+  async resume() {
+    const record = contextRecord(this);
+    if (record.state === "closed") {
+      throw domException("The AudioContext is closed.", "InvalidStateError");
+    }
+    try {
+      await core.ops.op_phase0_online_resume(record.native);
+    } catch (error) {
+      updateOnlineState(this, record);
+      rethrowNativeError(error, "AudioContext resume");
+    }
+    updateOnlineState(this, record);
+  }
+
+  close() {
+    const record = contextRecord(this);
+    if (record.closePromise !== undefined) return record.closePromise;
+    record.closePromise = closeOnlineContext(this, record);
+    return record.closePromise;
+  }
+}
+
+async function closeOnlineContext(context, record) {
+  if (record.eventPumpRetired) return;
+  record.eventPumpClosing = true;
+  if (record.eventPumpPending !== undefined) {
+    core.refOpPromise(record.eventPumpPending);
+  }
+  try {
+    await core.ops.op_phase0_online_close(record.native);
+  } catch (error) {
+    record.eventPumpClosing = false;
+    if (!record.eventPumpRefed && record.eventPumpPending !== undefined) {
+      core.unrefOpPromise(record.eventPumpPending);
+    }
+    updateOnlineState(context, record);
+    rethrowNativeError(error, "AudioContext close");
+  }
+  try {
+    await record.eventPumpPromise;
+    if (record.eventPumpError !== undefined) {
+      rethrowNativeError(record.eventPumpError, "AudioContext event retirement");
+    }
+  } finally {
+    releaseOnlineSources(record);
+  }
+  updateOnlineState(context, record);
+}
+
 class AudioNode extends EventTarget {
   constructor(key = undefined) {
     super();
@@ -576,7 +888,7 @@ class AudioNode extends EventTarget {
       value !== contextRecord(record.context).native.numberOfChannels
     ) {
       throw domException(
-        "The offline destination channelCount cannot be changed.",
+        "The destination channelCount cannot be changed.",
         "InvalidStateError",
       );
     }
@@ -604,7 +916,7 @@ class AudioNode extends EventTarget {
       value !== "explicit"
     ) {
       throw domException(
-        "The offline destination channelCountMode cannot be changed.",
+        "The destination channelCountMode cannot be changed.",
         "InvalidStateError",
       );
     }
@@ -752,7 +1064,7 @@ class OscillatorNode extends AudioScheduledSourceNode {
     validateNodeOptions(options, prefix);
     if (options.type === "custom" || options.periodicWave !== undefined) {
       throw domException(
-        "Custom PeriodicWave oscillators are not available in this bounded offline slice.",
+        "Custom PeriodicWave oscillators are not available in this bounded Web Audio slice.",
         "NotSupportedError",
       );
     }
@@ -813,7 +1125,12 @@ class OscillatorNode extends AudioScheduledSourceNode {
     }
     callNative("OscillatorNode start", () => record.native.start(when));
     record.started = true;
-    SetPrototypeAdd(contextRecord(record.context).sources, this);
+    const contextState = contextRecord(record.context);
+    SetPrototypeAdd(contextState.sources, this);
+    if (contextState.online) {
+      const id = record.native.sourceId;
+      MapPrototypeSet(contextState.sourceById, id, this);
+    }
   }
 
   stop(when = 0) {
@@ -835,7 +1152,7 @@ class OscillatorNode extends AudioScheduledSourceNode {
     webidl.requiredArguments(arguments.length, 1, prefix);
     webidl.converters.object(periodicWave, prefix, "Argument 1");
     throw domException(
-      "PeriodicWave is not available in this bounded offline slice.",
+      "PeriodicWave is not available in this bounded Web Audio slice.",
       "NotSupportedError",
     );
   }
@@ -1008,6 +1325,8 @@ class OfflineAudioCompletionEvent extends Event {
 
 webidl.configureInterface(BaseAudioContext);
 const BaseAudioContextPrototype = BaseAudioContext.prototype;
+webidl.configureInterface(AudioContext);
+const AudioContextPrototype = AudioContext.prototype;
 webidl.configureInterface(OfflineAudioContext);
 const OfflineAudioContextPrototype = OfflineAudioContext.prototype;
 webidl.configureInterface(AudioNode);
@@ -1044,6 +1363,7 @@ webidl.converters.AudioParam = webidl.createInterfaceConverter(
 
 const publicPrototypes = [
   BaseAudioContextPrototype,
+  AudioContextPrototype,
   OfflineAudioContextPrototype,
   AudioNodePrototype,
   AudioDestinationNodePrototype,
@@ -1058,6 +1378,7 @@ for (let i = 0; i < publicPrototypes.length; ++i) {
 }
 
 export {
+  AudioContext,
   AudioDestinationNode,
   AudioNode,
   AudioParam,

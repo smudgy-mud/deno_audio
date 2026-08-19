@@ -10,6 +10,13 @@ Web Audio surface.
 
 ### Added
 
+- The first public online Web Audio slice: `AudioContext`, destination, Gain,
+  fixed-wave Oscillator, scalar `AudioParam.value`, exact connect/disconnect,
+  suspend/resume/close, acknowledged state changes, and exactly-once `ended`
+  over built-in or host-injected output.
+- Explicit `AudioEventPumpLiveness` policy, defaulting to an unreferenced event
+  observer while allowing session embedders to keep Deno's loop alive until
+  online contexts retire.
 - A bounded public offline Web Audio graph with `OfflineAudioContext`, the base
   node hierarchy, destination, Gain, four fixed Oscillator waveforms,
   `AudioParam` automation, explicit connect/disconnect overloads, off-isolate

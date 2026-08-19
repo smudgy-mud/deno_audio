@@ -21,7 +21,10 @@ mod scheduled;
 pub use host::{
     AudioHost, AudioHostLimitError, AudioHostLimits, AudioHostResourceKind, AudioHostUsage,
 };
-pub use options::{AllowAllAudioPermissions, AudioExtensionOptions, AudioLimits, AudioPermissions};
+pub use options::{
+    AllowAllAudioPermissions, AudioEventPumpLiveness, AudioExtensionOptions, AudioLimits,
+    AudioPermissions,
+};
 
 deno_core::extension!(
     deno_audio,
@@ -34,6 +37,7 @@ deno_core::extension!(
         online::op_phase0_online_resume,
         online::op_phase0_online_close,
         scheduled::op_phase0_wait_ended,
+        scheduled::op_online_wait_events,
     ],
     objects = [
         binding::NativePhase0Probe,
@@ -57,7 +61,13 @@ deno_core::extension!(
         options: AudioExtensionOptions,
     },
     state = |state, extension_options| {
-        let (host, permissions, limits, output) = extension_options.options.into_parts();
+        let options::AudioExtensionParts {
+            host,
+            permissions,
+            limits,
+            output,
+            event_pump_liveness,
+        } = extension_options.options.into_parts();
         let native_audio_byte_limit = limits
             .live_audio_bytes()
             .unwrap_or(usize::MAX);
@@ -74,6 +84,7 @@ deno_core::extension!(
             permissions,
             limits,
             output,
+            event_pump_liveness,
         )));
     },
 );

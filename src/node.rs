@@ -1,22 +1,30 @@
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use deno_core::{op2, v8, GarbageCollected};
 use deno_error::JsErrorBox;
-use web_audio_api::context::{BaseAudioContext, OfflineAudioContext};
+use web_audio_api::context::{
+    AudioContext, AudioControlBatchReservation, AudioControlBatchReservationProvider,
+    AudioExplicitConnectionReservation, AudioExplicitConnectionReservationProvider,
+    AudioGraphConnectionReservation, AudioNodeLifetimeReservation, BaseAudioContext,
+    OfflineAudioContext,
+};
 use web_audio_api::node::{
-    AudioDestinationNode, AudioNode, AudioNodeOptions, AudioScheduledSourceNode,
-    AudioScheduledSourceNodeExt, ChannelCountMode, ChannelInterpretation, GainNode, GainOptions,
-    OscillatorNode, OscillatorOptions, OscillatorType,
+    AudioDestinationNode, AudioNode, AudioNodeDisconnectSelector, AudioNodeOptions,
+    AudioScheduledSourceNode, AudioScheduledSourceNodeExt, ChannelCountMode, ChannelInterpretation,
+    GainNode, GainOptions, OscillatorNode, OscillatorOptions, OscillatorType,
 };
 use web_audio_api::{AudioParam, AutomationRate};
 
 use crate::buffer::{NativeAudioByteBudget, NativeAudioByteReservation};
 use crate::host::{AudioHostReservation, AudioHostResourceKind};
-use crate::online::{AudioRuntimeState, ControlCommandReservations, IsolateReservation};
+use crate::online::{
+    AudioRuntimeState, ControlCommandReservations, IsolateReservation, NativeOnlineContextState,
+};
+use crate::scheduled::ScheduledSourceRoot;
 
 const MAGIC_NODE_COUNT: usize = 11;
 const MAGIC_COMMAND_COUNT: usize = 21;
@@ -24,17 +32,10 @@ const GAIN_NODE_COUNT: usize = 2;
 const GAIN_COMMAND_COUNT_WITH_TEARDOWN: usize = 6;
 const OSCILLATOR_NODE_COUNT: usize = 3;
 const OSCILLATOR_COMMAND_COUNT_WITH_TEARDOWN: usize = 10;
+const EXACT_GAIN_NODE_COUNT: usize = 2;
+const EXACT_GAIN_CONSTRUCTION_COMMAND_COUNT: usize = 4;
+const EXACT_OSCILLATOR_OPTION_COMMAND_LIMIT: usize = 3;
 const MAX_AUTOMATION_CURVE_SAMPLES: usize = 1_048_576;
-
-static NEXT_OFFLINE_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
-
-fn next_context_id() -> Result<u64, JsErrorBox> {
-    NEXT_OFFLINE_CONTEXT_ID
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            current.checked_add(1)
-        })
-        .map_err(|_| JsErrorBox::generic("offline audio context identity space is exhausted"))
-}
 
 fn host_reservation(
     runtime: &AudioRuntimeState,
@@ -95,6 +96,11 @@ struct ConnectionReservations {
     _host: AudioHostReservation,
 }
 
+struct OnlineGraphNodeReservations {
+    _isolate: IsolateReservation,
+    _host: AudioHostReservation,
+}
+
 struct AutomationReservations {
     _isolate: IsolateReservation,
     _host: AudioHostReservation,
@@ -121,7 +127,6 @@ pub(crate) struct OfflineGraph {
     context: Arc<OfflineAudioContext>,
     runtime: Arc<AudioRuntimeState>,
     byte_budget: Arc<NativeAudioByteBudget>,
-    context_id: u64,
     inner: Mutex<OfflineGraphInner>,
 }
 
@@ -141,7 +146,6 @@ impl OfflineGraph {
             "graph-node",
         )?;
         let commands = runtime.try_reserve_control_commands(MAGIC_COMMAND_COUNT)?;
-        let context_id = next_context_id()?;
         let context = panic::catch_unwind(AssertUnwindSafe(|| {
             OfflineAudioContext::new(number_of_channels, length, sample_rate)
         }))
@@ -156,7 +160,6 @@ impl OfflineGraph {
             context: Arc::new(context),
             runtime,
             byte_budget,
-            context_id,
             inner: Mutex::new(OfflineGraphInner {
                 phase: OfflineGraphPhase::Open,
                 next_node_id: 1,
@@ -313,7 +316,7 @@ impl OfflineGraph {
 
     pub(crate) fn destination(self: &Arc<Self>) -> NativeAudioNode {
         NativeAudioNode::from_handle(Arc::new(NativeNodeHandle {
-            graph: Arc::clone(self),
+            graph: NativeGraph::Offline(Arc::clone(self)),
             id: 0,
             kind: NativeNodeKind::Destination(self.context.destination()),
         }))
@@ -354,12 +357,12 @@ impl OfflineGraph {
             }
         };
         let parameter = Arc::new(NativeNodeHandle {
-            graph: Arc::clone(self),
+            graph: NativeGraph::Offline(Arc::clone(self)),
             id: first + 1,
             kind: NativeNodeKind::Param(node.gain().clone()),
         });
         Ok(NativeAudioNode::from_handle(Arc::new(NativeNodeHandle {
-            graph: Arc::clone(self),
+            graph: NativeGraph::Offline(Arc::clone(self)),
             id: first,
             kind: NativeNodeKind::Gain { node, parameter },
         })))
@@ -413,17 +416,17 @@ impl OfflineGraph {
             }
         };
         let frequency = Arc::new(NativeNodeHandle {
-            graph: Arc::clone(self),
+            graph: NativeGraph::Offline(Arc::clone(self)),
             id: first + 1,
             kind: NativeNodeKind::Param(node.frequency().clone()),
         });
         let detune = Arc::new(NativeNodeHandle {
-            graph: Arc::clone(self),
+            graph: NativeGraph::Offline(Arc::clone(self)),
             id: first + 2,
             kind: NativeNodeKind::Param(node.detune().clone()),
         });
         Ok(NativeAudioNode::from_handle(Arc::new(NativeNodeHandle {
-            graph: Arc::clone(self),
+            graph: NativeGraph::Offline(Arc::clone(self)),
             id: first,
             kind: NativeNodeKind::Oscillator {
                 node: Box::new(Mutex::new(node)),
@@ -440,9 +443,7 @@ impl OfflineGraph {
         output: usize,
         input: usize,
     ) -> Result<(), JsErrorBox> {
-        if !Arc::ptr_eq(&source.graph, &destination.graph)
-            || source.graph.context_id != self.context_id
-        {
+        if !source.graph.is_offline(self) || !destination.graph.is_offline(self) {
             return Err(JsErrorBox::generic(
                 "InvalidAccessError: nodes belong to different audio contexts",
             ));
@@ -513,13 +514,13 @@ impl OfflineGraph {
         output: Option<usize>,
         input: Option<usize>,
     ) -> Result<(), JsErrorBox> {
-        if source.graph.context_id != self.context_id {
+        if !source.graph.is_offline(self) {
             return Err(JsErrorBox::generic(
                 "InvalidAccessError: source belongs to a different audio context",
             ));
         }
         if let Some(destination) = destination {
-            if !Arc::ptr_eq(&source.graph, &destination.graph) {
+            if !destination.graph.is_offline(self) {
                 return Err(JsErrorBox::generic(
                     "InvalidAccessError: nodes belong to different audio contexts",
                 ));
@@ -624,6 +625,426 @@ impl OfflineGraph {
     }
 }
 
+/// Resource-accounted public graph over one exact hosted `AudioContext`.
+///
+/// The engine registry remains authoritative for explicit-edge identity. Host reservations are
+/// acquired lazily from that serialized transaction and attached to the engine's node, edge, and
+/// batch lifetimes instead of being mirrored in this binding.
+pub(crate) struct OnlineGraph {
+    state: Arc<NativeOnlineContextState>,
+    runtime: Arc<AudioRuntimeState>,
+}
+
+impl OnlineGraph {
+    pub(crate) fn new(
+        state: Arc<NativeOnlineContextState>,
+        runtime: Arc<AudioRuntimeState>,
+    ) -> Arc<Self> {
+        Arc::new(Self { state, runtime })
+    }
+
+    fn context(&self) -> Result<Arc<AudioContext>, JsErrorBox> {
+        self.state.context()
+    }
+
+    pub(crate) fn event_pump_refed(&self) -> bool {
+        self.runtime.event_pump_refed()
+    }
+
+    fn ensure_default_channel_options(
+        channel_count: usize,
+        count_mode: ChannelCountMode,
+        interpretation: ChannelInterpretation,
+    ) -> Result<(), JsErrorBox> {
+        if channel_count != 2
+            || count_mode != ChannelCountMode::Max
+            || interpretation != ChannelInterpretation::Speakers
+        {
+            return Err(JsErrorBox::generic(
+                "NotSupportedError: exact online channel configuration is not yet mutable",
+            ));
+        }
+        Ok(())
+    }
+
+    fn reserve_node_lifetime(
+        &self,
+        count: usize,
+    ) -> Result<AudioNodeLifetimeReservation, JsErrorBox> {
+        let isolate = self.runtime.try_reserve_graph_nodes(count)?;
+        let host = host_reservation(
+            &self.runtime,
+            AudioHostResourceKind::GraphNodes,
+            count,
+            "graph-node",
+        )?;
+        Ok(AudioNodeLifetimeReservation::new(
+            OnlineGraphNodeReservations {
+                _isolate: isolate,
+                _host: host,
+            },
+        ))
+    }
+
+    fn reserve_control(&self, count: usize) -> Result<AudioControlBatchReservation, JsErrorBox> {
+        Ok(AudioControlBatchReservation::new(
+            self.runtime.try_reserve_control_commands(count)?,
+        ))
+    }
+
+    pub(crate) fn destination(self: &Arc<Self>) -> Result<NativeAudioNode, JsErrorBox> {
+        let context = self.context()?;
+        Ok(NativeAudioNode::from_handle(Arc::new(NativeNodeHandle {
+            graph: NativeGraph::Online(Arc::clone(self)),
+            id: 0,
+            kind: NativeNodeKind::Destination(context.destination()),
+        })))
+    }
+
+    pub(crate) fn create_gain(
+        self: &Arc<Self>,
+        gain: f32,
+        channel_count: usize,
+        count_mode: ChannelCountMode,
+        interpretation: ChannelInterpretation,
+    ) -> Result<NativeAudioNode, JsErrorBox> {
+        if !gain.is_finite() {
+            return Err(JsErrorBox::type_error("gain must be finite"));
+        }
+        Self::ensure_default_channel_options(channel_count, count_mode, interpretation)?;
+        let context = self.context()?;
+        let lifetime = self.reserve_node_lifetime(EXACT_GAIN_NODE_COUNT)?;
+        let construction = self.reserve_control(EXACT_GAIN_CONSTRUCTION_COMMAND_COUNT)?;
+        let value = (gain.to_bits() != 1.0_f32.to_bits())
+            .then(|| self.reserve_control(1))
+            .transpose()?;
+        let node = panic::catch_unwind(AssertUnwindSafe(|| {
+            context.create_gain_with_reservations(lifetime, construction)
+        }))
+        .map_err(|payload| JsErrorBox::generic(panic_message(payload)))?;
+        if let Some(value) = value {
+            panic::catch_unwind(AssertUnwindSafe(|| {
+                node.gain().set_value_with_control_reservation(gain, value);
+            }))
+            .map_err(|payload| JsErrorBox::generic(panic_message(payload)))?;
+        }
+        let parameter = Arc::new(NativeNodeHandle {
+            graph: NativeGraph::Online(Arc::clone(self)),
+            id: 0,
+            kind: NativeNodeKind::Param(node.gain().clone()),
+        });
+        Ok(NativeAudioNode::from_handle(Arc::new(NativeNodeHandle {
+            graph: NativeGraph::Online(Arc::clone(self)),
+            id: 0,
+            kind: NativeNodeKind::Gain { node, parameter },
+        })))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_oscillator(
+        self: &Arc<Self>,
+        oscillator_type: OscillatorType,
+        frequency: f32,
+        detune: f32,
+        channel_count: usize,
+        count_mode: ChannelCountMode,
+        interpretation: ChannelInterpretation,
+    ) -> Result<NativeAudioNode, JsErrorBox> {
+        if !frequency.is_finite() || !detune.is_finite() {
+            return Err(JsErrorBox::type_error(
+                "oscillator frequency and detune must be finite",
+            ));
+        }
+        if oscillator_type == OscillatorType::Custom {
+            return Err(JsErrorBox::generic(
+                "NotSupportedError: custom oscillators require a PeriodicWave",
+            ));
+        }
+        Self::ensure_default_channel_options(channel_count, count_mode, interpretation)?;
+        let frequency_is_custom = frequency.to_bits() != 440.0_f32.to_bits();
+        let detune_is_custom = detune.to_bits() != 0.0_f32.to_bits();
+        let option_count = usize::from(frequency_is_custom)
+            + usize::from(detune_is_custom)
+            + usize::from(oscillator_type != OscillatorType::Sine);
+        debug_assert!(option_count <= EXACT_OSCILLATOR_OPTION_COMMAND_LIMIT);
+        let mut option_reservations = Vec::with_capacity(option_count);
+        for _ in 0..option_count {
+            option_reservations.push(self.reserve_control(1)?);
+        }
+        let root = self
+            .state
+            .event_hub()
+            .register_oscillator(&self.state, false)?;
+        if frequency_is_custom {
+            root.set_frequency(frequency, option_reservations.remove(0), &self.state)?;
+        }
+        if detune_is_custom {
+            root.set_detune(detune, option_reservations.remove(0), &self.state)?;
+        }
+        if oscillator_type != OscillatorType::Sine {
+            root.set_type(oscillator_type, option_reservations.remove(0), &self.state)?;
+        }
+        let frequency = Arc::new(NativeNodeHandle {
+            graph: NativeGraph::Online(Arc::clone(self)),
+            id: 0,
+            kind: NativeNodeKind::Param(root.frequency()),
+        });
+        let detune = Arc::new(NativeNodeHandle {
+            graph: NativeGraph::Online(Arc::clone(self)),
+            id: 0,
+            kind: NativeNodeKind::Param(root.detune()),
+        });
+        Ok(NativeAudioNode::from_handle(Arc::new(NativeNodeHandle {
+            graph: NativeGraph::Online(Arc::clone(self)),
+            id: u64::from(root.id()),
+            kind: NativeNodeKind::OnlineOscillator {
+                root,
+                frequency,
+                detune,
+            },
+        })))
+    }
+
+    fn validate_pair(
+        self: &Arc<Self>,
+        source: &NativeNodeHandle,
+        destination: &NativeNodeHandle,
+        output: usize,
+        input: usize,
+    ) -> Result<(), JsErrorBox> {
+        if !source.graph.is_online(self) || !destination.graph.is_online(self) {
+            return Err(JsErrorBox::generic(
+                "InvalidAccessError: nodes belong to different audio contexts",
+            ));
+        }
+        if output >= source.number_of_outputs() || input >= destination.number_of_inputs() {
+            return Err(JsErrorBox::generic(
+                "IndexSizeError: audio node port is out of range",
+            ));
+        }
+        Ok(())
+    }
+
+    fn connect(
+        self: &Arc<Self>,
+        source: &NativeNodeHandle,
+        destination: &NativeNodeHandle,
+        output: usize,
+        input: usize,
+    ) -> Result<(), JsErrorBox> {
+        self.validate_pair(source, destination, output, input)?;
+        let runtime = Arc::clone(&self.runtime);
+        let refused = Arc::new(AtomicBool::new(false));
+        let provider_refused = Arc::clone(&refused);
+        let provider = AudioExplicitConnectionReservationProvider::new(move || {
+            let reserve = || {
+                let isolate = runtime.try_reserve_graph_connection().ok()?;
+                let host = runtime
+                    .host()
+                    .try_reserve(AudioHostResourceKind::GraphConnections, 1)
+                    .ok()?;
+                let control = runtime.try_reserve_control_commands(1).ok()?;
+                Some((isolate, host, control))
+            };
+            let Some((isolate, host, control)) = reserve() else {
+                provider_refused.store(true, Ordering::Release);
+                return None;
+            };
+            Some(AudioExplicitConnectionReservation::new(
+                AudioGraphConnectionReservation::new(ConnectionReservations {
+                    _isolate: isolate,
+                    _host: host,
+                }),
+                AudioControlBatchReservation::new(control),
+            ))
+        });
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            source.with_audio_node(|source_node| {
+                destination.with_audio_node(|destination_node| {
+                    source_node.connect_from_output_to_input_with_reservations(
+                        destination_node,
+                        output,
+                        input,
+                        provider,
+                    );
+                });
+            });
+        }));
+        match result {
+            Ok(()) => Ok(()),
+            Err(payload) if refused.load(Ordering::Acquire) => {
+                std::mem::forget(payload);
+                Err(JsErrorBox::range_error(
+                    "explicit connection exceeds a configured audio resource limit",
+                ))
+            }
+            Err(payload) => Err(JsErrorBox::generic(panic_message(payload))),
+        }
+    }
+
+    fn disconnect(
+        self: &Arc<Self>,
+        source: &NativeNodeHandle,
+        destination: Option<&NativeNodeHandle>,
+        output: Option<usize>,
+        input: Option<usize>,
+    ) -> Result<(), JsErrorBox> {
+        if !source.graph.is_online(self)
+            || destination.is_some_and(|destination| !destination.graph.is_online(self))
+        {
+            return Err(JsErrorBox::generic(
+                "InvalidAccessError: nodes belong to different audio contexts",
+            ));
+        }
+        if output.is_some_and(|output| output >= source.number_of_outputs()) {
+            return Err(JsErrorBox::generic(
+                "IndexSizeError: audio node output port is out of range",
+            ));
+        }
+        if let (Some(destination), Some(input)) = (destination, input) {
+            if input >= destination.number_of_inputs() {
+                return Err(JsErrorBox::generic(
+                    "IndexSizeError: audio node input port is out of range",
+                ));
+            }
+        }
+        let runtime = Arc::clone(&self.runtime);
+        let refused = Arc::new(AtomicBool::new(false));
+        let provider_refused = Arc::clone(&refused);
+        let provider = AudioControlBatchReservationProvider::new(move |count| {
+            let reservation = runtime.try_reserve_control_commands(count).ok();
+            if reservation.is_none() {
+                provider_refused.store(true, Ordering::Release);
+            }
+            reservation.map(AudioControlBatchReservation::new)
+        });
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            source.with_audio_node(|source_node| match (destination, output, input) {
+                (None, None, None) => source_node.disconnect_with_control_reservation(
+                    AudioNodeDisconnectSelector::All,
+                    provider,
+                ),
+                (None, Some(output), None) => source_node.disconnect_with_control_reservation(
+                    AudioNodeDisconnectSelector::Output(output),
+                    provider,
+                ),
+                (Some(destination), None, None) => {
+                    destination.with_audio_node(|destination_node| {
+                        source_node.disconnect_with_control_reservation(
+                            AudioNodeDisconnectSelector::Destination(destination_node),
+                            provider,
+                        );
+                    });
+                }
+                (Some(destination), Some(output), None) => {
+                    destination.with_audio_node(|destination_node| {
+                        source_node.disconnect_with_control_reservation(
+                            AudioNodeDisconnectSelector::DestinationOutput {
+                                destination: destination_node,
+                                output,
+                            },
+                            provider,
+                        );
+                    });
+                }
+                (Some(destination), Some(output), Some(input)) => {
+                    destination.with_audio_node(|destination_node| {
+                        source_node.disconnect_with_control_reservation(
+                            AudioNodeDisconnectSelector::Exact {
+                                destination: destination_node,
+                                output,
+                                input,
+                            },
+                            provider,
+                        );
+                    });
+                }
+                _ => unreachable!("JavaScript exposes only legal disconnect selectors"),
+            });
+        }));
+        match result {
+            Ok(()) => Ok(()),
+            Err(payload) if refused.load(Ordering::Acquire) => {
+                std::mem::forget(payload);
+                Err(JsErrorBox::range_error(
+                    "explicit disconnection exceeds a configured audio resource limit",
+                ))
+            }
+            Err(payload) => Err(JsErrorBox::generic(panic_message(payload))),
+        }
+    }
+
+    fn set_param_value(&self, param: &AudioParam, value: f32) -> Result<(), JsErrorBox> {
+        let reservation = self.reserve_control(1)?;
+        panic::catch_unwind(AssertUnwindSafe(|| {
+            param.set_value_with_control_reservation(value, reservation);
+        }))
+        .map_err(|payload| JsErrorBox::generic(panic_message(payload)))
+    }
+
+    fn unsupported_mutation(&self, name: &'static str) -> Result<(), JsErrorBox> {
+        self.context()?;
+        Err(JsErrorBox::generic(format!(
+            "NotSupportedError: {name} is not available on exact online contexts"
+        )))
+    }
+}
+
+#[derive(Clone)]
+enum NativeGraph {
+    Offline(Arc<OfflineGraph>),
+    Online(Arc<OnlineGraph>),
+}
+
+impl NativeGraph {
+    fn is_offline(&self, graph: &OfflineGraph) -> bool {
+        matches!(self, Self::Offline(candidate) if std::ptr::eq(candidate.as_ref(), graph))
+    }
+
+    fn is_online(&self, graph: &Arc<OnlineGraph>) -> bool {
+        matches!(self, Self::Online(candidate) if Arc::ptr_eq(candidate, graph))
+    }
+
+    fn connect(
+        &self,
+        source: &NativeNodeHandle,
+        destination: &NativeNodeHandle,
+        output: usize,
+        input: usize,
+    ) -> Result<(), JsErrorBox> {
+        match self {
+            Self::Offline(graph) => graph.connect(source, destination, output, input),
+            Self::Online(graph) => graph.connect(source, destination, output, input),
+        }
+    }
+
+    fn disconnect(
+        &self,
+        source: &NativeNodeHandle,
+        destination: Option<&NativeNodeHandle>,
+        output: Option<usize>,
+        input: Option<usize>,
+    ) -> Result<(), JsErrorBox> {
+        match self {
+            Self::Offline(graph) => graph.disconnect(source, destination, output, input),
+            Self::Online(graph) => graph.disconnect(source, destination, output, input),
+        }
+    }
+
+    fn run_offline_command(
+        &self,
+        name: &'static str,
+        automation: bool,
+        native_bytes: usize,
+        operation: impl FnOnce(),
+    ) -> Result<(), JsErrorBox> {
+        match self {
+            Self::Offline(graph) => graph.run_command(automation, native_bytes, operation),
+            Self::Online(graph) => graph.unsupported_mutation(name),
+        }
+    }
+}
+
 enum NativeNodeKind {
     Destination(AudioDestinationNode),
     Gain {
@@ -635,11 +1056,16 @@ enum NativeNodeKind {
         frequency: Arc<NativeNodeHandle>,
         detune: Arc<NativeNodeHandle>,
     },
+    OnlineOscillator {
+        root: Arc<ScheduledSourceRoot>,
+        frequency: Arc<NativeNodeHandle>,
+        detune: Arc<NativeNodeHandle>,
+    },
     Param(AudioParam),
 }
 
 struct NativeNodeHandle {
-    graph: Arc<OfflineGraph>,
+    graph: NativeGraph,
     id: u64,
     kind: NativeNodeKind,
 }
@@ -650,6 +1076,7 @@ impl NativeNodeHandle {
             NativeNodeKind::Destination(node) => operation(node),
             NativeNodeKind::Gain { node, .. } => operation(node),
             NativeNodeKind::Oscillator { node, .. } => operation(&*mutex(node)),
+            NativeNodeKind::OnlineOscillator { root, .. } => root.with_audio_node(operation),
             NativeNodeKind::Param(param) => operation(param),
         }
     }
@@ -712,7 +1139,7 @@ impl NativeAudioNode {
         match &self.handle.kind {
             NativeNodeKind::Destination(_) => 0,
             NativeNodeKind::Gain { .. } => 1,
-            NativeNodeKind::Oscillator { .. } => 2,
+            NativeNodeKind::Oscillator { .. } | NativeNodeKind::OnlineOscillator { .. } => 2,
             NativeNodeKind::Param(_) => 3,
         }
     }
@@ -764,10 +1191,12 @@ impl NativeAudioNode {
                 "NotSupportedError: channelCount is outside the supported range",
             ));
         }
-        self.handle.graph.run_command(false, 0, || {
-            self.handle
-                .with_audio_node(|node| node.set_channel_count(value));
-        })
+        self.handle
+            .graph
+            .run_offline_command("channelCount mutation", false, 0, || {
+                self.handle
+                    .with_audio_node(|node| node.set_channel_count(value));
+            })
     }
 
     #[fast]
@@ -778,10 +1207,12 @@ impl NativeAudioNode {
             2 => ChannelCountMode::Explicit,
             _ => return Err(JsErrorBox::type_error("unknown channelCountMode")),
         };
-        self.handle.graph.run_command(false, 0, || {
-            self.handle
-                .with_audio_node(|node| node.set_channel_count_mode(value));
-        })
+        self.handle
+            .graph
+            .run_offline_command("channelCountMode mutation", false, 0, || {
+                self.handle
+                    .with_audio_node(|node| node.set_channel_count_mode(value));
+            })
     }
 
     #[fast]
@@ -791,10 +1222,12 @@ impl NativeAudioNode {
             1 => ChannelInterpretation::Discrete,
             _ => return Err(JsErrorBox::type_error("unknown channelInterpretation")),
         };
-        self.handle.graph.run_command(false, 0, || {
-            self.handle
-                .with_audio_node(|node| node.set_channel_interpretation(value));
-        })
+        self.handle
+            .graph
+            .run_offline_command("channelInterpretation mutation", false, 0, || {
+                self.handle
+                    .with_audio_node(|node| node.set_channel_interpretation(value));
+            })
     }
 
     #[fast]
@@ -838,7 +1271,8 @@ impl NativeAudioNode {
     #[cppgc]
     fn frequency(&self) -> Result<NativeAudioNode, JsErrorBox> {
         match &self.handle.kind {
-            NativeNodeKind::Oscillator { frequency, .. } => {
+            NativeNodeKind::Oscillator { frequency, .. }
+            | NativeNodeKind::OnlineOscillator { frequency, .. } => {
                 Ok(Self::from_handle(Arc::clone(frequency)))
             }
             _ => Err(JsErrorBox::type_error(
@@ -850,7 +1284,10 @@ impl NativeAudioNode {
     #[cppgc]
     fn detune(&self) -> Result<NativeAudioNode, JsErrorBox> {
         match &self.handle.kind {
-            NativeNodeKind::Oscillator { detune, .. } => Ok(Self::from_handle(Arc::clone(detune))),
+            NativeNodeKind::Oscillator { detune, .. }
+            | NativeNodeKind::OnlineOscillator { detune, .. } => {
+                Ok(Self::from_handle(Arc::clone(detune)))
+            }
             _ => Err(JsErrorBox::type_error(
                 "native binding expected an OscillatorNode",
             )),
@@ -867,13 +1304,18 @@ impl NativeAudioNode {
         if !value.is_finite() {
             return Err(JsErrorBox::type_error("AudioParam value must be finite"));
         }
-        self.handle.graph.run_command(true, 0, || {
-            self.handle
-                .with_param(|param| {
-                    param.set_value(value);
-                })
-                .expect("binding prevalidated AudioParam kind");
-        })
+        match &self.handle.graph {
+            NativeGraph::Offline(graph) => graph.run_command(true, 0, || {
+                self.handle
+                    .with_param(|param| {
+                        param.set_value(value);
+                    })
+                    .expect("binding prevalidated AudioParam kind");
+            }),
+            NativeGraph::Online(graph) => self
+                .handle
+                .with_param(|param| graph.set_param_value(param, value))?,
+        }
     }
 
     #[getter]
@@ -907,11 +1349,13 @@ impl NativeAudioNode {
             1 => AutomationRate::K,
             _ => return Err(JsErrorBox::type_error("unknown automationRate")),
         };
-        self.handle.graph.run_command(false, 0, || {
-            self.handle
-                .with_param(|param| param.set_automation_rate(value))
-                .expect("binding prevalidated AudioParam kind");
-        })
+        self.handle
+            .graph
+            .run_offline_command("automationRate mutation", false, 0, || {
+                self.handle
+                    .with_param(|param| param.set_automation_rate(value))
+                    .expect("binding prevalidated AudioParam kind");
+            })
     }
 
     #[fast]
@@ -957,13 +1401,15 @@ impl NativeAudioNode {
                 "AudioParam automation arguments are invalid",
             ));
         }
-        self.handle.graph.run_command(true, 0, || {
-            self.handle
-                .with_param(|param| {
-                    param.set_target_at_time(value, start_time, time_constant);
-                })
-                .expect("binding prevalidated AudioParam kind");
-        })
+        self.handle
+            .graph
+            .run_offline_command("AudioParam automation", true, 0, || {
+                self.handle
+                    .with_param(|param| {
+                        param.set_target_at_time(value, start_time, time_constant);
+                    })
+                    .expect("binding prevalidated AudioParam kind");
+            })
     }
 
     #[fast]
@@ -1006,19 +1452,28 @@ impl NativeAudioNode {
         let native_bytes = values.len().checked_mul(size_of::<f32>()).ok_or_else(|| {
             JsErrorBox::range_error("AudioParam value curve byte count overflowed")
         })?;
-        self.handle.graph.run_command(true, native_bytes, || {
-            self.handle
-                .with_param(|param| {
-                    param.set_value_curve_at_time(values, start_time, duration);
-                })
-                .expect("binding prevalidated AudioParam kind");
-        })
+        self.handle
+            .graph
+            .run_offline_command("AudioParam automation", true, native_bytes, || {
+                self.handle
+                    .with_param(|param| {
+                        param.set_value_curve_at_time(values, start_time, duration);
+                    })
+                    .expect("binding prevalidated AudioParam kind");
+            })
     }
 
     #[getter]
     fn oscillator_type(&self) -> Result<u32, JsErrorBox> {
         match &self.handle.kind {
             NativeNodeKind::Oscillator { node, .. } => Ok(match mutex(node).type_() {
+                OscillatorType::Sine => 0,
+                OscillatorType::Square => 1,
+                OscillatorType::Sawtooth => 2,
+                OscillatorType::Triangle => 3,
+                OscillatorType::Custom => 4,
+            }),
+            NativeNodeKind::OnlineOscillator { root, .. } => Ok(match root.type_() {
                 OscillatorType::Sine => 0,
                 OscillatorType::Square => 1,
                 OscillatorType::Sawtooth => 2,
@@ -1034,12 +1489,17 @@ impl NativeAudioNode {
     #[fast]
     fn set_oscillator_type(&self, value: u32) -> Result<(), JsErrorBox> {
         let value = Self::oscillator_type(value)?;
-        self.handle
-            .graph
-            .run_command(false, 0, || match &self.handle.kind {
-                NativeNodeKind::Oscillator { node, .. } => mutex(node).set_type(value),
-                _ => unreachable!("binding prevalidated OscillatorNode kind"),
-            })
+        match (&self.handle.graph, &self.handle.kind) {
+            (NativeGraph::Offline(graph), NativeNodeKind::Oscillator { node, .. }) => {
+                graph.run_command(false, 0, || mutex(node).set_type(value))
+            }
+            (NativeGraph::Online(graph), NativeNodeKind::OnlineOscillator { root, .. }) => {
+                root.set_type(value, graph.reserve_control(1)?, &graph.state)
+            }
+            _ => Err(JsErrorBox::type_error(
+                "native binding expected an OscillatorNode",
+            )),
+        }
     }
 
     #[fast]
@@ -1049,12 +1509,17 @@ impl NativeAudioNode {
                 "start time must be finite and non-negative",
             ));
         }
-        self.handle
-            .graph
-            .run_command(false, 0, || match &self.handle.kind {
-                NativeNodeKind::Oscillator { node, .. } => mutex(node).start_at(when),
-                _ => unreachable!("binding prevalidated OscillatorNode kind"),
-            })
+        match (&self.handle.graph, &self.handle.kind) {
+            (NativeGraph::Offline(graph), NativeNodeKind::Oscillator { node, .. }) => {
+                graph.run_command(false, 0, || mutex(node).start_at(when))
+            }
+            (NativeGraph::Online(graph), NativeNodeKind::OnlineOscillator { root, .. }) => {
+                root.start(when, graph.reserve_control(1)?, &graph.state)
+            }
+            _ => Err(JsErrorBox::type_error(
+                "native binding expected an OscillatorNode",
+            )),
+        }
     }
 
     #[fast]
@@ -1064,12 +1529,17 @@ impl NativeAudioNode {
                 "stop time must be finite and non-negative",
             ));
         }
-        self.handle
-            .graph
-            .run_command(false, 0, || match &self.handle.kind {
-                NativeNodeKind::Oscillator { node, .. } => mutex(node).stop_at(when),
-                _ => unreachable!("binding prevalidated OscillatorNode kind"),
-            })
+        match (&self.handle.graph, &self.handle.kind) {
+            (NativeGraph::Offline(graph), NativeNodeKind::Oscillator { node, .. }) => {
+                graph.run_command(false, 0, || mutex(node).stop_at(when))
+            }
+            (NativeGraph::Online(graph), NativeNodeKind::OnlineOscillator { root, .. }) => {
+                root.stop(when, graph.reserve_control(1)?, &graph.state)
+            }
+            _ => Err(JsErrorBox::type_error(
+                "native binding expected an OscillatorNode",
+            )),
+        }
     }
 
     #[getter]
@@ -1078,9 +1548,18 @@ impl NativeAudioNode {
             NativeNodeKind::Oscillator { node, .. } => {
                 Ok(mutex(node).completion_token().is_complete())
             }
+            NativeNodeKind::OnlineOscillator { root, .. } => Ok(root.is_complete()),
             _ => Err(JsErrorBox::type_error(
                 "native binding expected an OscillatorNode",
             )),
+        }
+    }
+
+    #[getter]
+    fn source_id(&self) -> f64 {
+        match &self.handle.kind {
+            NativeNodeKind::OnlineOscillator { root, .. } => f64::from(root.id()),
+            _ => 0.0,
         }
     }
 }
@@ -1097,11 +1576,13 @@ impl NativeAudioNode {
                 "AudioParam automation arguments are invalid",
             ));
         }
-        self.handle.graph.run_command(true, 0, || {
-            self.handle
-                .with_param(|param| operation(param, value, time))
-                .expect("binding prevalidated AudioParam kind");
-        })
+        self.handle
+            .graph
+            .run_offline_command("AudioParam automation", true, 0, || {
+                self.handle
+                    .with_param(|param| operation(param, value, time))
+                    .expect("binding prevalidated AudioParam kind");
+            })
     }
 
     fn run_param_time(
@@ -1114,11 +1595,13 @@ impl NativeAudioNode {
                 "AudioParam automation time must be finite and non-negative",
             ));
         }
-        self.handle.graph.run_command(true, 0, || {
-            self.handle
-                .with_param(|param| operation(param, time))
-                .expect("binding prevalidated AudioParam kind");
-        })
+        self.handle
+            .graph
+            .run_offline_command("AudioParam automation", true, 0, || {
+                self.handle
+                    .with_param(|param| operation(param, time))
+                    .expect("binding prevalidated AudioParam kind");
+            })
     }
 }
 

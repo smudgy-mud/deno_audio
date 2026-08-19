@@ -6,6 +6,26 @@ use web_audio_api::output::{AudioOutputFactory, SystemAudioOutput};
 
 use crate::host::AudioHost;
 
+/// Whether an online context's native-event observer keeps Deno's event loop alive.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum AudioEventPumpLiveness {
+    /// Do not keep an otherwise idle runtime alive solely for audio events.
+    ///
+    /// This is the default for CLI-style embedders. Playback ends when the embedder stops driving
+    /// and drops its runtime, and native context teardown remains cancellation-independent.
+    #[default]
+    Unref,
+    /// Keep the runtime alive until every online context event observer retires.
+    Ref,
+}
+
+impl AudioEventPumpLiveness {
+    pub(crate) const fn is_refed(self) -> bool {
+        matches!(self, Self::Ref)
+    }
+}
+
 /// Sandbox-oriented per-isolate resource ceilings.
 ///
 /// Shared cross-isolate ceilings belong to [`crate::AudioHostLimits`]. This
@@ -336,6 +356,15 @@ pub struct AudioExtensionOptions {
     permissions: Arc<dyn AudioPermissions>,
     limits: AudioLimits,
     output: Arc<dyn AudioOutputFactory>,
+    event_pump_liveness: AudioEventPumpLiveness,
+}
+
+pub(crate) struct AudioExtensionParts {
+    pub(crate) host: Arc<AudioHost>,
+    pub(crate) permissions: Arc<dyn AudioPermissions>,
+    pub(crate) limits: AudioLimits,
+    pub(crate) output: Arc<dyn AudioOutputFactory>,
+    pub(crate) event_pump_liveness: AudioEventPumpLiveness,
 }
 
 impl fmt::Debug for AudioExtensionOptions {
@@ -344,6 +373,7 @@ impl fmt::Debug for AudioExtensionOptions {
             .debug_struct("AudioExtensionOptions")
             .field("host", &self.host)
             .field("limits", &self.limits)
+            .field("event_pump_liveness", &self.event_pump_liveness)
             .finish_non_exhaustive()
     }
 }
@@ -363,6 +393,7 @@ impl AudioExtensionOptions {
             permissions: Arc::new(AllowAllAudioPermissions),
             limits: AudioLimits::default(),
             output: Arc::new(SystemAudioOutput::new()),
+            event_pump_liveness: AudioEventPumpLiveness::default(),
         }
     }
 
@@ -387,20 +418,26 @@ impl AudioExtensionOptions {
         self
     }
 
+    /// Selects whether pending online native-event observers keep Deno's event loop alive.
+    #[must_use]
+    pub const fn event_pump_liveness(mut self, liveness: AudioEventPumpLiveness) -> Self {
+        self.event_pump_liveness = liveness;
+        self
+    }
+
     /// Shared accounting domain used by this extension instance.
     #[must_use]
     pub fn host(&self) -> &Arc<AudioHost> {
         &self.host
     }
 
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        Arc<AudioHost>,
-        Arc<dyn AudioPermissions>,
-        AudioLimits,
-        Arc<dyn AudioOutputFactory>,
-    ) {
-        (self.host, self.permissions, self.limits, self.output)
+    pub(crate) fn into_parts(self) -> AudioExtensionParts {
+        AudioExtensionParts {
+            host: self.host,
+            permissions: self.permissions,
+            limits: self.limits,
+            output: self.output,
+            event_pump_liveness: self.event_pump_liveness,
+        }
     }
 }

@@ -50,7 +50,7 @@ new contract. A green baseline suite alone is not evidence of readiness.
 ## Selected production fork
 
 The current Phase 0 dependency is reviewed fork commit
-`c7244534cbc28992b0b2c8c88a3e647061b7a215`. It retains the upstream package
+`3455e57bde836a142faa3083cfbd3635dcf21b79`. It retains the upstream package
 name and the legacy behavior characterized above while adding a public hosted
 `AudioContext` builder, bounded exact lifecycle/control ownership, a public
 `AudioOutputFactory`, and `SystemAudioOutput` implementations for the silent,

@@ -1,11 +1,13 @@
 //! Phase 0D acceptance evidence for a shared host-supplied process mixer.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
+use deno_audio::{AudioExtensionOptions, AudioHost};
 use deno_core::futures::channel::oneshot;
+use deno_core::{JsRuntime, RuntimeOptions};
 use web_audio_api::context::{
     AudioContext, AudioContextOptions, AudioContextShutdownOutcome, AudioContextState,
     AudioContextStateChangeOutcome, BaseAudioContext,
@@ -696,5 +698,124 @@ fn rejected_third_input_retires_through_the_failed_build_receipt() {
 
     drive_close(&mixer, &first);
     drive_close(&mixer, &second);
+    mixer.shutdown_factory();
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the injected-mixer acceptance scenario keeps its driver and JavaScript FIFO timeline together"
+)]
+async fn public_audio_context_uses_the_same_injected_mixer_and_flushes_staged_graph_fifo() {
+    let mixer = FakeProcessMixer::new();
+    let host = Arc::new(AudioHost::default());
+    let mut runtime = JsRuntime::new(RuntimeOptions {
+        extensions: vec![
+            deno_webidl::deno_webidl::init(),
+            deno_web::deno_web::init(
+                deno_web::BlobStore::default_arc(),
+                None,
+                Default::default(),
+                deno_web::InMemoryBroadcastChannel::default(),
+            ),
+            deno_audio::deno_audio::init(
+                AudioExtensionOptions::new(Arc::clone(&host))
+                    .output_factory(Arc::new(mixer.clone())),
+            ),
+        ],
+        ..RuntimeOptions::default()
+    });
+
+    let driving = Arc::new(AtomicBool::new(true));
+    let audible = Arc::new(AtomicBool::new(false));
+    let driver_mixer = mixer.clone();
+    let driver_running = Arc::clone(&driving);
+    let driver_audible = Arc::clone(&audible);
+    let driver = thread::Builder::new()
+        .name("deno-audio-public-mixer-driver".to_owned())
+        .spawn(move || {
+            while driver_running.load(Ordering::Acquire) {
+                let capture = driver_mixer.render(FRAMES);
+                if capture.inputs[..capture.input_count]
+                    .iter()
+                    .any(|input| input[..capture.samples].iter().any(|sample| *sample != 0.0))
+                {
+                    driver_audible.store(true, Ordering::Release);
+                }
+                thread::yield_now();
+            }
+        })
+        .expect("public mixer driver should spawn");
+
+    let begin = runtime.execute_script(
+        "phase2_public_injected_mixer.js",
+        r#"
+              globalThis.__publicMixerScenario = (async () => {
+                const context = new AudioContext({
+                  sampleRate: 48000,
+                  sinkId: "none",
+                });
+                await context.suspend();
+                if (context.state !== "suspended") {
+                  throw new Error("public context did not suspend");
+                }
+                const oscillator = context.createOscillator();
+                const gain = context.createGain();
+                oscillator.connect(gain);
+                oscillator.disconnect(gain);
+                oscillator.connect(gain);
+                gain.connect(context.destination);
+                gain.gain.value = 0.25;
+                oscillator.type = "square";
+                oscillator.type = "triangle";
+                let ended = 0;
+                oscillator.onended = () => ended++;
+                const start = context.currentTime;
+                const stop = start + 0.03;
+                oscillator.start(start);
+                oscillator.stop(stop);
+                await context.resume();
+                while (context.currentTime < stop + 0.03) {}
+                await context.close();
+                if (ended !== 1 || context.state !== "closed") {
+                  throw new Error(`public staged retirement mismatch: ${ended}/${context.state}`);
+                }
+                globalThis.__publicMixerDone = true;
+              })();
+            "#,
+    );
+    let settle = if begin.is_ok() {
+        Some(
+            runtime
+                .run_event_loop(deno_core::PollEventLoopOptions::default())
+                .await,
+        )
+    } else {
+        None
+    };
+    driving.store(false, Ordering::Release);
+    driver.join().expect("public mixer driver should join");
+    begin.expect("the public injected-mixer scenario should begin");
+    settle
+        .expect("a started scenario has an event-loop result")
+        .expect("the public injected-mixer scenario should settle");
+    runtime
+        .execute_script(
+            "phase2_public_injected_mixer_result.js",
+            "if (globalThis.__publicMixerDone !== true) throw new Error('public mixer scenario did not finish');",
+        )
+        .expect("the public injected-mixer scenario should finish successfully");
+
+    assert!(
+        audible.load(Ordering::Acquire),
+        "the resumed public staged graph never reached the injected mixer"
+    );
+    assert_eq!(mixer.active_logical_inputs(), 0);
+    let usage = host.usage();
+    assert_eq!(usage.online_contexts(), 0);
+    assert_eq!(usage.graph_nodes(), 0);
+    assert_eq!(usage.graph_connections(), 0);
+    assert_eq!(usage.scheduled_sources(), 0);
+    assert_eq!(usage.queued_control_commands(), 0);
     mixer.shutdown_factory();
 }
