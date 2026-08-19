@@ -561,10 +561,16 @@ mod tests {
         )
     }
 
-    fn collect(runtime: &mut JsRuntime) {
-        runtime
-            .v8_isolate()
-            .request_garbage_collection_for_testing(v8::GarbageCollectionType::Full);
+    fn collect_until(runtime: &mut JsRuntime, budget: &NativeAudioByteBudget, expected: usize) {
+        for _ in 0..16 {
+            runtime
+                .v8_isolate()
+                .request_garbage_collection_for_testing(v8::GarbageCollectionType::Full);
+            if budget.used() == expected {
+                return;
+            }
+            std::thread::yield_now();
+        }
     }
 
     #[test]
@@ -656,7 +662,7 @@ mod tests {
                 "globalThis.__transferredAudioBytes = undefined;",
             )
             .unwrap();
-        collect(&mut runtime);
+        collect_until(&mut runtime, &budget, 48);
         assert_eq!(
             budget.used(),
             48,
@@ -669,7 +675,7 @@ mod tests {
                 "globalThis.__nativeAudioBuffer = undefined;",
             )
             .unwrap();
-        collect(&mut runtime);
+        collect_until(&mut runtime, &budget, 0);
         assert_eq!(
             budget.used(),
             0,
@@ -703,7 +709,7 @@ mod tests {
                 "globalThis.__smallNativeAudioBuffer = undefined;",
             )
             .unwrap();
-        collect(&mut runtime);
+        collect_until(&mut runtime, &budget, 0);
         assert_eq!(budget.used(), 0);
     }
 }
