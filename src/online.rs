@@ -31,7 +31,9 @@ pub(crate) struct AudioRuntimeState {
     decode_jobs: AtomicUsize,
     offline_render_jobs: AtomicUsize,
     graph_nodes: AtomicUsize,
+    graph_connections: AtomicUsize,
     scheduled_sources: AtomicUsize,
+    automation_events: AtomicUsize,
     queued_control_commands: AtomicUsize,
     queued_events: AtomicUsize,
 }
@@ -52,7 +54,9 @@ impl AudioRuntimeState {
             decode_jobs: AtomicUsize::new(0),
             offline_render_jobs: AtomicUsize::new(0),
             graph_nodes: AtomicUsize::new(0),
+            graph_connections: AtomicUsize::new(0),
             scheduled_sources: AtomicUsize::new(0),
+            automation_events: AtomicUsize::new(0),
             queued_control_commands: AtomicUsize::new(0),
             queued_events: AtomicUsize::new(0),
         }
@@ -84,11 +88,23 @@ impl AudioRuntimeState {
         self.try_reserve_resource(IsolateResourceKind::ScheduledSources, 1)
     }
 
+    pub(crate) fn try_reserve_automation_event(
+        self: &Arc<Self>,
+    ) -> Result<IsolateReservation, JsErrorBox> {
+        self.try_reserve_resource(IsolateResourceKind::AutomationEvents, 1)
+    }
+
     pub(crate) fn try_reserve_graph_nodes(
         self: &Arc<Self>,
         amount: usize,
     ) -> Result<IsolateReservation, JsErrorBox> {
         self.try_reserve_resource(IsolateResourceKind::GraphNodes, amount)
+    }
+
+    pub(crate) fn try_reserve_graph_connection(
+        self: &Arc<Self>,
+    ) -> Result<IsolateReservation, JsErrorBox> {
+        self.try_reserve_resource(IsolateResourceKind::GraphConnections, 1)
     }
 
     pub(crate) fn try_reserve_queued_event(
@@ -142,10 +158,20 @@ impl AudioRuntimeState {
                 self.limits.graph_nodes(),
                 "live graph node",
             ),
+            IsolateResourceKind::GraphConnections => (
+                &self.graph_connections,
+                self.limits.graph_connections(),
+                "live graph connection",
+            ),
             IsolateResourceKind::ScheduledSources => (
                 &self.scheduled_sources,
                 self.limits.scheduled_sources(),
                 "scheduled source",
+            ),
+            IsolateResourceKind::AutomationEvents => (
+                &self.automation_events,
+                self.limits.automation_events(),
+                "queued automation event",
             ),
             IsolateResourceKind::QueuedControlCommands => (
                 &self.queued_control_commands,
@@ -232,7 +258,9 @@ enum IsolateResourceKind {
     DecodeJobs,
     OfflineRenderJobs,
     GraphNodes,
+    GraphConnections,
     ScheduledSources,
+    AutomationEvents,
     QueuedControlCommands,
     QueuedEvents,
 }
@@ -254,7 +282,9 @@ impl Drop for IsolateReservation {
             IsolateResourceKind::DecodeJobs => &self.runtime.decode_jobs,
             IsolateResourceKind::OfflineRenderJobs => &self.runtime.offline_render_jobs,
             IsolateResourceKind::GraphNodes => &self.runtime.graph_nodes,
+            IsolateResourceKind::GraphConnections => &self.runtime.graph_connections,
             IsolateResourceKind::ScheduledSources => &self.runtime.scheduled_sources,
+            IsolateResourceKind::AutomationEvents => &self.runtime.automation_events,
             IsolateResourceKind::QueuedControlCommands => &self.runtime.queued_control_commands,
             IsolateResourceKind::QueuedEvents => &self.runtime.queued_events,
         };

@@ -30,7 +30,9 @@ pub struct AudioLimits {
     max_offline_samples: Option<usize>,
     max_offline_render_jobs: Option<usize>,
     max_graph_nodes: Option<usize>,
+    max_graph_connections: Option<usize>,
     max_scheduled_sources: Option<usize>,
+    max_automation_events: Option<usize>,
     max_queued_control_commands: Option<usize>,
     max_queued_events: Option<usize>,
 }
@@ -56,7 +58,9 @@ impl Default for AudioLimits {
             max_offline_samples: Some(16 * 1024 * 1024),
             max_offline_render_jobs: Some(2),
             max_graph_nodes: Some(1024),
+            max_graph_connections: Some(256),
             max_scheduled_sources: Some(512),
+            max_automation_events: Some(4096),
             max_queued_control_commands: Some(256),
             max_queued_events: Some(256),
         }
@@ -81,7 +85,9 @@ impl AudioLimits {
             max_offline_samples: None,
             max_offline_render_jobs: None,
             max_graph_nodes: None,
+            max_graph_connections: None,
             max_scheduled_sources: None,
+            max_automation_events: None,
             max_queued_control_commands: None,
             max_queued_events: None,
         }
@@ -178,10 +184,24 @@ impl AudioLimits {
         self
     }
 
+    /// Sets the maximum number of live explicit graph connections for this isolate.
+    #[must_use]
+    pub const fn max_graph_connections(mut self, limit: Option<usize>) -> Self {
+        self.max_graph_connections = limit;
+        self
+    }
+
     /// Sets the maximum number of scheduled sources rooted by this isolate.
     #[must_use]
     pub const fn max_scheduled_sources(mut self, limit: Option<usize>) -> Self {
         self.max_scheduled_sources = limit;
+        self
+    }
+
+    /// Sets the maximum number of queued automation events for this isolate.
+    #[must_use]
+    pub const fn max_automation_events(mut self, limit: Option<usize>) -> Self {
+        self.max_automation_events = limit;
         self
     }
 
@@ -252,8 +272,16 @@ impl AudioLimits {
         self.max_graph_nodes
     }
 
+    pub(crate) const fn graph_connections(&self) -> Option<usize> {
+        self.max_graph_connections
+    }
+
     pub(crate) const fn scheduled_sources(&self) -> Option<usize> {
         self.max_scheduled_sources
+    }
+
+    pub(crate) const fn automation_events(&self) -> Option<usize> {
+        self.max_automation_events
     }
 
     pub(crate) const fn queued_control_commands(&self) -> Option<usize> {

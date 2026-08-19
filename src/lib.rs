@@ -29,6 +29,7 @@ deno_core::extension!(
     ops = [
         decode::op_phase0_decode_off_thread,
         offline::op_phase0_render_off_thread,
+        offline::op_offline_start_rendering,
         online::op_phase0_online_suspend,
         online::op_phase0_online_resume,
         online::op_phase0_online_close,
@@ -39,6 +40,8 @@ deno_core::extension!(
         buffer::NativeAudioBuffer,
         decode::NativePhase0DecodeRequest,
         offline::NativePhase0OfflineRenderRequest,
+        offline::NativeOfflineAudioContext,
+        node::NativeAudioNode,
         online::NativePhase0OnlineContext,
         scheduled::NativePhase0Oscillator,
     ],
@@ -47,6 +50,7 @@ deno_core::extension!(
         dir "js",
         "00_webidl.js",
         "01_audio_buffer.js",
+        "02_offline_audio.js",
         "99_main.js",
     ],
     options = {

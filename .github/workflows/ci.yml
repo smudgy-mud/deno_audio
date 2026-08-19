@@ -20,6 +20,21 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
+      - name: Check out pinned Web Platform Tests
+        uses: actions/checkout@v4
+        with:
+          repository: web-platform-tests/wpt
+          ref: fbc1b90e28b38e919acabeeb14d1b074f2c125ec
+          path: target/wpt
+          fetch-depth: 1
+          sparse-checkout: |
+            resources
+            webaudio/resources
+            webaudio/the-audio-api/the-audiobuffer-interface
+            webaudio/the-audio-api/the-audionode-interface
+            webaudio/the-audio-api/the-gainnode-interface
+            webaudio/the-audio-api/the-offlineaudiocontext-interface
+            webaudio/the-audio-api/the-oscillatornode-interface
       - uses: dtolnay/rust-toolchain@1.91.0
       - name: Install Linux audio headers
         if: runner.os == 'Linux'
@@ -27,6 +42,12 @@ jobs:
       - run: cargo check --all-targets --locked
       - run: cargo test --all-targets --locked
       - run: cargo test --all-targets --no-default-features --locked
+        env:
+          DENO_AUDIO_WPT_ROOT: target/wpt
+      - name: Run pinned Web Platform Test subset
+        run: cargo test --test wpt --no-default-features --locked -- --nocapture
+        env:
+          DENO_AUDIO_WPT_ROOT: target/wpt
       - run: cargo test --doc --locked
       - run: cargo doc --no-deps --locked
         env:

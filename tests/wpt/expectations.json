@@ -1,0 +1,67 @@
+{
+  "wpt_commit": "fbc1b90e28b38e919acabeeb14d1b074f2c125ec",
+  "tests": [
+    {
+      "path": "webaudio/the-audio-api/the-audiobuffer-interface/audiobuffer.html",
+      "category": "AudioBuffer",
+      "status": "pass"
+    },
+    {
+      "path": "webaudio/the-audio-api/the-audiobuffer-interface/ctor-audiobuffer.html",
+      "category": "AudioBuffer",
+      "status": "skip",
+      "reason": "The file ends with AudioBufferSourceNode rendering, which is scheduled for Phase 3; the standalone AudioBuffer constructor/property file runs above."
+    },
+    {
+      "path": "webaudio/the-audio-api/the-audiobuffer-interface/audiobuffer-copy-channel.html",
+      "category": "AudioBuffer",
+      "status": "skip",
+      "reason": "The file constructs online AudioContext; Phase 1 copyFromChannel/copyToChannel behavior is covered by native integration tests until the Phase 2 online context lands."
+    },
+    {
+      "path": "webaudio/the-audio-api/the-offlineaudiocontext-interface/ctor-offlineaudiocontext.html",
+      "category": "constructors",
+      "status": "pass"
+    },
+    {
+      "path": "webaudio/the-audio-api/the-gainnode-interface/ctor-gain.html",
+      "category": "constructors",
+      "status": "skip",
+      "reason": "The upstream file hard-codes AudioContext; GainNode is available in Phase 1 only through OfflineAudioContext and is covered by the integration suite."
+    },
+    {
+      "path": "webaudio/the-audio-api/the-oscillatornode-interface/ctor-oscillator.html",
+      "category": "constructors",
+      "status": "skip",
+      "reason": "The file requires online AudioContext and custom PeriodicWave support; Phase 1 exposes only fixed-wave offline oscillators."
+    },
+    {
+      "path": "webaudio/the-audio-api/the-audionode-interface/audionode-connect-return-value.html",
+      "category": "connect/disconnect",
+      "status": "pass"
+    },
+    {
+      "path": "webaudio/the-audio-api/the-audionode-interface/audionode-disconnect.html",
+      "category": "connect/disconnect",
+      "status": "skip",
+      "reason": "The rendering cases require AudioBufferSourceNode and ChannelSplitterNode; Phase 1 disconnect overloads remain covered by the bounded graph integration suite."
+    },
+    {
+      "path": "webaudio/the-audio-api/the-audionode-interface/audionode-disconnect-audioparam.html",
+      "category": "connect/disconnect",
+      "status": "skip",
+      "reason": "The file requires AudioBufferSourceNode, ChannelSplitterNode, offline suspend/resume, and online AudioContext, none of which are claimed by the Phase 1 slice."
+    },
+    {
+      "path": "webaudio/the-audio-api/the-offlineaudiocontext-interface/current-time-block-size.html",
+      "category": "offline rendering",
+      "status": "pass"
+    },
+    {
+      "path": "webaudio/the-audio-api/the-offlineaudiocontext-interface/offlineaudiocontext-suspend-rendersizehint.https.html",
+      "category": "offline rendering",
+      "status": "skip",
+      "reason": "Offline suspend/resume and renderSizeHint are deferred; startRendering and render-quantum completion run above."
+    }
+  ]
+}

@@ -12,6 +12,7 @@ const { markNotSerializable } = core.loadExtScript(
   "ext:deno_web/13_message_port.js",
 );
 const {
+  ObjectCreate,
   ObjectPrototypeIsPrototypeOf,
   RangeErrorPrototype,
   SafeWeakMap,
@@ -20,6 +21,13 @@ const {
 } = primordials;
 
 const nativeBuffers = new SafeWeakMap();
+
+function createAudioBuffer(native) {
+  const buffer = ObjectCreate(AudioBufferPrototype);
+  WeakMapPrototypeSet(nativeBuffers, buffer, native);
+  buffer[webidl.brand] = webidl.brand;
+  return buffer;
+}
 
 webidl.converters.AudioBufferOptions = webidl.createDictionaryConverter(
   "AudioBufferOptions",
@@ -182,4 +190,8 @@ webidl.converters.AudioBuffer = webidl.createInterfaceConverter(
   AudioBufferPrototype,
 );
 
-export { AudioBuffer, nativeOf as getNativeAudioBuffer };
+export {
+  AudioBuffer,
+  createAudioBuffer,
+  nativeOf as getNativeAudioBuffer,
+};

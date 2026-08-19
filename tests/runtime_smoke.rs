@@ -43,6 +43,11 @@ fn extension_loads_after_web_platform_dependencies() {
         if (typeof AudioBuffer !== "function") {
           throw new Error("Phase 1 AudioBuffer global was not installed");
         }
+        if (typeof OfflineAudioContext !== "function" ||
+            typeof GainNode !== "function" ||
+            typeof OscillatorNode !== "function") {
+          throw new Error("Phase 1 offline graph globals were not installed");
+        }
         if (typeof AudioContext !== "undefined") {
           throw new Error("incomplete Phase 2 AudioContext was installed");
         }
@@ -74,6 +79,10 @@ fn extension_bootstrap_survives_a_startup_snapshot() {
               const buffer = new AudioBuffer({ length: 2, sampleRate: 48000 });
               if (buffer.length !== 2 || buffer.numberOfChannels !== 1) {
                 throw new Error("snapshotted AudioBuffer bootstrap is unusable");
+              }
+              const context = new OfflineAudioContext(1, 128, 48000);
+              if (!(context.createGain() instanceof GainNode)) {
+                throw new Error("snapshotted offline graph bootstrap is unusable");
               }
             "#,
         )

@@ -8,12 +8,101 @@ use deno_core::unsync::spawn_blocking;
 use deno_core::{op2, v8, GarbageCollected, OpState};
 use deno_error::JsErrorBox;
 use web_audio_api::context::{BaseAudioContext, OfflineAudioContext};
-use web_audio_api::node::{AudioNode, AudioScheduledSourceNode};
+use web_audio_api::node::{
+    AudioNode, AudioScheduledSourceNode, ChannelCountMode, ChannelInterpretation, OscillatorType,
+};
 use web_audio_api::MAX_CHANNELS;
 
-use crate::buffer::{NativeAudioByteBudget, NativeAudioByteReservation};
+use crate::buffer::{
+    checked_pcm_bytes, NativeAudioBuffer, NativeAudioByteBudget, NativeAudioByteReservation,
+};
 use crate::host::{AudioHostReservation, AudioHostResourceKind};
+use crate::node::{NativeAudioNode, OfflineGraph};
 use crate::online::{AudioRuntimeState, IsolateReservation};
+
+fn channel_count_mode(value: u32) -> Result<ChannelCountMode, JsErrorBox> {
+    match value {
+        0 => Ok(ChannelCountMode::Max),
+        1 => Ok(ChannelCountMode::ClampedMax),
+        2 => Ok(ChannelCountMode::Explicit),
+        _ => Err(JsErrorBox::type_error("unknown channelCountMode")),
+    }
+}
+
+fn channel_interpretation(value: u32) -> Result<ChannelInterpretation, JsErrorBox> {
+    match value {
+        0 => Ok(ChannelInterpretation::Speakers),
+        1 => Ok(ChannelInterpretation::Discrete),
+        _ => Err(JsErrorBox::type_error("unknown channelInterpretation")),
+    }
+}
+
+fn oscillator_type(value: u32) -> Result<OscillatorType, JsErrorBox> {
+    match value {
+        0 => Ok(OscillatorType::Sine),
+        1 => Ok(OscillatorType::Square),
+        2 => Ok(OscillatorType::Sawtooth),
+        3 => Ok(OscillatorType::Triangle),
+        _ => Err(JsErrorBox::generic(
+            "InvalidStateError: custom oscillator type is unavailable",
+        )),
+    }
+}
+
+fn validate_offline_dimensions(
+    runtime: &AudioRuntimeState,
+    number_of_channels: u32,
+    length: u32,
+    sample_rate: f64,
+) -> Result<(usize, usize, f32), JsErrorBox> {
+    let number_of_channels = number_of_channels as usize;
+    if !(1..=MAX_CHANNELS).contains(&number_of_channels)
+        || runtime
+            .limits()
+            .channels()
+            .is_some_and(|limit| number_of_channels > limit)
+    {
+        return Err(JsErrorBox::range_error(
+            "numberOfChannels exceeds the configured offline limit",
+        ));
+    }
+    let length = length as usize;
+    if length == 0 {
+        return Err(JsErrorBox::range_error("length must be greater than zero"));
+    }
+    if runtime
+        .limits()
+        .offline_frames()
+        .is_some_and(|limit| length > limit)
+    {
+        return Err(JsErrorBox::range_error(
+            "offline render frame limit exceeded",
+        ));
+    }
+    let samples = number_of_channels
+        .checked_mul(length)
+        .ok_or_else(|| JsErrorBox::range_error("offline render sample count overflowed"))?;
+    if runtime
+        .limits()
+        .offline_samples()
+        .is_some_and(|limit| samples > limit)
+    {
+        return Err(JsErrorBox::range_error(
+            "offline render logical sample limit exceeded",
+        ));
+    }
+    let sample_rate_f32 = validate_sample_rate(sample_rate)?;
+    if runtime
+        .limits()
+        .sample_rate()
+        .is_some_and(|limit| sample_rate > f64::from(limit))
+    {
+        return Err(JsErrorBox::range_error(
+            "configured offline sample-rate limit exceeded",
+        ));
+    }
+    Ok((number_of_channels, length, sample_rate_f32))
+}
 
 #[derive(Serialize)]
 #[serde(crate = "deno_core::serde", rename_all = "camelCase")]
@@ -73,6 +162,213 @@ where
             "{operation_name} blocking task failed: {error}"
         ))),
     }
+}
+
+/// Private native context behind the public JavaScript `OfflineAudioContext`.
+pub(crate) struct NativeOfflineAudioContext {
+    graph: Arc<OfflineGraph>,
+    runtime: Arc<AudioRuntimeState>,
+    budget: Arc<NativeAudioByteBudget>,
+    number_of_channels: usize,
+    length: usize,
+    sample_rate: f32,
+}
+
+// SAFETY: this object owns only Send + Sync Rust values and no V8 or CppGC
+// pointers.
+unsafe impl GarbageCollected for NativeOfflineAudioContext {
+    fn trace(&self, _visitor: &mut v8::cppgc::Visitor) {}
+
+    fn get_name(&self) -> &'static CStr {
+        c"NativeOfflineAudioContext"
+    }
+}
+
+#[op2]
+impl NativeOfflineAudioContext {
+    #[constructor]
+    #[cppgc]
+    fn new(
+        state: &mut OpState,
+        number_of_channels: u32,
+        length: u32,
+        sample_rate: f64,
+    ) -> Result<NativeOfflineAudioContext, JsErrorBox> {
+        let runtime = Arc::clone(state.borrow::<Arc<AudioRuntimeState>>());
+        let budget = Arc::clone(state.borrow::<Arc<NativeAudioByteBudget>>());
+        let (number_of_channels, length, sample_rate) =
+            validate_offline_dimensions(&runtime, number_of_channels, length, sample_rate)?;
+        let graph = OfflineGraph::new(
+            Arc::clone(&runtime),
+            Arc::clone(&budget),
+            number_of_channels,
+            length,
+            sample_rate,
+        )?;
+        Ok(NativeOfflineAudioContext {
+            graph,
+            runtime,
+            budget,
+            number_of_channels,
+            length,
+            sample_rate,
+        })
+    }
+
+    #[getter]
+    fn sample_rate(&self) -> f32 {
+        self.sample_rate
+    }
+
+    #[getter]
+    fn length(&self) -> u32 {
+        u32::try_from(self.length).expect("Web IDL validated offline length must fit u32")
+    }
+
+    #[getter]
+    fn number_of_channels(&self) -> u32 {
+        u32::try_from(self.number_of_channels)
+            .expect("Web IDL validated offline channel count must fit u32")
+    }
+
+    #[getter]
+    fn current_time(&self) -> f64 {
+        self.graph.context().current_time()
+    }
+
+    #[getter]
+    fn state(&self) -> u32 {
+        self.graph.state_code()
+    }
+
+    #[cppgc]
+    fn destination(&self) -> NativeAudioNode {
+        self.graph.destination()
+    }
+
+    #[cppgc]
+    fn create_gain(
+        &self,
+        gain: f32,
+        channel_count: u32,
+        count_mode: u32,
+        interpretation: u32,
+    ) -> Result<NativeAudioNode, JsErrorBox> {
+        self.graph.create_gain(
+            gain,
+            channel_count as usize,
+            channel_count_mode(count_mode)?,
+            channel_interpretation(interpretation)?,
+        )
+    }
+
+    #[cppgc]
+    #[allow(clippy::too_many_arguments)]
+    fn create_oscillator(
+        &self,
+        oscillator_type_code: u32,
+        frequency: f32,
+        detune: f32,
+        channel_count: u32,
+        count_mode: u32,
+        interpretation: u32,
+    ) -> Result<NativeAudioNode, JsErrorBox> {
+        self.graph.create_oscillator(
+            oscillator_type(oscillator_type_code)?,
+            frequency,
+            detune,
+            channel_count as usize,
+            channel_count_mode(count_mode)?,
+            channel_interpretation(interpretation)?,
+        )
+    }
+}
+
+struct PublicOfflineRenderPayload {
+    graph: Arc<OfflineGraph>,
+    budget: Arc<NativeAudioByteBudget>,
+    output_reservation: NativeAudioByteReservation,
+    _isolate_job: IsolateReservation,
+    _host_job: AudioHostReservation,
+}
+
+struct PublicOfflineRenderResult {
+    canonical: web_audio_api::AudioBuffer,
+    budget: Arc<NativeAudioByteBudget>,
+    output_reservation: NativeAudioByteReservation,
+}
+
+impl NativeOfflineAudioContext {
+    fn prepare_render(&self) -> Result<PublicOfflineRenderPayload, JsErrorBox> {
+        let isolate_job = self.runtime.try_reserve_offline_render_job()?;
+        let host_job = self
+            .runtime
+            .host()
+            .try_reserve(AudioHostResourceKind::OfflineRenderJobs, 1)
+            .map_err(|error| {
+                JsErrorBox::range_error(format!(
+                    "AudioHost offline-render-job limit exceeded: {error}"
+                ))
+            })?;
+        self.budget.validate_audio_buffer(
+            self.number_of_channels,
+            self.length,
+            f64::from(self.sample_rate),
+        )?;
+        let output_bytes = checked_pcm_bytes(self.number_of_channels, self.length)
+            .ok_or_else(|| JsErrorBox::range_error("offline render byte count overflowed"))?;
+        let output_reservation = self.budget.reserve(output_bytes).map_err(|error| {
+            JsErrorBox::range_error(format!(
+                "offline render output byte reservation failed: {error}"
+            ))
+        })?;
+        self.graph.begin_render()?;
+        Ok(PublicOfflineRenderPayload {
+            graph: Arc::clone(&self.graph),
+            budget: Arc::clone(&self.budget),
+            output_reservation,
+            _isolate_job: isolate_job,
+            _host_job: host_job,
+        })
+    }
+}
+
+/// Renders one public offline graph away from the isolate and returns its
+/// canonical PCM as a newly managed native `AudioBuffer`.
+#[op2]
+#[cppgc]
+pub(crate) async fn op_offline_start_rendering(
+    #[cppgc] context: &NativeOfflineAudioContext,
+) -> Result<NativeAudioBuffer, JsErrorBox> {
+    let payload = context.prepare_render()?;
+    let graph_on_join_failure = Arc::clone(&payload.graph);
+    let rendered = resolve_blocking("offline audio render", move || {
+        let graph = Arc::clone(&payload.graph);
+        let outcome = blocking_outcome(|| {
+            let canonical =
+                deno_core::futures::executor::block_on(payload.graph.context().start_rendering());
+            Ok(PublicOfflineRenderResult {
+                canonical,
+                budget: payload.budget,
+                output_reservation: payload.output_reservation,
+            })
+        });
+        graph.finish_render(matches!(outcome, BlockingOutcome::Complete(_)));
+        outcome
+    })
+    .await;
+    let rendered = match rendered {
+        Ok(rendered) => rendered,
+        Err(error) => {
+            graph_on_join_failure.finish_render(false);
+            return Err(error);
+        }
+    };
+    Ok(NativeAudioBuffer::from_canonical(
+        rendered.canonical,
+        rendered.budget,
+        rendered.output_reservation,
+    ))
 }
 
 struct OfflineRenderPayload {

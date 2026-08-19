@@ -10,6 +10,18 @@ Web Audio surface.
 
 ### Added
 
+- A bounded public offline Web Audio graph with `OfflineAudioContext`, the base
+  node hierarchy, destination, Gain, four fixed Oscillator waveforms,
+  `AudioParam` automation, explicit connect/disconnect overloads, off-isolate
+  rendering, and generation-local `complete`/`ended` event delivery.
+- Per-isolate connection and automation-event limits plus conservative native
+  graph/control ownership retained through rendering and eventual wrapper
+  teardown.
+- A minimal Web Platform Test harness pinned to commit
+  `fbc1b90e28b38e919acabeeb14d1b074f2c125ec`, including shell-global aliases,
+  a checkout-confined fetch shim, CI execution, and reviewed reasons for every
+  skipped Phase 1 file. The initial reviewed subset has 4 passing files, 0
+  failing files, and 7 explicitly skipped files.
 - The first Phase 1 public Web Audio surface: a primordial-safe, snapshot-safe
   `AudioBuffer` global with Web IDL construction, descriptors, brand checks,
   typed errors, channel-copy methods, same-object channel views, and explicit

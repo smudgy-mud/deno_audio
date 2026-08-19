@@ -46,7 +46,7 @@ impl NativeAudioByteBudget {
         }
     }
 
-    fn validate_audio_buffer(
+    pub(crate) fn validate_audio_buffer(
         &self,
         channels: usize,
         length: usize,
@@ -237,7 +237,7 @@ unsafe impl GarbageCollected for NativeAudioBuffer {
     }
 }
 
-fn checked_pcm_bytes(channels: usize, length: usize) -> Option<usize> {
+pub(crate) fn checked_pcm_bytes(channels: usize, length: usize) -> Option<usize> {
     channels.checked_mul(length)?.checked_mul(BYTES_PER_SAMPLE)
 }
 
@@ -413,6 +413,24 @@ fn check_sample(
         return Err(JsErrorBox::range_error("sample index is out of range"));
     }
     Ok((channel, sample))
+}
+
+impl NativeAudioBuffer {
+    pub(crate) fn from_canonical(
+        canonical: AudioBuffer,
+        budget: Arc<NativeAudioByteBudget>,
+        canonical_reservation: NativeAudioByteReservation,
+    ) -> Self {
+        let channel_count = canonical.number_of_channels();
+        Self {
+            state: GcCell::new(NativeAudioBufferState {
+                canonical,
+                exposed: (0..channel_count).map(|_| None).collect(),
+            }),
+            budget,
+            _canonical_reservation: canonical_reservation,
+        }
+    }
 }
 
 #[op2]
