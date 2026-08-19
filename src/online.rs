@@ -14,7 +14,7 @@ use web_audio_api::context::{
 };
 use web_audio_api::output::AudioOutputFactory;
 
-use crate::host::{AudioHost, AudioHostLimitError, AudioHostOnlineContextPermit};
+use crate::host::{release_atomic, AudioHost, AudioHostLimitError, AudioHostOnlineContextPermit};
 use crate::options::{AudioLimits, AudioPermissions};
 use crate::scheduled::ContextEventHub;
 
@@ -24,6 +24,7 @@ pub(crate) struct AudioRuntimeState {
     limits: AudioLimits,
     output: Arc<dyn AudioOutputFactory>,
     online_contexts: AtomicUsize,
+    decode_jobs: AtomicUsize,
     scheduled_sources: AtomicUsize,
     queued_events: AtomicUsize,
 }
@@ -41,6 +42,7 @@ impl AudioRuntimeState {
             limits,
             output,
             online_contexts: AtomicUsize::new(0),
+            decode_jobs: AtomicUsize::new(0),
             scheduled_sources: AtomicUsize::new(0),
             queued_events: AtomicUsize::new(0),
         }
@@ -48,6 +50,16 @@ impl AudioRuntimeState {
 
     pub(crate) fn host(&self) -> &Arc<AudioHost> {
         &self.host
+    }
+
+    pub(crate) fn limits(&self) -> &AudioLimits {
+        &self.limits
+    }
+
+    pub(crate) fn try_reserve_decode_job(
+        self: &Arc<Self>,
+    ) -> Result<IsolateReservation, JsErrorBox> {
+        self.try_reserve_resource(IsolateResourceKind::DecodeJobs, 1)
     }
 
     pub(crate) fn try_reserve_scheduled_source(
@@ -68,6 +80,9 @@ impl AudioRuntimeState {
         amount: usize,
     ) -> Result<IsolateReservation, JsErrorBox> {
         let (counter, limit, name) = match resource {
+            IsolateResourceKind::DecodeJobs => {
+                (&self.decode_jobs, self.limits.decode_jobs(), "decode job")
+            }
             IsolateResourceKind::ScheduledSources => (
                 &self.scheduled_sources,
                 self.limits.scheduled_sources(),
@@ -150,6 +165,7 @@ impl AudioRuntimeState {
 
 #[derive(Clone, Copy)]
 enum IsolateResourceKind {
+    DecodeJobs,
     ScheduledSources,
     QueuedEvents,
 }
@@ -163,11 +179,11 @@ pub(crate) struct IsolateReservation {
 impl Drop for IsolateReservation {
     fn drop(&mut self) {
         let counter = match self.resource {
+            IsolateResourceKind::DecodeJobs => &self.runtime.decode_jobs,
             IsolateResourceKind::ScheduledSources => &self.runtime.scheduled_sources,
             IsolateResourceKind::QueuedEvents => &self.runtime.queued_events,
         };
-        let previous = counter.fetch_sub(self.amount, Ordering::AcqRel);
-        debug_assert!(previous >= self.amount);
+        release_atomic(counter, self.amount);
     }
 }
 
@@ -194,8 +210,7 @@ impl Drop for IsolateOnlineContextPermit {
             self.release = false;
         }
         if self.release {
-            let previous = self.runtime.online_contexts.fetch_sub(1, Ordering::AcqRel);
-            debug_assert!(previous > 0);
+            release_atomic(&self.runtime.online_contexts, 1);
         }
     }
 }

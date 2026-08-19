@@ -11,6 +11,7 @@
 
 mod binding;
 mod buffer;
+mod decode;
 mod host;
 mod node;
 mod offline;
@@ -27,7 +28,7 @@ deno_core::extension!(
     deno_audio,
     deps = [deno_webidl, deno_web],
     ops = [
-        offline::op_phase0_decode_off_thread,
+        decode::op_phase0_decode_off_thread,
         offline::op_phase0_render_off_thread,
         online::op_phase0_online_suspend,
         online::op_phase0_online_resume,
@@ -37,6 +38,7 @@ deno_core::extension!(
     objects = [
         binding::NativePhase0Probe,
         buffer::NativeAudioBuffer,
+        decode::NativePhase0DecodeRequest,
         online::NativePhase0OnlineContext,
         scheduled::NativePhase0Oscillator,
     ],

@@ -19,6 +19,11 @@ use crate::host::AudioHost;
 pub struct AudioLimits {
     max_online_contexts: Option<usize>,
     max_live_audio_bytes: Option<usize>,
+    max_channels: Option<usize>,
+    max_decoded_frames: Option<usize>,
+    max_decoded_samples: Option<usize>,
+    max_encoded_bytes: Option<usize>,
+    max_decode_jobs: Option<usize>,
     max_scheduled_sources: Option<usize>,
     max_queued_events: Option<usize>,
 }
@@ -30,6 +35,11 @@ impl Default for AudioLimits {
             // while still allowing trusted embedders to opt out explicitly.
             max_online_contexts: Some(6),
             max_live_audio_bytes: Some(64 * 1024 * 1024),
+            max_channels: Some(web_audio_api::MAX_CHANNELS),
+            max_decoded_frames: Some(16 * 1024 * 1024),
+            max_decoded_samples: Some(16 * 1024 * 1024),
+            max_encoded_bytes: Some(32 * 1024 * 1024),
+            max_decode_jobs: Some(4),
             max_scheduled_sources: Some(512),
             max_queued_events: Some(256),
         }
@@ -43,6 +53,11 @@ impl AudioLimits {
         Self {
             max_online_contexts: None,
             max_live_audio_bytes: None,
+            max_channels: None,
+            max_decoded_frames: None,
+            max_decoded_samples: None,
+            max_encoded_bytes: None,
+            max_decode_jobs: None,
             max_scheduled_sources: None,
             max_queued_events: None,
         }
@@ -59,6 +74,41 @@ impl AudioLimits {
     #[must_use]
     pub const fn max_live_audio_bytes(mut self, limit: Option<usize>) -> Self {
         self.max_live_audio_bytes = limit;
+        self
+    }
+
+    /// Sets the maximum channel count accepted from decoded media.
+    #[must_use]
+    pub const fn max_channels(mut self, limit: Option<usize>) -> Self {
+        self.max_channels = limit;
+        self
+    }
+
+    /// Sets the maximum frame count accepted from one decoded result.
+    #[must_use]
+    pub const fn max_decoded_frames(mut self, limit: Option<usize>) -> Self {
+        self.max_decoded_frames = limit;
+        self
+    }
+
+    /// Sets the maximum logical sample count accepted from one decoded result.
+    #[must_use]
+    pub const fn max_decoded_samples(mut self, limit: Option<usize>) -> Self {
+        self.max_decoded_samples = limit;
+        self
+    }
+
+    /// Sets the maximum encoded payload accepted by one decode request.
+    #[must_use]
+    pub const fn max_encoded_bytes(mut self, limit: Option<usize>) -> Self {
+        self.max_encoded_bytes = limit;
+        self
+    }
+
+    /// Sets the concurrent decode-job ceiling for this isolate.
+    #[must_use]
+    pub const fn max_decode_jobs(mut self, limit: Option<usize>) -> Self {
+        self.max_decode_jobs = limit;
         self
     }
 
@@ -82,6 +132,26 @@ impl AudioLimits {
 
     pub(crate) const fn live_audio_bytes(&self) -> Option<usize> {
         self.max_live_audio_bytes
+    }
+
+    pub(crate) const fn channels(&self) -> Option<usize> {
+        self.max_channels
+    }
+
+    pub(crate) const fn decoded_frames(&self) -> Option<usize> {
+        self.max_decoded_frames
+    }
+
+    pub(crate) const fn decoded_samples(&self) -> Option<usize> {
+        self.max_decoded_samples
+    }
+
+    pub(crate) const fn encoded_bytes(&self) -> Option<usize> {
+        self.max_encoded_bytes
+    }
+
+    pub(crate) const fn decode_jobs(&self) -> Option<usize> {
+        self.max_decode_jobs
     }
 
     pub(crate) const fn scheduled_sources(&self) -> Option<usize> {

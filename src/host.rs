@@ -122,7 +122,7 @@ impl AudioHostLimits {
 pub enum AudioHostResourceKind {
     /// Open online audio contexts.
     OnlineContexts,
-    /// Wrapper-owned live audio bytes.
+    /// Wrapper-owned encoded and PCM audio bytes.
     LiveAudioBytes,
     /// Live graph nodes.
     GraphNodes,
@@ -212,7 +212,7 @@ impl AudioHostUsage {
         self.online_contexts
     }
 
-    /// Wrapper-owned live audio bytes.
+    /// Wrapper-owned encoded and PCM audio bytes.
     #[must_use]
     pub const fn live_audio_bytes(self) -> usize {
         self.live_audio_bytes
@@ -435,6 +435,18 @@ pub(crate) struct AudioHostReservation {
 }
 
 impl AudioHostReservation {
+    pub(crate) fn shrink_to(&mut self, amount: usize) {
+        if amount > self.amount {
+            return;
+        }
+        let released = self.amount - amount;
+        self.amount = amount;
+        if self.release {
+            let (counter, _) = self.host.counter_and_limit(self.resource);
+            release_atomic(counter, released);
+        }
+    }
+
     fn abandon_without_release(mut self) {
         self.release = false;
     }
@@ -444,8 +456,22 @@ impl Drop for AudioHostReservation {
     fn drop(&mut self) {
         if self.release {
             let (counter, _) = self.host.counter_and_limit(self.resource);
-            let previous = counter.fetch_sub(self.amount, Ordering::AcqRel);
-            debug_assert!(previous >= self.amount);
+            release_atomic(counter, self.amount);
+        }
+    }
+}
+
+pub(crate) fn release_atomic(counter: &AtomicUsize, amount: usize) {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let Some(next) = current.checked_sub(amount) else {
+            // Accounting corruption must fail closed rather than wrap the
+            // counter or panic from a resource-guard destructor.
+            return;
+        };
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
         }
     }
 }

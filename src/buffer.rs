@@ -1,4 +1,5 @@
 use std::ffi::CStr;
+use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -7,7 +8,9 @@ use deno_core::{op2, v8, GarbageCollected, OpState};
 use deno_error::JsErrorBox;
 use web_audio_api::{AudioBuffer, AudioBufferOptions, MAX_CHANNELS};
 
-use crate::host::{AudioHost, AudioHostReservation, AudioHostResourceKind};
+use crate::host::{
+    release_atomic, AudioHost, AudioHostLimitError, AudioHostReservation, AudioHostResourceKind,
+};
 
 const BYTES_PER_SAMPLE: usize = size_of::<f32>();
 
@@ -26,12 +29,25 @@ impl NativeAudioByteBudget {
         }
     }
 
-    fn reserve(self: &Arc<Self>, bytes: usize) -> Option<NativeAudioByteReservation> {
+    pub(crate) fn reserve(
+        self: &Arc<Self>,
+        bytes: usize,
+    ) -> Result<NativeAudioByteReservation, NativeAudioByteLimitError> {
         let mut used = self.used.load(Ordering::Acquire);
         loop {
-            let next = used.checked_add(bytes)?;
+            let Some(next) = used.checked_add(bytes) else {
+                return Err(NativeAudioByteLimitError::Local {
+                    current: used,
+                    requested: bytes,
+                    limit: self.limit,
+                });
+            };
             if next > self.limit {
-                return None;
+                return Err(NativeAudioByteLimitError::Local {
+                    current: used,
+                    requested: bytes,
+                    limit: self.limit,
+                });
             }
             match self
                 .used
@@ -42,17 +58,17 @@ impl NativeAudioByteBudget {
                         budget: Arc::clone(self),
                         bytes,
                     };
-                    let Ok(host) = self
+                    let host = match self
                         .host
                         .try_reserve(AudioHostResourceKind::LiveAudioBytes, bytes)
-                    else {
-                        drop(local);
-                        return None;
+                    {
+                        Ok(host) => host,
+                        Err(error) => {
+                            drop(local);
+                            return Err(NativeAudioByteLimitError::Host(error));
+                        }
                     };
-                    return Some(NativeAudioByteReservation {
-                        _local: local,
-                        _host: host,
-                    });
+                    return Ok(NativeAudioByteReservation { local, host });
                 }
                 Err(observed) => used = observed,
             }
@@ -64,6 +80,34 @@ impl NativeAudioByteBudget {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum NativeAudioByteLimitError {
+    Local {
+        current: usize,
+        requested: usize,
+        limit: usize,
+    },
+    Host(AudioHostLimitError),
+}
+
+impl fmt::Display for NativeAudioByteLimitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local {
+                current,
+                requested,
+                limit,
+            } => write!(
+                formatter,
+                "per-isolate live audio byte limit {limit} exceeded by reservation of {requested} at {current}"
+            ),
+            Self::Host(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for NativeAudioByteLimitError {}
+
 struct LocalNativeAudioByteReservation {
     budget: Arc<NativeAudioByteBudget>,
     bytes: usize,
@@ -71,14 +115,25 @@ struct LocalNativeAudioByteReservation {
 
 impl Drop for LocalNativeAudioByteReservation {
     fn drop(&mut self) {
-        let previous = self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
-        debug_assert!(previous >= self.bytes);
+        release_atomic(&self.budget.used, self.bytes);
     }
 }
 
-struct NativeAudioByteReservation {
-    _local: LocalNativeAudioByteReservation,
-    _host: AudioHostReservation,
+pub(crate) struct NativeAudioByteReservation {
+    local: LocalNativeAudioByteReservation,
+    host: AudioHostReservation,
+}
+
+impl NativeAudioByteReservation {
+    pub(crate) fn shrink_to(&mut self, bytes: usize) {
+        if bytes > self.local.bytes {
+            return;
+        }
+        let released = self.local.bytes - bytes;
+        self.local.bytes = bytes;
+        release_atomic(&self.local.budget.used, released);
+        self.host.shrink_to(bytes);
+    }
 }
 
 /// Storage handed to V8 for one exposed channel copy.
@@ -255,8 +310,10 @@ impl NativeAudioBuffer {
         let canonical_bytes = checked_pcm_bytes(options.number_of_channels, options.length)
             .ok_or_else(|| JsErrorBox::range_error("AudioBuffer dimensions overflow"))?;
         let budget = Arc::clone(state.borrow::<Arc<NativeAudioByteBudget>>());
-        let canonical_reservation = budget.reserve(canonical_bytes).ok_or_else(|| {
-            JsErrorBox::range_error("native audio byte budget exceeded before allocation")
+        let canonical_reservation = budget.reserve(canonical_bytes).map_err(|error| {
+            JsErrorBox::range_error(format!(
+                "native audio byte budget exceeded before allocation: {error}"
+            ))
         })?;
         let channel_count = options.number_of_channels;
         let canonical = AudioBuffer::new(options);
@@ -307,8 +364,10 @@ impl NativeAudioBuffer {
             .checked_mul(BYTES_PER_SAMPLE)
             .ok_or_else(|| JsErrorBox::range_error("channel byte length overflow"))?;
         let sample_count = samples.len();
-        let reservation = self.budget.reserve(byte_length).ok_or_else(|| {
-            JsErrorBox::range_error("native audio byte budget exceeded before V8 allocation")
+        let reservation = self.budget.reserve(byte_length).map_err(|error| {
+            JsErrorBox::range_error(format!(
+                "native audio byte budget exceeded before V8 allocation: {error}"
+            ))
         })?;
         let storage = Box::new(ExposedChannelStorage {
             bytes: encode_samples(samples),

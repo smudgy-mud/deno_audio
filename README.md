@@ -9,10 +9,10 @@ the [Smudgy `web-audio-api-rs` fork](https://github.com/smudgy-mud/web-audio-api
 paths have passed the Phase 0B acceptance gate. The extension now contains
 private proof objects and ops for `CppGC`, `AudioBuffer`, owned asynchronous
 work, offline rendering, shared `AudioHost` accounting, online lifecycle
-ownership, render-death handling, and scheduled-source reconciliation. It does
-not install Web Audio globals and is not ready for application use. These
-private seams exist to make the eventual JavaScript surface reviewable rather
-than to provide an interim API.
+ownership, render-death handling, scheduled-source reconciliation, and bounded
+off-thread decoding. It does not install Web Audio globals and is not ready for
+application use. These private seams exist to make the eventual JavaScript
+surface reviewable rather than to provide an interim API.
 
 The research baseline is deliberately locked to one compatibility set:
 
@@ -63,9 +63,11 @@ public JavaScript `OfflineAudioContext` exists yet.
 Each extension instance is initialized with `AudioExtensionOptions`. Sharing
 one `Arc<AudioHost>` across options makes the configured aggregate limits span
 isolates; output and permission services remain separate authorities. The
-private Phase 0D proof surface uses this same ownership shape, but is available
-only through unsafe native exposure in tests and is not a supported JavaScript
-API.
+private Phase 0D proof surface uses this same ownership shape. Decode requests
+reserve their encoded copy, concurrent job, result dimensions, and every
+wrapper-owned PCM allocation before spawning or growing. These objects remain
+available only through unsafe native exposure in tests and are not a supported
+JavaScript API.
 
 The engine revision is currently available only in the maintainer's local fork
 history. A fresh external checkout cannot resolve the canonical Git dependency

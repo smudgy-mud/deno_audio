@@ -1,4 +1,3 @@
-use std::io::Cursor;
 use std::panic::{self, AssertUnwindSafe};
 use std::thread;
 
@@ -12,15 +11,6 @@ use web_audio_api::MAX_CHANNELS;
 
 #[derive(Serialize)]
 #[serde(crate = "deno_core::serde", rename_all = "camelCase")]
-struct Phase0DecodeSummary {
-    number_of_channels: u32,
-    length: u32,
-    sample_rate: f64,
-    off_isolate_thread: bool,
-}
-
-#[derive(Serialize)]
-#[serde(crate = "deno_core::serde", rename_all = "camelCase")]
 struct Phase0RenderSummary {
     number_of_channels: u32,
     length: u32,
@@ -28,7 +18,7 @@ struct Phase0RenderSummary {
     off_isolate_thread: bool,
 }
 
-enum BlockingOutcome<T> {
+pub(crate) enum BlockingOutcome<T> {
     Complete(T),
     Failed(String),
     Panicked,
@@ -38,7 +28,7 @@ enum BlockingOutcome<T> {
     clippy::cast_possible_truncation,
     reason = "Web Audio exposes a double sample rate while the pinned engine stores validated rates as f32"
 )]
-fn validate_sample_rate(sample_rate: f64) -> Result<f32, JsErrorBox> {
+pub(crate) fn validate_sample_rate(sample_rate: f64) -> Result<f32, JsErrorBox> {
     if !(3_000.0..=768_000.0).contains(&sample_rate) {
         return Err(JsErrorBox::range_error(
             "sampleRate must be in the inclusive range 3000..=768000",
@@ -47,15 +37,20 @@ fn validate_sample_rate(sample_rate: f64) -> Result<f32, JsErrorBox> {
     Ok(sample_rate as f32)
 }
 
-fn blocking_outcome<T>(operation: impl FnOnce() -> Result<T, String>) -> BlockingOutcome<T> {
+pub(crate) fn blocking_outcome<T>(
+    operation: impl FnOnce() -> Result<T, String>,
+) -> BlockingOutcome<T> {
     match panic::catch_unwind(AssertUnwindSafe(operation)) {
         Ok(Ok(value)) => BlockingOutcome::Complete(value),
         Ok(Err(error)) => BlockingOutcome::Failed(error),
-        Err(_) => BlockingOutcome::Panicked,
+        Err(payload) => {
+            std::mem::forget(payload);
+            BlockingOutcome::Panicked
+        }
     }
 }
 
-async fn resolve_blocking<T>(
+pub(crate) async fn resolve_blocking<T>(
     operation_name: &'static str,
     task: impl FnOnce() -> BlockingOutcome<T> + Send + 'static,
 ) -> Result<T, JsErrorBox>
@@ -72,36 +67,6 @@ where
             "{operation_name} blocking task failed: {error}"
         ))),
     }
-}
-
-/// Phase 0 proof op. `#[buffer(copy)]` snapshots script bytes synchronously,
-/// before this future is constructed; only the owned `Vec` crosses the await.
-#[op2]
-#[serde]
-pub(crate) async fn op_phase0_decode_off_thread(
-    #[buffer(copy)] encoded: Vec<u8>,
-    sample_rate: f64,
-) -> Result<Phase0DecodeSummary, JsErrorBox> {
-    let sample_rate = validate_sample_rate(sample_rate)?;
-    let isolate_thread = thread::current().id();
-
-    resolve_blocking("audio decode", move || {
-        blocking_outcome(|| {
-            let context = OfflineAudioContext::new(1, 1, sample_rate);
-            let decoded = context
-                .decode_audio_data_sync(Cursor::new(encoded))
-                .map_err(|error| format!("audio decode failed: {error}"))?;
-            Ok(Phase0DecodeSummary {
-                number_of_channels: u32::try_from(decoded.number_of_channels())
-                    .map_err(|_| "decoded channel count exceeds the binding range".to_owned())?,
-                length: u32::try_from(decoded.length())
-                    .map_err(|_| "decoded frame count exceeds the binding range".to_owned())?,
-                sample_rate: f64::from(decoded.sample_rate()),
-                off_isolate_thread: thread::current().id() != isolate_thread,
-            })
-        })
-    })
-    .await
 }
 
 /// Phase 0 proof op. Every value captured across the await is an owned Rust
@@ -164,6 +129,22 @@ mod tests {
 
     use super::*;
 
+    struct PanicOnDrop;
+
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            panic!("hostile panic payload destructor");
+        }
+    }
+
+    #[test]
+    fn blocking_panic_boundary_contains_a_hostile_payload() {
+        let outcome = blocking_outcome(|| -> Result<(), String> {
+            std::panic::panic_any(PanicOnDrop);
+        });
+        assert!(matches!(outcome, BlockingOutcome::Panicked));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn decode_and_render_ops_leave_the_isolate_thread() {
         let mut runtime = JsRuntime::new(RuntimeOptions {
@@ -202,10 +183,11 @@ mod tests {
                     view.setInt16(44, 0, true); view.setInt16(46, 8192, true);
                     view.setInt16(48, -8192, true); view.setInt16(50, 0, true);
 
-                    const decoded = await Deno.core.ops.op_phase0_decode_off_thread(
+                    const request = new Deno.core.ops.NativePhase0DecodeRequest(
                       bytes,
                       48000,
                     );
+                    const decoded = await Deno.core.ops.op_phase0_decode_off_thread(request);
                     if (decoded.numberOfChannels !== 1 || decoded.length !== 4 ||
                         decoded.sampleRate !== 48000 || !decoded.offIsolateThread) {
                       throw new Error(`unexpected decode summary: ${JSON.stringify(decoded)}`);
