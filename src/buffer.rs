@@ -221,7 +221,10 @@ impl v8::cppgc::Traced for NativeAudioBufferState {
 pub(crate) struct NativeAudioBuffer {
     state: GcCell<NativeAudioBufferState>,
     budget: Arc<NativeAudioByteBudget>,
-    _canonical_reservation: NativeAudioByteReservation,
+    // Decoded buffers carry their exact reservations inside the engine AudioBuffer's
+    // accounting lease so cheap native clones cannot outlive the charge. Constructed
+    // and rendered buffers retain the wrapper-owned reservation here instead.
+    _canonical_reservation: Option<NativeAudioByteReservation>,
 }
 
 // SAFETY: every V8 handle is a TracedReference inside `state`, and `trace`
@@ -428,7 +431,22 @@ impl NativeAudioBuffer {
                 exposed: (0..channel_count).map(|_| None).collect(),
             }),
             budget,
-            _canonical_reservation: canonical_reservation,
+            _canonical_reservation: Some(canonical_reservation),
+        }
+    }
+
+    pub(crate) fn from_budgeted_decode(
+        canonical: AudioBuffer,
+        budget: Arc<NativeAudioByteBudget>,
+    ) -> Self {
+        let channel_count = canonical.number_of_channels();
+        Self {
+            state: GcCell::new(NativeAudioBufferState {
+                canonical,
+                exposed: (0..channel_count).map(|_| None).collect(),
+            }),
+            budget,
+            _canonical_reservation: None,
         }
     }
 }
@@ -462,7 +480,7 @@ impl NativeAudioBuffer {
                 exposed: (0..channel_count).map(|_| None).collect(),
             }),
             budget,
-            _canonical_reservation: canonical_reservation,
+            _canonical_reservation: Some(canonical_reservation),
         })
     }
 

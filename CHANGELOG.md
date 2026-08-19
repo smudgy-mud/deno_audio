@@ -14,6 +14,9 @@ Web Audio surface.
   fixed-wave Oscillator, scalar `AudioParam.value`, exact connect/disconnect,
   suspend/resume/close, acknowledged state changes, and exactly-once `ended`
   over built-in or host-injected output.
+- Public `BaseAudioContext.decodeAudioData`, including synchronous encoded-input
+  detachment, off-isolate bounded decoding, promise and legacy callback forms,
+  target-rate resampling, and decoder-owned PCM reservations.
 - Explicit `AudioEventPumpLiveness` policy, defaulting to an unreferenced event
   observer while allowing session embedders to keep Deno's loop alive until
   online contexts retire.

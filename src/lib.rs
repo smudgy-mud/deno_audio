@@ -31,6 +31,7 @@ deno_core::extension!(
     deps = [deno_webidl, deno_web],
     ops = [
         decode::op_phase0_decode_off_thread,
+        decode::op_decode_audio_data,
         offline::op_phase0_render_off_thread,
         offline::op_offline_start_rendering,
         online::op_phase0_online_suspend,

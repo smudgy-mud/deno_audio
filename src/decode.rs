@@ -11,11 +11,11 @@ use deno_core::{op2, v8, GarbageCollected, JsBuffer, OpState};
 use deno_error::JsErrorBox;
 use web_audio_api::context::OfflineAudioContext;
 use web_audio_api::{
-    BaseAudioContextDecodeBudgetExt, DecodeBudget, DecodeBudgetError, DecodeBudgetKind,
-    DecodeBudgetRequest, DecodeBudgetReservation,
+    AudioBuffer, BaseAudioContextDecodeBudgetExt, DecodeBudget, DecodeBudgetError,
+    DecodeBudgetKind, DecodeBudgetRequest, DecodeBudgetReservation,
 };
 
-use crate::buffer::{NativeAudioByteBudget, NativeAudioByteReservation};
+use crate::buffer::{NativeAudioBuffer, NativeAudioByteBudget, NativeAudioByteReservation};
 use crate::host::{release_atomic, AudioHostReservation, AudioHostResourceKind};
 use crate::offline::{blocking_outcome, resolve_blocking, validate_sample_rate};
 use crate::online::{AudioRuntimeState, IsolateReservation};
@@ -194,6 +194,7 @@ struct DecodeRequestPayload {
     sample_rate: f32,
     isolate_thread: thread::ThreadId,
     budget: Arc<dyn DecodeBudget>,
+    byte_budget: Arc<NativeAudioByteBudget>,
     _encoded_bytes: NativeAudioByteReservation,
     _isolate_job: IsolateReservation,
     _host_job: AudioHostReservation,
@@ -265,12 +266,14 @@ impl NativePhase0DecodeRequest {
         })?;
         owned.extend_from_slice(encoded.as_ref());
 
+        let decode_budget = Arc::new(NativeDecodeBudget::new(&runtime, Arc::clone(&byte_budget)));
         Ok(NativePhase0DecodeRequest {
             payload: Mutex::new(Some(DecodeRequestPayload {
                 encoded: owned,
                 sample_rate,
                 isolate_thread: thread::current().id(),
-                budget: Arc::new(NativeDecodeBudget::new(&runtime, byte_budget)),
+                budget: decode_budget,
+                byte_budget,
                 _encoded_bytes: encoded_bytes,
                 _isolate_job: isolate_job,
                 _host_job: host_job,
@@ -289,11 +292,15 @@ impl NativePhase0DecodeRequest {
     }
 }
 
-#[op2]
-#[serde]
-pub(crate) async fn op_phase0_decode_off_thread(
-    #[cppgc] request: &NativePhase0DecodeRequest,
-) -> Result<Phase0DecodeSummary, JsErrorBox> {
+struct CompletedDecode {
+    decoded: AudioBuffer,
+    byte_budget: Arc<NativeAudioByteBudget>,
+    off_isolate_thread: bool,
+}
+
+async fn decode_request(
+    request: &NativePhase0DecodeRequest,
+) -> Result<CompletedDecode, JsErrorBox> {
     let payload = request.take()?;
     resolve_blocking("audio decode", move || {
         blocking_outcome(|| {
@@ -302,6 +309,7 @@ pub(crate) async fn op_phase0_decode_off_thread(
                 sample_rate,
                 isolate_thread,
                 budget,
+                byte_budget,
                 _encoded_bytes,
                 _isolate_job,
                 _host_job,
@@ -310,15 +318,45 @@ pub(crate) async fn op_phase0_decode_off_thread(
             let decoded = context
                 .decode_audio_data_sync_with_budget(Cursor::new(encoded), budget)
                 .map_err(|error| format!("audio decode failed: {error}"))?;
-            Ok(Phase0DecodeSummary {
-                number_of_channels: u32::try_from(decoded.number_of_channels())
-                    .map_err(|_| "decoded channel count exceeds the binding range".to_owned())?,
-                length: u32::try_from(decoded.length())
-                    .map_err(|_| "decoded frame count exceeds the binding range".to_owned())?,
-                sample_rate: f64::from(decoded.sample_rate()),
+            Ok(CompletedDecode {
+                decoded,
+                byte_budget,
                 off_isolate_thread: thread::current().id() != isolate_thread,
             })
         })
     })
     .await
+}
+
+#[op2]
+#[serde]
+pub(crate) async fn op_phase0_decode_off_thread(
+    #[cppgc] request: &NativePhase0DecodeRequest,
+) -> Result<Phase0DecodeSummary, JsErrorBox> {
+    let completed = decode_request(request).await?;
+    Ok(Phase0DecodeSummary {
+        number_of_channels: u32::try_from(completed.decoded.number_of_channels()).map_err(
+            |_| JsErrorBox::range_error("decoded channel count exceeds the binding range"),
+        )?,
+        length: u32::try_from(completed.decoded.length()).map_err(|_| {
+            JsErrorBox::range_error("decoded frame count exceeds the binding range")
+        })?,
+        sample_rate: f64::from(completed.decoded.sample_rate()),
+        off_isolate_thread: completed.off_isolate_thread,
+    })
+}
+
+/// Public `BaseAudioContext.decodeAudioData` completion. The decoded engine buffer carries the
+/// decoder's exact dimension and PCM reservations; the wrapper budget is retained separately for
+/// any later V8 channel exposure.
+#[op2]
+#[cppgc]
+pub(crate) async fn op_decode_audio_data(
+    #[cppgc] request: &NativePhase0DecodeRequest,
+) -> Result<NativeAudioBuffer, JsErrorBox> {
+    let completed = decode_request(request).await?;
+    Ok(NativeAudioBuffer::from_budgeted_decode(
+        completed.decoded,
+        completed.byte_budget,
+    ))
 }

@@ -11,9 +11,10 @@ Phase 0 acceptance gates, and the deterministic Phase 1 offline graph is
 complete. The extension now also exposes the first production-bounded online
 slice: `AudioContext`, destination, `GainNode`, fixed-wave `OscillatorNode`,
 scalar `AudioParam.value`, explicit connections, lifecycle methods,
-`statechange`, and exactly-once `ended`. The same JavaScript surface renders
+`statechange`, exactly-once `ended`, and bounded off-isolate `decodeAudioData`
+with both promise and legacy callback forms. The same JavaScript surface renders
 through built-in system output or an embedder-supplied `AudioOutputFactory`.
-`AudioBufferSourceNode`, `ConstantSourceNode`, `decodeAudioData`, custom
+`AudioBufferSourceNode`, `ConstantSourceNode`, custom
 `PeriodicWave`, online parameter automation, additional node families, and
 full browser conformance remain later Phase 2/3 slices, so this is not yet a
 complete Web Audio API.

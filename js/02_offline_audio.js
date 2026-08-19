@@ -20,8 +20,10 @@ const {
   Event,
   EventTarget,
   EventTargetPrototype,
+  reportException,
 } = core.loadExtScript("ext:deno_web/02_event.js");
 const {
+  ArrayBufferPrototypeTransferToFixedLength,
   ArrayPrototypePush,
   Float32Array,
   MapPrototypeDelete,
@@ -29,6 +31,8 @@ const {
   MapPrototypeSet,
   NumberIsFinite,
   ObjectPrototypeIsPrototypeOf,
+  PromisePrototypeThen,
+  PromiseReject,
   RangeError,
   RangeErrorPrototype,
   ReflectApply,
@@ -46,6 +50,7 @@ const {
   SymbolIterator,
   TypeError,
   TypeErrorPrototype,
+  Uint8Array,
   WeakMapPrototypeGet,
   WeakMapPrototypeSet,
   WeakRefPrototypeDeref,
@@ -539,6 +544,51 @@ function validatePort(index, count, kind) {
   }
 }
 
+function convertNullableCallback(value, prefix, position) {
+  if (value === undefined || value === null) return undefined;
+  return webidl.converters.Function(value, prefix, position);
+}
+
+function attachDecodeCallbacks(promise, successCallback, errorCallback) {
+  if (successCallback === undefined && errorCallback === undefined) return;
+  PromisePrototypeThen(
+    promise,
+    successCallback === undefined
+      ? undefined
+      : (buffer) => {
+        try {
+          ReflectApply(successCallback, undefined, [buffer]);
+        } catch (error) {
+          reportException(error);
+        }
+      },
+    errorCallback === undefined
+      ? undefined
+      : (error) => {
+        try {
+          ReflectApply(errorCallback, undefined, [error]);
+        } catch (callbackError) {
+          reportException(callbackError);
+        }
+      },
+  );
+}
+
+async function decodeAudioBuffer(record, encoded) {
+  try {
+    const request = new core.ops.NativePhase0DecodeRequest(
+      new Uint8Array(encoded),
+      record.sampleRate,
+    );
+    return createAudioBuffer(await core.ops.op_decode_audio_data(request));
+  } catch (error) {
+    if (StringPrototypeIncludes(String(error), "audio decode failed")) {
+      throw domException("Unable to decode audio data.", "EncodingError");
+    }
+    rethrowNativeError(error, "BaseAudioContext decodeAudioData");
+  }
+}
+
 class BaseAudioContext extends EventTarget {
   constructor(key = undefined) {
     super();
@@ -551,7 +601,7 @@ class BaseAudioContext extends EventTarget {
   }
 
   get sampleRate() {
-    return contextRecord(this).native.sampleRate;
+    return contextRecord(this).sampleRate;
   }
 
   get currentTime() {
@@ -585,6 +635,39 @@ class BaseAudioContext extends EventTarget {
         "Argument 3",
       ),
     });
+  }
+
+  decodeAudioData(
+    audioData,
+    successCallback = undefined,
+    errorCallback = undefined,
+  ) {
+    const prefix = "Failed to execute 'decodeAudioData' on 'BaseAudioContext'";
+    const record = contextRecord(this);
+    webidl.requiredArguments(arguments.length, 1, prefix);
+    audioData = webidl.converters.ArrayBuffer(audioData, prefix, "Argument 1");
+    successCallback = convertNullableCallback(
+      successCallback,
+      prefix,
+      "Argument 2",
+    );
+    errorCallback = convertNullableCallback(errorCallback, prefix, "Argument 3");
+
+    let encoded;
+    try {
+      encoded = ArrayBufferPrototypeTransferToFixedLength(audioData);
+    } catch {
+      const error = domException(
+        "The encoded audio ArrayBuffer is already detached.",
+        "DataCloneError",
+      );
+      const promise = PromiseReject(error);
+      attachDecodeCallbacks(promise, successCallback, errorCallback);
+      return promise;
+    }
+    const promise = decodeAudioBuffer(record, encoded);
+    attachDecodeCallbacks(promise, successCallback, errorCallback);
+    return promise;
   }
 
   createGain() {
@@ -657,6 +740,7 @@ class OfflineAudioContext extends BaseAudioContext {
       native,
       online: false,
       rendering: false,
+      sampleRate: options.sampleRate,
       sources: new SafeSet(),
       state: "suspended",
     };
@@ -765,6 +849,7 @@ class AudioContext extends BaseAudioContext {
       eventPumpRetired: false,
       native,
       online: true,
+      sampleRate: native.sampleRate,
       sourceById: new SafeMap(),
       sources: new SafeSet(),
       state: contextStateName(native.contextState),
