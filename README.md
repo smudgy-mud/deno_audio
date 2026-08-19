@@ -6,10 +6,11 @@ standard Web Platform extensions, delegating DSP and rendering to
 the [Smudgy `web-audio-api-rs` fork](https://github.com/smudgy-mud/web-audio-api-rs).
 
 **Status: Phase 0 binding spike.** The native engine and both hosted-output
-paths have passed the Phase 0B acceptance gate. The crate still provides only an
-empty Deno extension: it does not install Web Audio globals and is not ready for
-application use. Phase 0C is proving the CppGC, `AudioBuffer`, asynchronous-work,
-and offline-rendering boundaries before the JavaScript surface is built.
+paths have passed the Phase 0B acceptance gate. The extension now contains
+private proof objects and ops for `CppGC`, `AudioBuffer`, owned asynchronous
+work, and offline rendering, but it does not install Web Audio globals and is
+not ready for application use. These private seams exist to make the eventual
+JavaScript surface reviewable rather than to provide an interim API.
 
 The research baseline is deliberately locked to one compatibility set:
 
@@ -47,12 +48,14 @@ cargo test --all-targets --locked
 cargo test --all-targets --no-default-features --locked
 cargo test --doc --locked
 cargo clippy --all-targets --locked -- -D warnings
+cargo doc --no-deps --locked
 cargo deny check
 ```
 
-The default feature selects CPAL. The dependency graph and hosted silent output
-also pass without default features; Phase 0C still has to prove the complete
-offline JavaScript path before that configuration is declared supported.
+The default feature selects CPAL. The dependency graph, hosted silent output,
+private Deno binding proofs, decode worker, and offline render/suspend path also
+pass without default features. This is build-path evidence, not a claim that a
+public JavaScript `OfflineAudioContext` exists yet.
 
 The engine revision is currently available only in the maintainer's local fork
 history. A fresh external checkout cannot resolve the canonical Git dependency

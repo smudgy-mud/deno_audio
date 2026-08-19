@@ -1,7 +1,7 @@
 use deno_core::{JsRuntime, RuntimeOptions};
 
 #[test]
-fn empty_extension_loads_after_web_platform_dependencies() {
+fn private_extension_loads_after_web_platform_dependencies() {
     let mut runtime = JsRuntime::new(RuntimeOptions {
         extensions: vec![
             deno_webidl::deno_webidl::init(),

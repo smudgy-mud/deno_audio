@@ -67,3 +67,26 @@ The working-lockfile acceptance evidence maps the five gates as follows:
 | Suspended/control traffic | `engine_contracts::suspended_hosted_control_is_bounded_and_recovers` reaches the fixed admission limit before unbounded growth, then resumes and closes the accepted graph cleanly. |
 | Decode growth | `engine_contracts::decode_resampling_reserves_output_before_growth` rejects the resampling reservation and proves all earlier reservation guards are released. |
 | Output ownership | `output_ownership` injects a public host factory before graph construction and renders a real hosted graph through public `SystemAudioOutput` using the hardware-free `none` sink. |
+
+## Phase 0C binding and offline evidence
+
+Date verified: 2026-08-19
+
+The extension still installs no Web Audio globals. Its private native seams now
+provide executable evidence for the representation decisions that the public
+surface will use:
+
+| Seam | Executable evidence | Result |
+| --- | --- | --- |
+| `CppGC` ownership | `binding::tests::cppgc_dispatch_tracing_and_finalization_are_real` | Constructor and method dispatch are branded; a traced `Member` keeps its child alive; clearing the member and releasing the final JavaScript root finalize exactly the expected objects. |
+| Erased native nodes | `node::tests::erased_concrete_nodes_connect_and_render_through_dyn_audio_node` | One closed `NativeAudioNode` enum stores destination, gain, and oscillator nodes and connects unlike variants through `&dyn AudioNode`; the resulting graph renders non-silent audio. |
+| `AudioBuffer` exposure | `buffer::tests::exposure_acquisition_transfer_reservations_and_gc_are_coherent` | Repeated `getChannelData` calls return the same traced view; unexposed access remains Rust-side; acquisition copies exposed data then detaches; an already transferred view cannot overwrite canonical PCM; re-exposure creates a fresh view. |
+| Native audio-byte accounting | Both `buffer::tests` | Canonical and exposed bytes are reserved before their represented allocations. A V8 backing-store-owned reservation follows an external transfer and releases only after the transferred store is collected; wrapper collection releases canonical and cached-view reservations. Limit refusal happens before canonical or exposed allocation. |
+| Owned asynchronous boundary | `offline::tests::decode_and_render_ops_leave_the_isolate_thread` | `#[buffer(copy)]` snapshots encoded input before the async future, neither private op accepts `OpState` or V8 handles, and both decode and offline render execute on a blocking worker rather than the isolate thread. |
+| Offline suspension | `offline::tests::offline_suspend_and_resume_observe_the_render_quantum` | With default features disabled, upstream `suspend(time)` pauses before frame 128 and `resume()` makes frames 128 onward audible. The future coverage manifest should therefore mark offline suspend/resume supported rather than `upstream-missing`. |
+| Thread bounds | The erased-node test plus the blocking-op type checks | `AudioBuffer`, `OfflineAudioContext`, the selected concrete node types, the erased enum, and blocking request/result ownership satisfy the required `Send`/`Sync` or `Send` bounds at compile time. |
+
+The buffer proof deliberately uses safe `rusty_v8` backing-store ownership, not
+an external raw PCM pointer. Actual `AudioBufferSourceNode` and `ConvolverNode`
+acquisition remain later public-surface work; their native consumers must retain
+the canonical byte lease alongside every acquired engine buffer clone.
