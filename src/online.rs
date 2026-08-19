@@ -26,6 +26,7 @@ pub(crate) struct AudioRuntimeState {
     online_contexts: AtomicUsize,
     decode_jobs: AtomicUsize,
     offline_render_jobs: AtomicUsize,
+    graph_nodes: AtomicUsize,
     scheduled_sources: AtomicUsize,
     queued_events: AtomicUsize,
 }
@@ -45,6 +46,7 @@ impl AudioRuntimeState {
             online_contexts: AtomicUsize::new(0),
             decode_jobs: AtomicUsize::new(0),
             offline_render_jobs: AtomicUsize::new(0),
+            graph_nodes: AtomicUsize::new(0),
             scheduled_sources: AtomicUsize::new(0),
             queued_events: AtomicUsize::new(0),
         }
@@ -76,6 +78,13 @@ impl AudioRuntimeState {
         self.try_reserve_resource(IsolateResourceKind::ScheduledSources, 1)
     }
 
+    pub(crate) fn try_reserve_graph_nodes(
+        self: &Arc<Self>,
+        amount: usize,
+    ) -> Result<IsolateReservation, JsErrorBox> {
+        self.try_reserve_resource(IsolateResourceKind::GraphNodes, amount)
+    }
+
     pub(crate) fn try_reserve_queued_event(
         self: &Arc<Self>,
     ) -> Result<IsolateReservation, JsErrorBox> {
@@ -95,6 +104,11 @@ impl AudioRuntimeState {
                 &self.offline_render_jobs,
                 self.limits.offline_render_jobs(),
                 "offline render job",
+            ),
+            IsolateResourceKind::GraphNodes => (
+                &self.graph_nodes,
+                self.limits.graph_nodes(),
+                "live graph node",
             ),
             IsolateResourceKind::ScheduledSources => (
                 &self.scheduled_sources,
@@ -180,6 +194,7 @@ impl AudioRuntimeState {
 enum IsolateResourceKind {
     DecodeJobs,
     OfflineRenderJobs,
+    GraphNodes,
     ScheduledSources,
     QueuedEvents,
 }
@@ -195,6 +210,7 @@ impl Drop for IsolateReservation {
         let counter = match self.resource {
             IsolateResourceKind::DecodeJobs => &self.runtime.decode_jobs,
             IsolateResourceKind::OfflineRenderJobs => &self.runtime.offline_render_jobs,
+            IsolateResourceKind::GraphNodes => &self.runtime.graph_nodes,
             IsolateResourceKind::ScheduledSources => &self.runtime.scheduled_sources,
             IsolateResourceKind::QueuedEvents => &self.runtime.queued_events,
         };

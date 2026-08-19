@@ -10,10 +10,13 @@ paths have passed the Phase 0B acceptance gate. The extension now contains
 private proof objects and ops for `CppGC`, `AudioBuffer`, owned asynchronous
 work, offline rendering, shared `AudioHost` accounting, online lifecycle
 ownership, render-death handling, scheduled-source reconciliation, and bounded
-off-thread decoding. A bounded fake process mixer additionally proves that two
-isolated hosted graphs and a native input can share one physical-output owner
-without coupling their clocks or retirement. It does not install Web Audio
-globals and is not ready for application use. These private seams exist to make
+off-thread decoding. Exact oscillator graph nodes are reserved against both
+isolate and shared-host ceilings before native construction and remain charged
+through physical source retirement. A bounded fake process mixer additionally
+proves that two isolated hosted graphs and a native input can share one
+physical-output owner without coupling their clocks or retirement. It does not
+install Web Audio globals and is not ready for application use. These private
+seams exist to make
 the eventual JavaScript surface reviewable rather than to provide an interim
 API.
 

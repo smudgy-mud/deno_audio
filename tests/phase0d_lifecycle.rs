@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use deno_audio::{AudioExtensionOptions, AudioHost, AudioHostLimits};
+use deno_audio::{AudioExtensionOptions, AudioHost, AudioHostLimits, AudioLimits};
 use deno_core::{JsRuntime, RuntimeOptions};
 use web_audio_api::output::{
     AudioOutputConfig, AudioOutputEndpointShutdown, AudioOutputError, AudioOutputErrorKind,
@@ -40,6 +40,14 @@ impl AudioOutputFactory for CountingSystemFactory {
 }
 
 fn runtime(host: Arc<AudioHost>, output: Arc<dyn AudioOutputFactory>) -> JsRuntime {
+    runtime_with_limits(host, output, AudioLimits::default())
+}
+
+fn runtime_with_limits(
+    host: Arc<AudioHost>,
+    output: Arc<dyn AudioOutputFactory>,
+    limits: AudioLimits,
+) -> JsRuntime {
     JsRuntime::new(RuntimeOptions {
         extensions: vec![
             deno_webidl::deno_webidl::init(),
@@ -49,7 +57,11 @@ fn runtime(host: Arc<AudioHost>, output: Arc<dyn AudioOutputFactory>) -> JsRunti
                 Default::default(),
                 deno_web::InMemoryBroadcastChannel::default(),
             ),
-            deno_audio::deno_audio::init(AudioExtensionOptions::new(host).output_factory(output)),
+            deno_audio::deno_audio::init(
+                AudioExtensionOptions::new(host)
+                    .limits(limits)
+                    .output_factory(output),
+            ),
         ],
         unsafe_expose_natives_and_gc: true,
         ..RuntimeOptions::default()
@@ -553,6 +565,7 @@ async fn saturated_scheduled_sources_dispatch_once_or_release_on_close() {
     let host = Arc::new(AudioHost::new(
         AudioHostLimits::default()
             .max_online_contexts(Some(1))
+            .max_graph_nodes(Some(SOURCE_COUNT * 3))
             .max_scheduled_sources(Some(SOURCE_COUNT))
             .max_queued_events(Some(256)),
     ));
@@ -607,6 +620,7 @@ async fn saturated_scheduled_sources_dispatch_once_or_release_on_close() {
         .await
         .expect("source construction and the slow-consumer interval should finish");
     assert_eq!(host.usage().scheduled_sources(), SOURCE_COUNT);
+    assert_eq!(host.usage().graph_nodes(), SOURCE_COUNT * 3);
     assert!(host.usage().queued_events() <= 256);
     runtime
         .execute_script(
@@ -658,11 +672,21 @@ async fn saturated_scheduled_sources_dispatch_once_or_release_on_close() {
         host.usage().scheduled_sources(),
         SOURCE_COUNT - DISPATCHED_BEFORE_CLOSE
     );
+    // Dropping reconciled wrappers requests exact node teardown; graph-node reservations remain
+    // charged until the renderer acknowledgement and lifetime cleanup complete off the isolate.
+    wait_until(|| host.usage().graph_nodes() == (SOURCE_COUNT - DISPATCHED_BEFORE_CLOSE) * 3);
+    assert_eq!(
+        host.usage().graph_nodes(),
+        (SOURCE_COUNT - DISPATCHED_BEFORE_CLOSE) * 3
+    );
 
     close(&mut runtime, "eventContext").await;
     wait_until(|| {
         let usage = host.usage();
-        usage.online_contexts() == 0 && usage.scheduled_sources() == 0 && usage.queued_events() == 0
+        usage.online_contexts() == 0
+            && usage.graph_nodes() == 0
+            && usage.scheduled_sources() == 0
+            && usage.queued_events() == 0
     });
     runtime
         .execute_script(
@@ -674,4 +698,102 @@ async fn saturated_scheduled_sources_dispatch_once_or_release_on_close() {
             "#,
         )
         .expect("confirmed close should release every undispatched source root");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shared_graph_node_budget_rejects_before_oscillator_construction_and_recovers() {
+    let host = Arc::new(AudioHost::new(
+        AudioHostLimits::default().max_graph_nodes(Some(3)),
+    ));
+    let mut first = runtime(Arc::clone(&host), Arc::new(SystemAudioOutput::new()));
+    construct(&mut first, "firstGraphContext");
+    first
+        .execute_script(
+            "phase0d_first_graph_nodes.js",
+            r"
+              globalThis.__firstGraphSource = new Deno.core.ops.NativePhase0Oscillator(
+                globalThis.firstGraphContext,
+              );
+            ",
+        )
+        .expect("the first exact oscillator should reserve three graph nodes");
+    assert_eq!(host.usage().graph_nodes(), 3);
+
+    let mut second = runtime(Arc::clone(&host), Arc::new(SystemAudioOutput::new()));
+    construct(&mut second, "secondGraphContext");
+    second
+        .execute_script(
+            "phase0d_graph_node_refusal.js",
+            r#"
+              let refused = false;
+              try {
+                new Deno.core.ops.NativePhase0Oscillator(globalThis.secondGraphContext);
+              } catch (error) {
+                refused = error instanceof RangeError;
+              }
+              if (!refused) throw new Error("shared graph-node exhaustion was not a RangeError");
+            "#,
+        )
+        .expect("shared graph-node exhaustion must reject at the native boundary");
+    assert_eq!(host.usage().graph_nodes(), 3);
+    assert_eq!(host.usage().scheduled_sources(), 1);
+    drop(second);
+
+    close(&mut first, "firstGraphContext").await;
+    wait_until(|| host.usage().graph_nodes() == 0);
+    let mut recovered = runtime(Arc::clone(&host), Arc::new(SystemAudioOutput::new()));
+    construct(&mut recovered, "recoveredGraphContext");
+    recovered
+        .execute_script(
+            "phase0d_graph_node_recovery.js",
+            r#"
+              globalThis.__secondGraphSource = new Deno.core.ops.NativePhase0Oscillator(
+                globalThis.recoveredGraphContext,
+              );
+              if (globalThis.__secondGraphSource.sourceId !== 1) {
+                throw new Error("a rejected construction consumed wrapper source identity");
+              }
+            "#,
+        )
+        .expect("confirmed retirement should restore the shared graph-node budget");
+    assert_eq!(host.usage().graph_nodes(), 3);
+
+    close(&mut recovered, "recoveredGraphContext").await;
+    wait_until(|| host.usage().graph_nodes() == 0 && host.usage().scheduled_sources() == 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn per_isolate_graph_node_budget_rejects_before_a_second_oscillator() {
+    let host = Arc::new(AudioHost::new(
+        AudioHostLimits::default().max_graph_nodes(Some(6)),
+    ));
+    let mut runtime = runtime_with_limits(
+        Arc::clone(&host),
+        Arc::new(SystemAudioOutput::new()),
+        AudioLimits::default().max_graph_nodes(Some(3)),
+    );
+    construct(&mut runtime, "isolateGraphContext");
+    runtime
+        .execute_script(
+            "phase0d_isolate_graph_nodes.js",
+            r#"
+              globalThis.__isolateGraphSource = new Deno.core.ops.NativePhase0Oscillator(
+                globalThis.isolateGraphContext,
+              );
+              let refused = false;
+              try {
+                new Deno.core.ops.NativePhase0Oscillator(globalThis.isolateGraphContext);
+              } catch (error) {
+                refused = error instanceof RangeError
+                  && String(error).includes("per-isolate live graph node limit");
+              }
+              if (!refused) throw new Error("per-isolate graph-node exhaustion was not typed");
+            "#,
+        )
+        .expect("the second exact oscillator must lose the isolate budget before mutation");
+    assert_eq!(host.usage().graph_nodes(), 3);
+    assert_eq!(host.usage().scheduled_sources(), 1);
+
+    close(&mut runtime, "isolateGraphContext").await;
+    wait_until(|| host.usage().graph_nodes() == 0 && host.usage().scheduled_sources() == 0);
 }

@@ -27,6 +27,7 @@ pub struct AudioLimits {
     max_offline_frames: Option<usize>,
     max_offline_samples: Option<usize>,
     max_offline_render_jobs: Option<usize>,
+    max_graph_nodes: Option<usize>,
     max_scheduled_sources: Option<usize>,
     max_queued_events: Option<usize>,
 }
@@ -46,6 +47,7 @@ impl Default for AudioLimits {
             max_offline_frames: Some(16 * 1024 * 1024),
             max_offline_samples: Some(16 * 1024 * 1024),
             max_offline_render_jobs: Some(2),
+            max_graph_nodes: Some(1024),
             max_scheduled_sources: Some(512),
             max_queued_events: Some(256),
         }
@@ -67,6 +69,7 @@ impl AudioLimits {
             max_offline_frames: None,
             max_offline_samples: None,
             max_offline_render_jobs: None,
+            max_graph_nodes: None,
             max_scheduled_sources: None,
             max_queued_events: None,
         }
@@ -142,6 +145,13 @@ impl AudioLimits {
         self
     }
 
+    /// Sets the maximum number of live wrapper-created graph nodes for this isolate.
+    #[must_use]
+    pub const fn max_graph_nodes(mut self, limit: Option<usize>) -> Self {
+        self.max_graph_nodes = limit;
+        self
+    }
+
     /// Sets the maximum number of scheduled sources rooted by this isolate.
     #[must_use]
     pub const fn max_scheduled_sources(mut self, limit: Option<usize>) -> Self {
@@ -194,6 +204,10 @@ impl AudioLimits {
 
     pub(crate) const fn offline_render_jobs(&self) -> Option<usize> {
         self.max_offline_render_jobs
+    }
+
+    pub(crate) const fn graph_nodes(&self) -> Option<usize> {
+        self.max_graph_nodes
     }
 
     pub(crate) const fn scheduled_sources(&self) -> Option<usize> {

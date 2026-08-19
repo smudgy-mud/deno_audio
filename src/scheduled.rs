@@ -8,7 +8,7 @@ use std::time::Duration;
 use deno_core::unsync::spawn_blocking;
 use deno_core::{op2, v8, GarbageCollected};
 use deno_error::JsErrorBox;
-use web_audio_api::context::BaseAudioContext as _;
+use web_audio_api::context::AudioNodeLifetimeReservation;
 use web_audio_api::node::{
     AudioScheduledSourceNode as _, AudioScheduledSourceNodeExt as _, OscillatorNode,
 };
@@ -21,11 +21,19 @@ use crate::online::{
 const EVENT_WAKE_CAPACITY: usize = 256;
 const MAX_DISPATCHES_PER_RECONCILE: usize = 128;
 const RECONCILE_INTERVAL: Duration = Duration::from_millis(25);
+// The reviewed exact oscillator transaction creates the oscillator plus its
+// frequency and detune AudioParams as three independently reclaimed graph nodes.
+const OSCILLATOR_GRAPH_NODE_COST: usize = 3;
 
 struct NativeEventWake {
     _source_id: u64,
     _isolate_reservation: IsolateReservation,
     _host_reservation: AudioHostReservation,
+}
+
+struct GraphNodeReservations {
+    _isolate: IsolateReservation,
+    _host: AudioHostReservation,
 }
 
 struct ScheduledSourcePayload {
@@ -119,18 +127,36 @@ impl ContextEventHub {
                     "AudioHost scheduled-source limit exceeded: {error}"
                 ))
             })?;
+        let isolate_graph_nodes = self
+            .runtime
+            .try_reserve_graph_nodes(OSCILLATOR_GRAPH_NODE_COST)?;
+        let host_graph_nodes = self
+            .runtime
+            .host()
+            .try_reserve(
+                AudioHostResourceKind::GraphNodes,
+                OSCILLATOR_GRAPH_NODE_COST,
+            )
+            .map_err(|error| {
+                JsErrorBox::range_error(format!("AudioHost graph-node limit exceeded: {error}"))
+            })?;
         let native_context = context.native_context()?;
-        let oscillator =
-            match panic::catch_unwind(AssertUnwindSafe(|| native_context.create_oscillator())) {
-                Ok(oscillator) => oscillator,
-                Err(payload) => {
-                    std::mem::forget(payload);
-                    context.lifecycle_state().poison();
-                    return Err(JsErrorBox::generic(
-                        "Oscillator construction panicked and poisoned its AudioContext",
-                    ));
-                }
-            };
+        let graph_lifetime = AudioNodeLifetimeReservation::new(GraphNodeReservations {
+            _isolate: isolate_graph_nodes,
+            _host: host_graph_nodes,
+        });
+        let oscillator = match panic::catch_unwind(AssertUnwindSafe(move || {
+            native_context.create_oscillator_with_lifetime_reservation(graph_lifetime)
+        })) {
+            Ok(oscillator) => oscillator,
+            Err(payload) => {
+                std::mem::forget(payload);
+                context.lifecycle_state().poison();
+                return Err(JsErrorBox::generic(
+                    "Oscillator construction panicked and poisoned its AudioContext",
+                ));
+            }
+        };
         let completion = oscillator.completion_token();
         let id = match self.next_source_id() {
             Ok(id) => id,
