@@ -3356,7 +3356,7 @@ dependencies = [
 [[package]]
 name = "web-audio-api"
 version = "1.7.0"
-source = "git+https://github.com/smudgy-mud/web-audio-api-rs?rev=c7244534cbc28992b0b2c8c88a3e647061b7a215#c7244534cbc28992b0b2c8c88a3e647061b7a215"
+source = "git+https://github.com/smudgy-mud/web-audio-api-rs?rev=dd2416065645751a5210181dfc33639b234734a7#dd2416065645751a5210181dfc33639b234734a7"
 dependencies = [
  "almost",
  "arc-swap",
