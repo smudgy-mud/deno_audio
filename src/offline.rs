@@ -175,7 +175,7 @@ mod tests {
                     Default::default(),
                     deno_web::InMemoryBroadcastChannel::default(),
                 ),
-                crate::deno_audio::init(),
+                crate::deno_audio::init(crate::AudioExtensionOptions::default()),
             ],
             ..RuntimeOptions::default()
         });

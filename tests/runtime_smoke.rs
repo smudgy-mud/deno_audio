@@ -11,7 +11,7 @@ fn private_extension_loads_after_web_platform_dependencies() {
                 Default::default(),
                 deno_web::InMemoryBroadcastChannel::default(),
             ),
-            deno_audio::deno_audio::init(),
+            deno_audio::deno_audio::init(deno_audio::AudioExtensionOptions::default()),
         ],
         ..Default::default()
     });

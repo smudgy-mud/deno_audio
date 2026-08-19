@@ -11,8 +11,17 @@
 
 mod binding;
 mod buffer;
+mod host;
 mod node;
 mod offline;
+mod online;
+mod options;
+mod scheduled;
+
+pub use host::{
+    AudioHost, AudioHostLimitError, AudioHostLimits, AudioHostResourceKind, AudioHostUsage,
+};
+pub use options::{AllowAllAudioPermissions, AudioExtensionOptions, AudioLimits, AudioPermissions};
 
 deno_core::extension!(
     deno_audio,
@@ -20,12 +29,35 @@ deno_core::extension!(
     ops = [
         offline::op_phase0_decode_off_thread,
         offline::op_phase0_render_off_thread,
+        online::op_phase0_online_suspend,
+        online::op_phase0_online_resume,
+        online::op_phase0_online_close,
+        scheduled::op_phase0_wait_ended,
     ],
-    objects = [binding::NativePhase0Probe, buffer::NativeAudioBuffer],
-    state = |state| {
+    objects = [
+        binding::NativePhase0Probe,
+        buffer::NativeAudioBuffer,
+        online::NativePhase0OnlineContext,
+        scheduled::NativePhase0Oscillator,
+    ],
+    options = {
+        options: AudioExtensionOptions,
+    },
+    state = |state, extension_options| {
+        let (host, permissions, limits, output) = extension_options.options.into_parts();
+        let native_audio_byte_limit = limits
+            .live_audio_bytes()
+            .unwrap_or(usize::MAX);
         state.put(std::sync::Arc::new(binding::NativeBindingMetrics::default()));
         state.put(std::sync::Arc::new(buffer::NativeAudioByteBudget::new(
-            buffer::DEFAULT_NATIVE_AUDIO_BYTE_LIMIT,
+            native_audio_byte_limit,
+            std::sync::Arc::clone(&host),
+        )));
+        state.put(std::sync::Arc::new(online::AudioRuntimeState::new(
+            host,
+            permissions,
+            limits,
+            output,
         )));
     },
 );

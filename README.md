@@ -8,9 +8,11 @@ the [Smudgy `web-audio-api-rs` fork](https://github.com/smudgy-mud/web-audio-api
 **Status: Phase 0 binding spike.** The native engine and both hosted-output
 paths have passed the Phase 0B acceptance gate. The extension now contains
 private proof objects and ops for `CppGC`, `AudioBuffer`, owned asynchronous
-work, and offline rendering, but it does not install Web Audio globals and is
-not ready for application use. These private seams exist to make the eventual
-JavaScript surface reviewable rather than to provide an interim API.
+work, offline rendering, shared `AudioHost` accounting, online lifecycle
+ownership, render-death handling, and scheduled-source reconciliation. It does
+not install Web Audio globals and is not ready for application use. These
+private seams exist to make the eventual JavaScript surface reviewable rather
+than to provide an interim API.
 
 The research baseline is deliberately locked to one compatibility set:
 
@@ -20,8 +22,9 @@ The research baseline is deliberately locked to one compatibility set:
 - `deno_error` 0.7.1
 - `serde_v8` 0.319.0
 - the Smudgy `web-audio-api` fork at commit
-  `2c2b260516a7557b5ee487bc89cc1dd08c048d35` (the reviewed hosted-output
-  compatibility stack based on 1.7.0)
+  `dd83ee6530136a71caff97da06269302f129cb09` (the reviewed hosted-output
+  compatibility stack plus the fixed scheduled-source saturation capacity,
+  based on 1.7.0)
 
 The Deno crates move as a coordinated tuple. Upgrade them together in one
 reviewed change, and keep `Cargo.lock` committed so Phase 0 evidence remains
@@ -56,6 +59,13 @@ The default feature selects CPAL. The dependency graph, hosted silent output,
 private Deno binding proofs, decode worker, and offline render/suspend path also
 pass without default features. This is build-path evidence, not a claim that a
 public JavaScript `OfflineAudioContext` exists yet.
+
+Each extension instance is initialized with `AudioExtensionOptions`. Sharing
+one `Arc<AudioHost>` across options makes the configured aggregate limits span
+isolates; output and permission services remain separate authorities. The
+private Phase 0D proof surface uses this same ownership shape, but is available
+only through unsafe native exposure in tests and is not a supported JavaScript
+API.
 
 The engine revision is currently available only in the maintainer's local fork
 history. A fresh external checkout cannot resolve the canonical Git dependency

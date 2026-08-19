@@ -7,19 +7,22 @@ use deno_core::{op2, v8, GarbageCollected, OpState};
 use deno_error::JsErrorBox;
 use web_audio_api::{AudioBuffer, AudioBufferOptions, MAX_CHANNELS};
 
-pub(crate) const DEFAULT_NATIVE_AUDIO_BYTE_LIMIT: usize = 64 * 1024 * 1024;
+use crate::host::{AudioHost, AudioHostReservation, AudioHostResourceKind};
+
 const BYTES_PER_SAMPLE: usize = size_of::<f32>();
 
 pub(crate) struct NativeAudioByteBudget {
     limit: usize,
     used: AtomicUsize,
+    host: Arc<AudioHost>,
 }
 
 impl NativeAudioByteBudget {
-    pub(crate) const fn new(limit: usize) -> Self {
+    pub(crate) fn new(limit: usize, host: Arc<AudioHost>) -> Self {
         Self {
             limit,
             used: AtomicUsize::new(0),
+            host,
         }
     }
 
@@ -35,9 +38,20 @@ impl NativeAudioByteBudget {
                 .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire)
             {
                 Ok(_) => {
-                    return Some(NativeAudioByteReservation {
+                    let local = LocalNativeAudioByteReservation {
                         budget: Arc::clone(self),
                         bytes,
+                    };
+                    let Ok(host) = self
+                        .host
+                        .try_reserve(AudioHostResourceKind::LiveAudioBytes, bytes)
+                    else {
+                        drop(local);
+                        return None;
+                    };
+                    return Some(NativeAudioByteReservation {
+                        _local: local,
+                        _host: host,
                     });
                 }
                 Err(observed) => used = observed,
@@ -50,16 +64,21 @@ impl NativeAudioByteBudget {
     }
 }
 
-struct NativeAudioByteReservation {
+struct LocalNativeAudioByteReservation {
     budget: Arc<NativeAudioByteBudget>,
     bytes: usize,
 }
 
-impl Drop for NativeAudioByteReservation {
+impl Drop for LocalNativeAudioByteReservation {
     fn drop(&mut self) {
         let previous = self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
         debug_assert!(previous >= self.bytes);
     }
+}
+
+struct NativeAudioByteReservation {
+    _local: LocalNativeAudioByteReservation,
+    _host: AudioHostReservation,
 }
 
 /// Storage handed to V8 for one exposed channel copy.
@@ -458,7 +477,7 @@ mod tests {
                     Default::default(),
                     deno_web::InMemoryBroadcastChannel::default(),
                 ),
-                crate::deno_audio::init(),
+                crate::deno_audio::init(crate::AudioExtensionOptions::default()),
             ],
             unsafe_expose_natives_and_gc: true,
             shared_array_buffer_store: Some(deno_core::SharedArrayBufferStore::default()),
@@ -467,7 +486,10 @@ mod tests {
         runtime
             .op_state()
             .borrow_mut()
-            .put(Arc::new(NativeAudioByteBudget::new(limit)));
+            .put(Arc::new(NativeAudioByteBudget::new(
+                limit,
+                Arc::new(crate::AudioHost::default()),
+            )));
         runtime
     }
 

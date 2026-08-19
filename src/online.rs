@@ -1,0 +1,654 @@
+use std::ffi::CStr;
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+
+use deno_core::futures::FutureExt as _;
+use deno_core::{op2, v8, GarbageCollected, OpState};
+use deno_error::JsErrorBox;
+use web_audio_api::context::{
+    AudioContext, AudioContextBuildError, AudioContextBuildErrorKind, AudioContextLifecycleError,
+    AudioContextOptions, AudioContextShutdownOutcome, AudioContextShutdownReceipt,
+    AudioContextState, AudioContextStateChangeOutcome, AudioContextStateChangeReceipt,
+};
+use web_audio_api::output::AudioOutputFactory;
+
+use crate::host::{AudioHost, AudioHostLimitError, AudioHostOnlineContextPermit};
+use crate::options::{AudioLimits, AudioPermissions};
+use crate::scheduled::ContextEventHub;
+
+pub(crate) struct AudioRuntimeState {
+    host: Arc<AudioHost>,
+    permissions: Arc<dyn AudioPermissions>,
+    limits: AudioLimits,
+    output: Arc<dyn AudioOutputFactory>,
+    online_contexts: AtomicUsize,
+    scheduled_sources: AtomicUsize,
+    queued_events: AtomicUsize,
+}
+
+impl AudioRuntimeState {
+    pub(crate) fn new(
+        host: Arc<AudioHost>,
+        permissions: Arc<dyn AudioPermissions>,
+        limits: AudioLimits,
+        output: Arc<dyn AudioOutputFactory>,
+    ) -> Self {
+        Self {
+            host,
+            permissions,
+            limits,
+            output,
+            online_contexts: AtomicUsize::new(0),
+            scheduled_sources: AtomicUsize::new(0),
+            queued_events: AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn host(&self) -> &Arc<AudioHost> {
+        &self.host
+    }
+
+    pub(crate) fn try_reserve_scheduled_source(
+        self: &Arc<Self>,
+    ) -> Result<IsolateReservation, JsErrorBox> {
+        self.try_reserve_resource(IsolateResourceKind::ScheduledSources, 1)
+    }
+
+    pub(crate) fn try_reserve_queued_event(
+        self: &Arc<Self>,
+    ) -> Result<IsolateReservation, JsErrorBox> {
+        self.try_reserve_resource(IsolateResourceKind::QueuedEvents, 1)
+    }
+
+    fn try_reserve_resource(
+        self: &Arc<Self>,
+        resource: IsolateResourceKind,
+        amount: usize,
+    ) -> Result<IsolateReservation, JsErrorBox> {
+        let (counter, limit, name) = match resource {
+            IsolateResourceKind::ScheduledSources => (
+                &self.scheduled_sources,
+                self.limits.scheduled_sources(),
+                "scheduled source",
+            ),
+            IsolateResourceKind::QueuedEvents => (
+                &self.queued_events,
+                self.limits.queued_events(),
+                "queued native event",
+            ),
+        };
+        let mut current = counter.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(amount) else {
+                return Err(JsErrorBox::range_error(format!(
+                    "per-isolate {name} count overflowed"
+                )));
+            };
+            if limit.is_some_and(|limit| next > limit) {
+                return Err(JsErrorBox::range_error(format!(
+                    "per-isolate {name} limit exceeded"
+                )));
+            }
+            match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    return Ok(IsolateReservation {
+                        runtime: Arc::clone(self),
+                        resource,
+                        amount,
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn try_reserve_online_context(
+        self: &Arc<Self>,
+    ) -> Result<IsolateOnlineContextPermit, JsErrorBox> {
+        let mut current = self.online_contexts.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(1) else {
+                return Err(JsErrorBox::range_error(
+                    "per-isolate online AudioContext count overflowed",
+                ));
+            };
+            if self
+                .limits
+                .online_contexts()
+                .is_some_and(|limit| next > limit)
+            {
+                return Err(JsErrorBox::range_error(
+                    "per-isolate online AudioContext limit exceeded",
+                ));
+            }
+            match self.online_contexts.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(IsolateOnlineContextPermit {
+                        runtime: Arc::clone(self),
+                        committed: false,
+                        release: true,
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn online_contexts(&self) -> usize {
+        self.online_contexts.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum IsolateResourceKind {
+    ScheduledSources,
+    QueuedEvents,
+}
+
+pub(crate) struct IsolateReservation {
+    runtime: Arc<AudioRuntimeState>,
+    resource: IsolateResourceKind,
+    amount: usize,
+}
+
+impl Drop for IsolateReservation {
+    fn drop(&mut self) {
+        let counter = match self.resource {
+            IsolateResourceKind::ScheduledSources => &self.runtime.scheduled_sources,
+            IsolateResourceKind::QueuedEvents => &self.runtime.queued_events,
+        };
+        let previous = counter.fetch_sub(self.amount, Ordering::AcqRel);
+        debug_assert!(previous >= self.amount);
+    }
+}
+
+struct IsolateOnlineContextPermit {
+    runtime: Arc<AudioRuntimeState>,
+    committed: bool,
+    release: bool,
+}
+
+impl IsolateOnlineContextPermit {
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+
+    fn release_confirmed(mut self) {
+        self.committed = false;
+        self.release = true;
+    }
+}
+
+impl Drop for IsolateOnlineContextPermit {
+    fn drop(&mut self) {
+        if self.committed {
+            self.release = false;
+        }
+        if self.release {
+            let previous = self.runtime.online_contexts.fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(previous > 0);
+        }
+    }
+}
+
+struct LifecycleObservation {
+    receipt: AudioContextShutdownReceipt,
+    host_permit: AudioHostOnlineContextPermit,
+    isolate_permit: IsolateOnlineContextPermit,
+    event_hub: Option<Arc<ContextEventHub>>,
+}
+
+fn lifecycle_observer(receiver: &mpsc::Receiver<LifecycleObservation>) {
+    let Ok(observation) = receiver.recv() else {
+        return;
+    };
+    let LifecycleObservation {
+        receipt,
+        host_permit,
+        isolate_permit,
+        event_hub,
+    } = observation;
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| receipt.wait()));
+    if let Some(event_hub) = event_hub {
+        event_hub.shutdown();
+    }
+    if matches!(outcome, Ok(AudioContextShutdownOutcome::Confirmed(_))) {
+        host_permit.release_confirmed();
+        isolate_permit.release_confirmed();
+    }
+    // Every other result intentionally drops committed permits without
+    // decrementing their counters. Unconfirmed output ownership must remain
+    // scarce until the accounting domain itself is discarded.
+}
+
+fn spawn_lifecycle_observer() -> Result<
+    (
+        mpsc::SyncSender<LifecycleObservation>,
+        thread::JoinHandle<()>,
+    ),
+    JsErrorBox,
+> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let join = thread::Builder::new()
+        .name("deno-audio-lifecycle-observer".to_owned())
+        .spawn(move || lifecycle_observer(&receiver))
+        .map_err(|error| {
+            JsErrorBox::generic(format!(
+                "failed to establish AudioContext lifecycle ownership: {error}"
+            ))
+        })?;
+    Ok((sender, join))
+}
+
+pub(crate) struct NativeOnlineContextState {
+    context: Mutex<Option<Arc<AudioContext>>>,
+    event_hub: Arc<ContextEventHub>,
+}
+
+impl NativeOnlineContextState {
+    fn context(&self) -> Result<Arc<AudioContext>, JsErrorBox> {
+        self.context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| JsErrorBox::generic("AudioContext is poisoned or retired"))
+    }
+
+    pub(crate) fn poison(&self) {
+        let context = self
+            .context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(context);
+    }
+}
+
+impl Drop for NativeOnlineContextState {
+    fn drop(&mut self) {
+        let context = self
+            .context
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(context);
+    }
+}
+
+/// Private online-context proof object. The later `WebIDL` facade will own this
+/// same lifecycle state rather than a raw upstream context.
+pub(crate) struct NativePhase0OnlineContext {
+    state: Arc<NativeOnlineContextState>,
+}
+
+impl NativePhase0OnlineContext {
+    pub(crate) fn native_context(&self) -> Result<Arc<AudioContext>, JsErrorBox> {
+        self.state.context()
+    }
+
+    pub(crate) fn event_hub(&self) -> Arc<ContextEventHub> {
+        Arc::clone(&self.state.event_hub)
+    }
+
+    pub(crate) fn lifecycle_state(&self) -> Arc<NativeOnlineContextState> {
+        Arc::clone(&self.state)
+    }
+}
+
+// SAFETY: this object contains no V8 or CppGC pointers. Its native context is
+// owned through Arc and its lifecycle observer owns all terminal accounting.
+unsafe impl GarbageCollected for NativePhase0OnlineContext {
+    fn trace(&self, _visitor: &mut v8::cppgc::Visitor) {}
+
+    fn get_name(&self) -> &'static CStr {
+        c"NativePhase0OnlineContext"
+    }
+}
+
+fn map_host_limit(error: &AudioHostLimitError) -> JsErrorBox {
+    JsErrorBox::range_error(format!("AudioHost limit rejected AudioContext: {error}"))
+}
+
+fn map_build_error(error: &AudioContextBuildError) -> JsErrorBox {
+    let prefix = match error.kind() {
+        AudioContextBuildErrorKind::InvalidConfiguration => "invalid audio output configuration",
+        AudioContextBuildErrorKind::OutputRejected => "audio output was rejected",
+        AudioContextBuildErrorKind::OutputPanicked => "audio output panicked",
+        AudioContextBuildErrorKind::BootstrapFailed => "audio graph bootstrap failed",
+        AudioContextBuildErrorKind::StartFailed => "audio output failed to start",
+        AudioContextBuildErrorKind::LifecycleUnavailable => "audio lifecycle is unavailable",
+        _ => "audio context construction failed",
+    };
+    JsErrorBox::generic(format!("{prefix}: {error}"))
+}
+
+fn abandon_committed(
+    mut host_permit: AudioHostOnlineContextPermit,
+    mut isolate_permit: IsolateOnlineContextPermit,
+) {
+    host_permit.commit();
+    isolate_permit.commit();
+    drop(host_permit);
+    drop(isolate_permit);
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the Web Audio f64 surface is range-checked before conversion to the engine's f32 rate"
+)]
+fn exact_context_options(sample_rate: f64) -> AudioContextOptions {
+    AudioContextOptions {
+        sample_rate: Some(sample_rate as f32),
+        sink_id: "none".to_owned(),
+        ..AudioContextOptions::default()
+    }
+}
+
+#[op2]
+impl NativePhase0OnlineContext {
+    #[constructor]
+    #[cppgc]
+    fn new(
+        state: &mut OpState,
+        sample_rate: f64,
+        initially_suspended: bool,
+    ) -> Result<NativePhase0OnlineContext, JsErrorBox> {
+        if !(3_000.0..=768_000.0).contains(&sample_rate) {
+            return Err(JsErrorBox::range_error(
+                "sampleRate must be in the inclusive range 3000..=768000",
+            ));
+        }
+        let runtime = Arc::clone(state.borrow::<Arc<AudioRuntimeState>>());
+        runtime.permissions.check_playback("AudioContext")?;
+        let isolate_permit = runtime.try_reserve_online_context()?;
+        let host_permit = runtime
+            .host
+            .try_reserve_online_context()
+            .map_err(|error| map_host_limit(&error))?;
+        let (observer_sender, observer_join) = spawn_lifecycle_observer()?;
+
+        let options = exact_context_options(sample_rate);
+        let build = panic::catch_unwind(AssertUnwindSafe(|| {
+            AudioContext::builder(Arc::clone(&runtime.output))
+                .options(options)
+                .number_of_channels(2)
+                .initially_suspended(initially_suspended)
+                .diagnostic_label("deno_audio online context")
+                .build()
+        }));
+
+        let context = match build {
+            Ok(Ok(context)) => context,
+            Ok(Err(error)) => {
+                if let Some(receipt) = error.cleanup_receipt() {
+                    let mut host_permit = host_permit;
+                    let mut isolate_permit = isolate_permit;
+                    host_permit.commit();
+                    isolate_permit.commit();
+                    if observer_sender
+                        .send(LifecycleObservation {
+                            receipt,
+                            host_permit,
+                            isolate_permit,
+                            event_hub: None,
+                        })
+                        .is_err()
+                    {
+                        // SendError drops its committed payload fail closed.
+                    }
+                    drop(observer_join);
+                } else {
+                    drop(observer_sender);
+                    let _ = observer_join.join();
+                }
+                return Err(map_build_error(&error));
+            }
+            Err(payload) => {
+                std::mem::forget(payload);
+                drop(observer_sender);
+                let _ = observer_join.join();
+                abandon_committed(host_permit, isolate_permit);
+                return Err(JsErrorBox::generic(
+                    "AudioContext construction panicked and was quarantined",
+                ));
+            }
+        };
+
+        // Successful build means a physical or logical endpoint may already
+        // exist. From this point onward, every unwind must retain accounting
+        // unless the observer later sees confirmed shutdown.
+        let mut host_permit = host_permit;
+        let mut isolate_permit = isolate_permit;
+        host_permit.commit();
+        isolate_permit.commit();
+
+        let Ok(receipt) = context.shutdown_receipt() else {
+            drop(observer_sender);
+            let _ = observer_join.join();
+            drop(context);
+            drop(host_permit);
+            drop(isolate_permit);
+            return Err(JsErrorBox::generic(
+                "hosted AudioContext did not expose a shutdown receipt",
+            ));
+        };
+        let event_hub = Arc::new(ContextEventHub::new(Arc::clone(&runtime)));
+        if observer_sender
+            .send(LifecycleObservation {
+                receipt,
+                host_permit,
+                isolate_permit,
+                event_hub: Some(Arc::clone(&event_hub)),
+            })
+            .is_err()
+        {
+            drop(context);
+            drop(observer_join);
+            return Err(JsErrorBox::generic(
+                "AudioContext lifecycle observer terminated before ownership transfer",
+            ));
+        }
+        drop(observer_join);
+
+        Ok(NativePhase0OnlineContext {
+            state: Arc::new(NativeOnlineContextState {
+                context: Mutex::new(Some(Arc::new(context))),
+                event_hub,
+            }),
+        })
+    }
+
+    #[getter]
+    fn sample_rate(&self) -> Result<f64, JsErrorBox> {
+        use web_audio_api::context::BaseAudioContext as _;
+        Ok(f64::from(self.state.context()?.sample_rate()))
+    }
+
+    #[getter]
+    fn current_time(&self) -> Result<f64, JsErrorBox> {
+        use web_audio_api::context::BaseAudioContext as _;
+        Ok(self.state.context()?.current_time())
+    }
+
+    #[getter]
+    #[smi]
+    fn context_state(&self) -> Result<u32, JsErrorBox> {
+        use web_audio_api::context::BaseAudioContext as _;
+        match self.state.context()?.state() {
+            AudioContextState::Suspended => Ok(0),
+            AudioContextState::Running => Ok(1),
+            AudioContextState::Closed => Ok(2),
+        }
+    }
+
+    #[getter]
+    #[smi]
+    fn rooted_source_count(&self) -> u32 {
+        u32::try_from(self.state.event_hub.rooted_source_count())
+            .expect("bounded scheduled-source count fits u32")
+    }
+}
+
+fn request_state_change(
+    state: &Arc<NativeOnlineContextState>,
+    suspend: bool,
+) -> Result<AudioContextStateChangeReceipt, JsErrorBox> {
+    let context = state.context()?;
+    let request = panic::catch_unwind(AssertUnwindSafe(|| {
+        if suspend {
+            context.request_suspend()
+        } else {
+            context.request_resume()
+        }
+    }));
+    match request {
+        Ok(Ok(receipt)) => Ok(receipt),
+        Ok(Err(error)) => Err(map_lifecycle_error(error)),
+        Err(payload) => {
+            std::mem::forget(payload);
+            state.poison();
+            Err(JsErrorBox::generic(
+                "AudioContext state transition panicked and poisoned the context",
+            ))
+        }
+    }
+}
+
+fn map_lifecycle_error(error: AudioContextLifecycleError) -> JsErrorBox {
+    JsErrorBox::generic(format!("AudioContext lifecycle request failed: {error:?}"))
+}
+
+async fn observe_state_change(
+    state: Arc<NativeOnlineContextState>,
+    receipt: AudioContextStateChangeReceipt,
+) -> Result<u32, JsErrorBox> {
+    match AssertUnwindSafe(receipt).catch_unwind().await {
+        Ok(AudioContextStateChangeOutcome::Applied) => Ok(0),
+        Ok(AudioContextStateChangeOutcome::Unchanged) => Ok(1),
+        Ok(AudioContextStateChangeOutcome::SupersededByShutdown) => Ok(2),
+        Ok(AudioContextStateChangeOutcome::Closed) => {
+            Err(JsErrorBox::generic("AudioContext is closed"))
+        }
+        Ok(AudioContextStateChangeOutcome::TransportFailed) => {
+            state.poison();
+            Err(JsErrorBox::generic("AudioContext control transport failed"))
+        }
+        Ok(AudioContextStateChangeOutcome::EventDeliveryFailed) => Ok(4),
+        Ok(AudioContextStateChangeOutcome::EndpointUncertain) => {
+            state.poison();
+            Err(JsErrorBox::generic(
+                "AudioContext output endpoint became uncertain",
+            ))
+        }
+        Ok(AudioContextStateChangeOutcome::WorkerFailed) => {
+            state.poison();
+            Err(JsErrorBox::generic("AudioContext lifecycle worker failed"))
+        }
+        Ok(_) => {
+            state.poison();
+            Err(JsErrorBox::generic(
+                "AudioContext returned an unknown state transition outcome",
+            ))
+        }
+        Err(payload) => {
+            std::mem::forget(payload);
+            state.poison();
+            Err(JsErrorBox::generic(
+                "AudioContext state acknowledgement panicked and poisoned the context",
+            ))
+        }
+    }
+}
+
+#[op2]
+#[smi]
+pub(crate) async fn op_phase0_online_suspend(
+    #[cppgc] context: &NativePhase0OnlineContext,
+) -> Result<u32, JsErrorBox> {
+    let state = Arc::clone(&context.state);
+    let receipt = request_state_change(&state, true)?;
+    observe_state_change(state, receipt).await
+}
+
+#[op2]
+#[smi]
+pub(crate) async fn op_phase0_online_resume(
+    #[cppgc] context: &NativePhase0OnlineContext,
+) -> Result<u32, JsErrorBox> {
+    let state = Arc::clone(&context.state);
+    let receipt = request_state_change(&state, false)?;
+    observe_state_change(state, receipt).await
+}
+
+#[op2]
+pub(crate) async fn op_phase0_online_close(
+    #[cppgc] context: &NativePhase0OnlineContext,
+) -> Result<bool, JsErrorBox> {
+    let state = Arc::clone(&context.state);
+    let native = state.context()?;
+    let request = panic::catch_unwind(AssertUnwindSafe(|| native.request_close()));
+    let receipt = match request {
+        Ok(Ok(receipt)) => receipt,
+        Ok(Err(error)) => return Err(map_lifecycle_error(error)),
+        Err(payload) => {
+            std::mem::forget(payload);
+            state.poison();
+            return Err(JsErrorBox::generic(
+                "AudioContext close panicked and poisoned the context",
+            ));
+        }
+    };
+    drop(native);
+    match AssertUnwindSafe(receipt).catch_unwind().await {
+        Ok(AudioContextShutdownOutcome::Confirmed(_)) => Ok(true),
+        Ok(AudioContextShutdownOutcome::Unconfirmed { .. }) => Err(JsErrorBox::generic(
+            "AudioContext shutdown could not be confirmed",
+        )),
+        Ok(AudioContextShutdownOutcome::ControllerTerminated) => Err(JsErrorBox::generic(
+            "AudioContext lifecycle controller terminated",
+        )),
+        Ok(_) => Err(JsErrorBox::generic(
+            "AudioContext returned an unknown shutdown outcome",
+        )),
+        Err(payload) => {
+            std::mem::forget(payload);
+            state.poison();
+            Err(JsErrorBox::generic(
+                "AudioContext shutdown acknowledgement panicked",
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn isolate_permit_rolls_back_then_retains_after_commit() {
+        let runtime = Arc::new(AudioRuntimeState::new(
+            Arc::new(AudioHost::default()),
+            Arc::new(crate::AllowAllAudioPermissions),
+            AudioLimits::default().max_online_contexts(Some(1)),
+            Arc::new(web_audio_api::output::SystemAudioOutput::new()),
+        ));
+        drop(runtime.try_reserve_online_context().unwrap());
+        assert_eq!(runtime.online_contexts(), 0);
+
+        let mut permit = runtime.try_reserve_online_context().unwrap();
+        permit.commit();
+        drop(permit);
+        assert_eq!(runtime.online_contexts(), 1);
+        assert!(runtime.try_reserve_online_context().is_err());
+    }
+}
