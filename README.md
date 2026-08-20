@@ -19,6 +19,17 @@ embedder-supplied `AudioOutputFactory`. Online parameter automation, additional
 node families, and full browser conformance remain later Phase 2/3 slices, so
 this is not yet a complete Web Audio API.
 
+Same-context `suspend()` and `resume()` calls enter one FIFO coordinator before
+native admission. An accepted transition remains owned after its JavaScript
+promise is discarded; later callers observe that receipt before submitting
+their own transition. Transient native contention or capacity refusal retains
+no native command credit and sleeps until an explicit state, terminal, or Close
+wake rather than spinning the isolate. Close is outside the waiter queue and
+dominates active retry. The per-context waiter ceiling defaults to 64, is
+configured for contexts in an isolate through
+`AudioLimits::max_lifecycle_waiters`, and rejects overflow before native
+mutation with `QuotaExceededError`.
+
 The public `AudioBuffer` implements Web IDL conversion, nominal-range and brand
 checks, standard prototype descriptors, `getChannelData()`,
 `copyFromChannel()`, and `copyToChannel()`. Canonical PCM remains Rust-owned.

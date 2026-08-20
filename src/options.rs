@@ -55,6 +55,7 @@ pub struct AudioLimits {
     max_automation_events: Option<usize>,
     max_queued_control_commands: Option<usize>,
     max_queued_events: Option<usize>,
+    max_lifecycle_waiters: Option<usize>,
 }
 
 impl Default for AudioLimits {
@@ -83,6 +84,7 @@ impl Default for AudioLimits {
             max_automation_events: Some(4096),
             max_queued_control_commands: Some(256),
             max_queued_events: Some(256),
+            max_lifecycle_waiters: Some(64),
         }
     }
 }
@@ -110,6 +112,7 @@ impl AudioLimits {
             max_automation_events: None,
             max_queued_control_commands: None,
             max_queued_events: None,
+            max_lifecycle_waiters: None,
         }
     }
 
@@ -240,6 +243,19 @@ impl AudioLimits {
         self
     }
 
+    /// Sets the maximum number of JavaScript lifecycle requests waiting for admission or native
+    /// acknowledgement on each online context owned by this isolate. Accepted native work remains
+    /// cancellation-independent.
+    ///
+    /// The default is 64. `Some(0)` disables JavaScript Suspend/Resume requests, while `None`
+    /// removes this wrapper ceiling. Exceeding a finite limit rejects before native mutation and
+    /// becomes `QuotaExceededError` at the public JavaScript boundary.
+    #[must_use]
+    pub const fn max_lifecycle_waiters(mut self, limit: Option<usize>) -> Self {
+        self.max_lifecycle_waiters = limit;
+        self
+    }
+
     pub(crate) const fn online_contexts(&self) -> Option<usize> {
         self.max_online_contexts
     }
@@ -310,6 +326,10 @@ impl AudioLimits {
 
     pub(crate) const fn queued_events(&self) -> Option<usize> {
         self.max_queued_events
+    }
+
+    pub(crate) const fn lifecycle_waiters(&self) -> Option<usize> {
+        self.max_lifecycle_waiters
     }
 }
 

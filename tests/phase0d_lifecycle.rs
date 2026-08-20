@@ -1,7 +1,9 @@
 //! Phase 0D acceptance evidence for shared context permits and shutdown ownership.
 
+use std::future::poll_fn;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use deno_audio::{AudioExtensionOptions, AudioHost, AudioHostLimits, AudioLimits};
@@ -25,6 +27,119 @@ struct CommandObservingFactory {
     observed_commands: Arc<AtomicUsize>,
     host: Arc<AudioHost>,
     system: SystemAudioOutput,
+}
+
+struct BlockingLifecycleFactory {
+    entered: mpsc::SyncSender<()>,
+    release: Mutex<Option<mpsc::Receiver<()>>>,
+    system: SystemAudioOutput,
+}
+
+struct BlockingLifecyclePrepared {
+    inner: Box<dyn PreparedAudioOutput>,
+    entered: mpsc::SyncSender<()>,
+    release: mpsc::Receiver<()>,
+}
+
+struct BlockingLifecycleRunning {
+    inner: Box<dyn RunningAudioOutput>,
+    entered: mpsc::SyncSender<()>,
+    release: mpsc::Receiver<()>,
+    suspend_blocked: bool,
+}
+
+impl BlockingLifecycleFactory {
+    fn new() -> (Self, mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+        let (entered_send, entered_recv) = mpsc::sync_channel(1);
+        let (release_send, release_recv) = mpsc::sync_channel(1);
+        (
+            Self {
+                entered: entered_send,
+                release: Mutex::new(Some(release_recv)),
+                system: SystemAudioOutput::new(),
+            },
+            entered_recv,
+            release_send,
+        )
+    }
+}
+
+impl AudioOutputFactory for BlockingLifecycleFactory {
+    fn prepare(
+        &self,
+        request: &AudioOutputRequest,
+    ) -> Result<Box<dyn PreparedAudioOutput>, AudioOutputError> {
+        let inner = self.system.prepare(request)?;
+        let release = self
+            .release
+            .lock()
+            .expect("blocking lifecycle factory lock poisoned")
+            .take()
+            .ok_or_else(|| {
+                AudioOutputError::new(
+                    AudioOutputErrorKind::BackendSpecific,
+                    "blocking lifecycle factory is single-use",
+                )
+            })?;
+        Ok(Box::new(BlockingLifecyclePrepared {
+            inner,
+            entered: self.entered.clone(),
+            release,
+        }))
+    }
+}
+
+impl PreparedAudioOutput for BlockingLifecyclePrepared {
+    fn config(&self) -> &AudioOutputConfig {
+        self.inner.config()
+    }
+
+    fn start(
+        self: Box<Self>,
+        callback: AudioRenderCallback,
+        events: AudioOutputEventSink,
+    ) -> Result<Box<dyn RunningAudioOutput>, AudioOutputStartFailure> {
+        let inner = self.inner.start(callback, events)?;
+        Ok(Box::new(BlockingLifecycleRunning {
+            inner,
+            entered: self.entered,
+            release: self.release,
+            suspend_blocked: false,
+        }))
+    }
+
+    fn abort(self: Box<Self>) -> AudioOutputEndpointShutdown {
+        self.inner.abort()
+    }
+}
+
+impl RunningAudioOutput for BlockingLifecycleRunning {
+    fn resume(&mut self) -> Result<(), AudioOutputError> {
+        self.inner.resume()
+    }
+
+    fn suspend(&mut self) -> Result<(), AudioOutputError> {
+        if !self.suspend_blocked {
+            self.suspend_blocked = true;
+            self.entered.send(()).map_err(|_| {
+                AudioOutputError::new(
+                    AudioOutputErrorKind::BackendSpecific,
+                    "lifecycle retry test observer disconnected",
+                )
+            })?;
+            self.release.recv().map_err(|_| {
+                AudioOutputError::new(
+                    AudioOutputErrorKind::BackendSpecific,
+                    "lifecycle retry test release disconnected",
+                )
+            })?;
+        }
+        self.inner.suspend()
+    }
+
+    fn shutdown(self: Box<Self>) -> AudioOutputEndpointShutdown {
+        self.inner.shutdown()
+    }
 }
 
 impl AudioOutputFactory for CommandObservingFactory {
@@ -180,6 +295,66 @@ async fn close(runtime: &mut JsRuntime, global_name: &str) {
             "if (globalThis.__phase0dClosed !== true) throw new Error('close did not settle');",
         )
         .expect("the close result should be observable");
+}
+
+fn evaluate_boolean(runtime: &mut JsRuntime, name: &'static str, expression: &str) -> bool {
+    match runtime.execute_script(
+        name,
+        format!(r#"if (!({expression})) throw new Error("__phase0d_waiting__");"#),
+    ) {
+        Ok(_) => true,
+        Err(error) if error.to_string().contains("__phase0d_waiting__") => false,
+        Err(error) => panic!("lifecycle readiness expression failed: {error}"),
+    }
+}
+
+async fn poll_pending_event_loop_once(runtime: &mut JsRuntime) {
+    let poll = poll_fn(|cx| {
+        Poll::Ready(runtime.poll_event_loop(cx, deno_core::PollEventLoopOptions::default()))
+    })
+    .await;
+    match poll {
+        Poll::Pending => {}
+        Poll::Ready(Ok(())) => panic!("event loop settled while lifecycle work was blocked"),
+        Poll::Ready(Err(error)) => {
+            panic!("event loop failed while lifecycle work was blocked: {error}")
+        }
+    }
+}
+
+async fn drive_until_suspend_blocks(runtime: &mut JsRuntime, entered: &mpsc::Receiver<()>) {
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    loop {
+        poll_pending_event_loop_once(runtime).await;
+        match entered.try_recv() {
+            Ok(()) => return,
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                panic!("blocking lifecycle endpoint retired before suspend")
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the native suspend boundary"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn drive_until_javascript_flag(
+    runtime: &mut JsRuntime,
+    name: &'static str,
+    expression: &str,
+) {
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    while !evaluate_boolean(runtime, name, expression) {
+        poll_pending_event_loop_once(runtime).await;
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for JavaScript lifecycle observation"
+        );
+        tokio::task::yield_now().await;
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -806,6 +981,261 @@ async fn accepted_state_and_close_commands_outlive_javascript_waiters() {
             "#,
         )
         .expect("confirmed close should remain observable through the native object");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one end-to-end test keeps refusal, unchanged state, capacity recovery, and retirement in one ownership timeline"
+)]
+async fn lifecycle_waiter_limit_rejects_before_native_mutation_and_recovers() {
+    let host = Arc::new(AudioHost::default());
+    let (factory, entered, release) = BlockingLifecycleFactory::new();
+    let limits = AudioLimits::default().max_lifecycle_waiters(Some(1));
+    let mut runtime = runtime_with_limits(Arc::clone(&host), Arc::new(factory), limits);
+    runtime
+        .execute_script(
+            "phase0d_lifecycle_limit_start.js",
+            r#"
+              globalThis.__lifecycleLimitContext = new AudioContext({
+                sampleRate: 48000,
+                sinkId: "none",
+              });
+              globalThis.__lifecycleLimitFirstDone = false;
+              globalThis.__lifecycleLimitFirstError = undefined;
+              __lifecycleLimitContext.suspend().then(
+                () => { __lifecycleLimitFirstDone = true; },
+                (error) => { __lifecycleLimitFirstError = error; },
+              );
+            "#,
+        )
+        .expect("the first lifecycle request should start");
+    drive_until_suspend_blocks(&mut runtime, &entered).await;
+
+    runtime
+        .execute_script(
+            "phase0d_lifecycle_limit_reject.js",
+            r#"
+              globalThis.__lifecycleLimitRejected = false;
+              globalThis.__lifecycleLimitError = undefined;
+              __lifecycleLimitContext.resume().then(
+                () => { __lifecycleLimitError = "fulfilled"; },
+                (error) => {
+                  __lifecycleLimitError = error?.name;
+                  __lifecycleLimitRejected = true;
+                },
+              );
+            "#,
+        )
+        .expect("the over-limit lifecycle request should be scheduled");
+    drive_until_javascript_flag(
+        &mut runtime,
+        "phase0d_lifecycle_limit_pending.js",
+        "globalThis.__lifecycleLimitRejected === true",
+    )
+    .await;
+    runtime
+        .execute_script(
+            "phase0d_lifecycle_limit_pending_result.js",
+            r#"
+              if (__lifecycleLimitError !== "QuotaExceededError") {
+                throw new Error(`unexpected lifecycle limit error ${__lifecycleLimitError}`);
+              }
+              if (__lifecycleLimitFirstDone || __lifecycleLimitFirstError !== undefined) {
+                throw new Error("the blocked accepted request settled prematurely");
+              }
+            "#,
+        )
+        .expect("waiter refusal should settle without disturbing accepted work");
+
+    release
+        .send(())
+        .expect("the blocked endpoint should still own its release receiver");
+    runtime
+        .run_event_loop(deno_core::PollEventLoopOptions::default())
+        .await
+        .expect("the accepted suspend should finish after release");
+    runtime
+        .execute_script(
+            "phase0d_lifecycle_limit_recovery.js",
+            r#"
+              if (!__lifecycleLimitFirstDone || __lifecycleLimitFirstError !== undefined) {
+                throw new Error("the accepted suspend did not finish cleanly");
+              }
+              if (__lifecycleLimitContext.state !== "suspended") {
+                throw new Error("the refused resume mutated native lifecycle state");
+              }
+              globalThis.__lifecycleLimitRecovered = false;
+              __lifecycleLimitContext.resume()
+                .then(() => {
+                  if (__lifecycleLimitContext.state !== "running") {
+                    throw new Error("waiter capacity did not recover after acknowledgement");
+                  }
+                  return __lifecycleLimitContext.close();
+                })
+                .then(() => { __lifecycleLimitRecovered = true; });
+            "#,
+        )
+        .expect("released waiter capacity should admit another lifecycle request");
+    runtime
+        .run_event_loop(deno_core::PollEventLoopOptions::default())
+        .await
+        .expect("recovered resume and close should settle");
+    runtime
+        .execute_script(
+            "phase0d_lifecycle_limit_recovery_result.js",
+            r#"
+              if (!__lifecycleLimitRecovered || __lifecycleLimitContext.state !== "closed") {
+                throw new Error("lifecycle waiter capacity did not recover cleanly");
+              }
+            "#,
+        )
+        .expect("waiter recovery should remain observable");
+    wait_until(|| host.usage().online_contexts() == 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn lifecycle_requests_are_fifo_after_discarded_waiter() {
+    let host = Arc::new(AudioHost::default());
+    let (factory, entered, release) = BlockingLifecycleFactory::new();
+    let limits = AudioLimits::default().max_lifecycle_waiters(Some(4));
+    let mut runtime = runtime_with_limits(Arc::clone(&host), Arc::new(factory), limits);
+    runtime
+        .execute_script(
+            "phase0d_lifecycle_fifo_start.js",
+            r#"
+              globalThis.__lifecycleFifoContext = new AudioContext({
+                sampleRate: 48000,
+                sinkId: "none",
+              });
+              globalThis.__lifecycleFifoStates = [];
+              __lifecycleFifoContext.onstatechange = () => {
+                __lifecycleFifoStates.push(__lifecycleFifoContext.state);
+              };
+              __lifecycleFifoContext.suspend();
+              globalThis.__lifecycleFifoDone = false;
+              globalThis.__lifecycleFifoBeforeClose = undefined;
+              __lifecycleFifoContext.resume()
+                .then(() => {
+                  __lifecycleFifoBeforeClose = __lifecycleFifoContext.state;
+                  return __lifecycleFifoContext.close();
+                })
+                .then(() => { __lifecycleFifoDone = true; });
+            "#,
+        )
+        .expect("discarded suspend and queued resume should start");
+    drive_until_suspend_blocks(&mut runtime, &entered).await;
+    release
+        .send(())
+        .expect("the blocked endpoint should still own its release receiver");
+    runtime
+        .run_event_loop(deno_core::PollEventLoopOptions::default())
+        .await
+        .expect("FIFO lifecycle requests should settle");
+    runtime
+        .execute_script(
+            "phase0d_lifecycle_fifo_result.js",
+            r#"
+              if (!__lifecycleFifoDone || __lifecycleFifoBeforeClose !== "running") {
+                throw new Error("queued resume did not follow the discarded suspend waiter");
+              }
+              if (__lifecycleFifoStates[0] !== "suspended" ||
+                  __lifecycleFifoStates[1] !== "running" ||
+                  __lifecycleFifoContext.state !== "closed") {
+                throw new Error(`unexpected lifecycle order ${__lifecycleFifoStates}`);
+              }
+            "#,
+        )
+        .expect("accepted state work should remain FIFO after JavaScript cancellation");
+    wait_until(|| host.usage().online_contexts() == 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn close_dominates_a_blocked_and_queued_lifecycle_request() {
+    let host = Arc::new(AudioHost::default());
+    let (factory, entered, release) = BlockingLifecycleFactory::new();
+    let limits = AudioLimits::default().max_lifecycle_waiters(Some(4));
+    let mut runtime = runtime_with_limits(Arc::clone(&host), Arc::new(factory), limits);
+    runtime
+        .execute_script(
+            "phase0d_lifecycle_close_start.js",
+            r#"
+              globalThis.__lifecycleCloseContext = new AudioContext({
+                sampleRate: 48000,
+                sinkId: "none",
+              });
+              globalThis.__lifecycleCloseFirst = __lifecycleCloseContext.suspend();
+            "#,
+        )
+        .expect("the blocking suspend should start");
+    drive_until_suspend_blocks(&mut runtime, &entered).await;
+
+    runtime
+        .execute_script(
+            "phase0d_lifecycle_close_dominance.js",
+            r#"
+              globalThis.__lifecycleCloseDone = false;
+              globalThis.__lifecycleCloseResumeSettled = false;
+              globalThis.__lifecycleCloseResumeError = undefined;
+              const closing = __lifecycleCloseContext.close().then(() => {
+                __lifecycleCloseDone = true;
+              });
+              const queued = __lifecycleCloseContext.resume().then(
+                () => {
+                  __lifecycleCloseResumeError = "fulfilled";
+                  __lifecycleCloseResumeSettled = true;
+                },
+                (error) => {
+                  __lifecycleCloseResumeError = error?.name;
+                  __lifecycleCloseResumeSettled = true;
+                },
+              );
+              globalThis.__lifecycleCloseAll = Promise.allSettled([
+                __lifecycleCloseFirst,
+                queued,
+                closing,
+              ]);
+            "#,
+        )
+        .expect("Close and the later state request should be scheduled");
+    drive_until_javascript_flag(
+        &mut runtime,
+        "phase0d_lifecycle_close_pending.js",
+        "globalThis.__lifecycleCloseResumeSettled === true",
+    )
+    .await;
+    runtime
+        .execute_script(
+            "phase0d_lifecycle_close_pending_result.js",
+            r#"
+              if (__lifecycleCloseResumeError !== "InvalidStateError") {
+                throw new Error(`Close did not reject queued Resume: ${__lifecycleCloseResumeError}`);
+              }
+              if (__lifecycleCloseDone) {
+                throw new Error("Close completed before the active endpoint transition released");
+              }
+            "#,
+        )
+        .expect("Close should dominate without falsely completing retirement");
+
+    release
+        .send(())
+        .expect("the blocked endpoint should still own its release receiver");
+    runtime
+        .run_event_loop(deno_core::PollEventLoopOptions::default())
+        .await
+        .expect("Close should finish after the active transition releases");
+    runtime
+        .execute_script(
+            "phase0d_lifecycle_close_result.js",
+            r#"
+              if (!__lifecycleCloseDone || __lifecycleCloseContext.state !== "closed") {
+                throw new Error("Close did not complete authoritative retirement");
+              }
+            "#,
+        )
+        .expect("Close dominance should remain observable");
+    wait_until(|| host.usage().online_contexts() == 0);
 }
 
 #[allow(

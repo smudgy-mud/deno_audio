@@ -1,12 +1,13 @@
 use std::ffi::CStr;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::thread;
 
 use deno_core::futures::FutureExt as _;
 use deno_core::{op2, v8, GarbageCollected, OpState};
 use deno_error::JsErrorBox;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 use web_audio_api::context::{
     AudioContext, AudioContextBuildError, AudioContextBuildErrorKind, AudioContextLatencyCategory,
     AudioContextLifecycleError, AudioContextOptions, AudioContextShutdownOutcome,
@@ -335,6 +336,7 @@ struct LifecycleObservation {
     host_permit: AudioHostOnlineContextPermit,
     isolate_permit: IsolateOnlineContextPermit,
     event_hub: Option<Arc<ContextEventHub>>,
+    lifecycle_requests: Option<Weak<LifecycleRequestCoordinator>>,
 }
 
 fn lifecycle_observer(receiver: &mpsc::Receiver<LifecycleObservation>) {
@@ -346,8 +348,12 @@ fn lifecycle_observer(receiver: &mpsc::Receiver<LifecycleObservation>) {
         host_permit,
         isolate_permit,
         event_hub,
+        lifecycle_requests,
     } = observation;
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| receipt.wait()));
+    if let Some(coordinator) = lifecycle_requests.and_then(|weak| weak.upgrade()) {
+        coordinator.begin_close();
+    }
     if let Some(event_hub) = event_hub {
         event_hub.shutdown();
     }
@@ -379,9 +385,81 @@ fn spawn_lifecycle_observer() -> Result<
     Ok((sender, join))
 }
 
+#[derive(Default)]
+struct LifecycleRequestQueue {
+    pending: Option<AudioContextStateChangeReceipt>,
+}
+
+struct LifecycleRequestCoordinator {
+    serial: AsyncMutex<LifecycleRequestQueue>,
+    waiters: AtomicUsize,
+    waiter_limit: Option<usize>,
+    closing: AtomicBool,
+    retry: Notify,
+}
+
+impl LifecycleRequestCoordinator {
+    fn new(waiter_limit: Option<usize>) -> Arc<Self> {
+        Arc::new(Self {
+            serial: AsyncMutex::new(LifecycleRequestQueue::default()),
+            waiters: AtomicUsize::new(0),
+            waiter_limit,
+            closing: AtomicBool::new(false),
+            retry: Notify::new(),
+        })
+    }
+
+    fn try_waiter(self: &Arc<Self>) -> Result<LifecycleWaiterPermit, JsErrorBox> {
+        self.waiters
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                let next = count.checked_add(1)?;
+                self.waiter_limit
+                    .is_none_or(|limit| next <= limit)
+                    .then_some(next)
+            })
+            .map_err(|_| {
+                JsErrorBox::range_error(
+                    "AudioContext lifecycle waiter limit exceeded before native admission",
+                )
+            })?;
+        Ok(LifecycleWaiterPermit {
+            coordinator: Arc::clone(self),
+        })
+    }
+
+    fn begin_close(&self) {
+        self.closing.store(true, Ordering::Release);
+        self.wake_retry();
+    }
+
+    fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+    }
+
+    fn wake_retry(&self) {
+        self.retry.notify_one();
+    }
+
+    async fn wait_to_retry(&self) {
+        self.retry.notified().await;
+    }
+}
+
+struct LifecycleWaiterPermit {
+    coordinator: Arc<LifecycleRequestCoordinator>,
+}
+
+impl Drop for LifecycleWaiterPermit {
+    fn drop(&mut self) {
+        let previous = self.coordinator.waiters.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "lifecycle waiter count underflow");
+    }
+}
+
 pub(crate) struct NativeOnlineContextState {
     context: Mutex<Option<Arc<AudioContext>>>,
     event_hub: Arc<ContextEventHub>,
+    lifecycle_requests: Arc<LifecycleRequestCoordinator>,
 }
 
 impl NativeOnlineContextState {
@@ -399,6 +477,7 @@ impl NativeOnlineContextState {
     }
 
     pub(crate) fn poison(&self) {
+        self.lifecycle_requests.begin_close();
         let context = self
             .context
             .lock()
@@ -410,6 +489,7 @@ impl NativeOnlineContextState {
 
 impl Drop for NativeOnlineContextState {
     fn drop(&mut self) {
+        self.lifecycle_requests.begin_close();
         let context = self
             .context
             .get_mut()
@@ -584,13 +664,18 @@ fn oscillator_type(value: u32) -> Result<OscillatorType, JsErrorBox> {
 fn install_state_wake_handler(
     context: &AudioContext,
     event_hub: &Arc<ContextEventHub>,
+    lifecycle_requests: &Arc<LifecycleRequestCoordinator>,
 ) -> Result<(), JsErrorBox> {
     let weak_hub = Arc::downgrade(event_hub);
+    let weak_lifecycle_requests = Arc::downgrade(lifecycle_requests);
     panic::catch_unwind(AssertUnwindSafe(|| {
         use web_audio_api::context::BaseAudioContext as _;
         context.set_onstatechange(move |_| {
             if let Some(hub) = weak_hub.upgrade() {
                 hub.enqueue_state_wake();
+            }
+            if let Some(coordinator) = weak_lifecycle_requests.upgrade() {
+                coordinator.wake_retry();
             }
         });
     }))
@@ -605,6 +690,67 @@ fn runtime_resources(state: &OpState) -> (Arc<AudioRuntimeState>, Arc<NativeAudi
         Arc::clone(state.borrow::<Arc<AudioRuntimeState>>()),
         Arc::clone(state.borrow::<Arc<NativeAudioByteBudget>>()),
     )
+}
+
+fn publish_online_context(
+    context: AudioContext,
+    runtime: &Arc<AudioRuntimeState>,
+    byte_budget: Arc<NativeAudioByteBudget>,
+    observer: (
+        mpsc::SyncSender<LifecycleObservation>,
+        thread::JoinHandle<()>,
+    ),
+    permits: (AudioHostOnlineContextPermit, IsolateOnlineContextPermit),
+) -> Result<NativePhase0OnlineContext, JsErrorBox> {
+    // Successful build means a physical or logical endpoint may already exist. From this point
+    // onward, every unwind must retain accounting unless the observer sees confirmed shutdown.
+    let (observer_sender, observer_join) = observer;
+    let (mut host_permit, mut isolate_permit) = permits;
+    host_permit.commit();
+    isolate_permit.commit();
+
+    let Ok(receipt) = context.shutdown_receipt() else {
+        drop(observer_sender);
+        let _ = observer_join.join();
+        drop(context);
+        drop(host_permit);
+        drop(isolate_permit);
+        return Err(JsErrorBox::generic(
+            "hosted AudioContext did not expose a shutdown receipt",
+        ));
+    };
+    let event_hub = Arc::new(ContextEventHub::new(Arc::clone(runtime)));
+    let lifecycle_requests = LifecycleRequestCoordinator::new(runtime.limits().lifecycle_waiters());
+    if observer_sender
+        .send(LifecycleObservation {
+            receipt,
+            host_permit,
+            isolate_permit,
+            event_hub: Some(Arc::clone(&event_hub)),
+            lifecycle_requests: Some(Arc::downgrade(&lifecycle_requests)),
+        })
+        .is_err()
+    {
+        drop(context);
+        drop(observer_join);
+        return Err(JsErrorBox::generic(
+            "AudioContext lifecycle observer terminated before ownership transfer",
+        ));
+    }
+    drop(observer_join);
+
+    if let Err(error) = install_state_wake_handler(&context, &event_hub, &lifecycle_requests) {
+        drop(context);
+        return Err(error);
+    }
+
+    let state = Arc::new(NativeOnlineContextState {
+        context: Mutex::new(Some(Arc::new(context))),
+        event_hub,
+        lifecycle_requests,
+    });
+    let graph = OnlineGraph::new(Arc::clone(&state), Arc::clone(runtime), byte_budget);
+    Ok(NativePhase0OnlineContext { state, graph })
 }
 
 #[op2]
@@ -659,6 +805,7 @@ impl NativePhase0OnlineContext {
                             host_permit,
                             isolate_permit,
                             event_hub: None,
+                            lifecycle_requests: None,
                         })
                         .is_err()
                     {
@@ -682,53 +829,13 @@ impl NativePhase0OnlineContext {
             }
         };
 
-        // Successful build means a physical or logical endpoint may already
-        // exist. From this point onward, every unwind must retain accounting
-        // unless the observer later sees confirmed shutdown.
-        let mut host_permit = host_permit;
-        let mut isolate_permit = isolate_permit;
-        host_permit.commit();
-        isolate_permit.commit();
-
-        let Ok(receipt) = context.shutdown_receipt() else {
-            drop(observer_sender);
-            let _ = observer_join.join();
-            drop(context);
-            drop(host_permit);
-            drop(isolate_permit);
-            return Err(JsErrorBox::generic(
-                "hosted AudioContext did not expose a shutdown receipt",
-            ));
-        };
-        let event_hub = Arc::new(ContextEventHub::new(Arc::clone(&runtime)));
-        if observer_sender
-            .send(LifecycleObservation {
-                receipt,
-                host_permit,
-                isolate_permit,
-                event_hub: Some(Arc::clone(&event_hub)),
-            })
-            .is_err()
-        {
-            drop(context);
-            drop(observer_join);
-            return Err(JsErrorBox::generic(
-                "AudioContext lifecycle observer terminated before ownership transfer",
-            ));
-        }
-        drop(observer_join);
-
-        if let Err(error) = install_state_wake_handler(&context, &event_hub) {
-            drop(context);
-            return Err(error);
-        }
-
-        let state = Arc::new(NativeOnlineContextState {
-            context: Mutex::new(Some(Arc::new(context))),
-            event_hub,
-        });
-        let graph = OnlineGraph::new(Arc::clone(&state), Arc::clone(&runtime), byte_budget);
-        Ok(NativePhase0OnlineContext { state, graph })
+        publish_online_context(
+            context,
+            &runtime,
+            byte_budget,
+            (observer_sender, observer_join),
+            (host_permit, isolate_permit),
+        )
     }
 
     #[getter]
@@ -878,10 +985,10 @@ impl NativePhase0OnlineContext {
     }
 }
 
-fn request_state_change(
+fn try_request_state_change(
     state: &Arc<NativeOnlineContextState>,
     suspend: bool,
-) -> Result<AudioContextStateChangeReceipt, JsErrorBox> {
+) -> Result<Result<AudioContextStateChangeReceipt, AudioContextLifecycleError>, JsErrorBox> {
     let context = state.context()?;
     let request = panic::catch_unwind(AssertUnwindSafe(|| {
         if suspend {
@@ -891,8 +998,7 @@ fn request_state_change(
         }
     }));
     match request {
-        Ok(Ok(receipt)) => Ok(receipt),
-        Ok(Err(error)) => Err(map_lifecycle_error(error)),
+        Ok(result) => Ok(result),
         Err(payload) => {
             std::mem::forget(payload);
             state.poison();
@@ -903,8 +1009,36 @@ fn request_state_change(
     }
 }
 
+fn lifecycle_closed_error() -> JsErrorBox {
+    JsErrorBox::generic("InvalidStateError: AudioContext shutdown has started")
+}
+
 fn map_lifecycle_error(error: AudioContextLifecycleError) -> JsErrorBox {
     JsErrorBox::generic(format!("AudioContext lifecycle request failed: {error:?}"))
+}
+
+async fn retry_lifecycle_request<T>(
+    coordinator: &LifecycleRequestCoordinator,
+    mut request: impl FnMut() -> Result<Result<T, AudioContextLifecycleError>, JsErrorBox>,
+) -> Result<T, JsErrorBox> {
+    loop {
+        if coordinator.is_closing() {
+            return Err(lifecycle_closed_error());
+        }
+        match request()? {
+            Ok(value) => return Ok(value),
+            Err(AudioContextLifecycleError::Contended | AudioContextLifecycleError::Capacity) => {
+                if coordinator.is_closing() {
+                    return Err(lifecycle_closed_error());
+                }
+                // These immediate native failures retain no command credits. The sole Deno
+                // leader sleeps until a state transition, terminal observation, or Close emits
+                // an explicit wake; queued Deno callers remain parked on the FIFO mutex.
+                coordinator.wait_to_retry().await;
+            }
+            Err(error) => return Err(map_lifecycle_error(error)),
+        }
+    }
 }
 
 async fn observe_state_change(
@@ -949,14 +1083,44 @@ async fn observe_state_change(
     }
 }
 
+async fn request_and_observe_state_change(
+    state: Arc<NativeOnlineContextState>,
+    suspend: bool,
+) -> Result<u32, JsErrorBox> {
+    let coordinator = Arc::clone(&state.lifecycle_requests);
+    if coordinator.is_closing() {
+        return Err(lifecycle_closed_error());
+    }
+    let _waiter = coordinator.try_waiter()?;
+    let receipt = {
+        let mut queue = coordinator.serial.lock().await;
+        loop {
+            if coordinator.is_closing() {
+                return Err(lifecycle_closed_error());
+            }
+            if let Some(pending) = queue.pending.clone() {
+                let observation = observe_state_change(Arc::clone(&state), pending).await;
+                queue.pending = None;
+                observation?;
+                continue;
+            }
+            let receipt =
+                retry_lifecycle_request(&coordinator, || try_request_state_change(&state, suspend))
+                    .await?;
+            queue.pending = Some(receipt.clone());
+            break receipt;
+        }
+    };
+    observe_state_change(state, receipt).await
+}
+
 #[op2]
 #[smi]
 pub(crate) async fn op_phase0_online_suspend(
     #[cppgc] context: &NativePhase0OnlineContext,
 ) -> Result<u32, JsErrorBox> {
     let state = Arc::clone(&context.state);
-    let receipt = request_state_change(&state, true)?;
-    observe_state_change(state, receipt).await
+    request_and_observe_state_change(state, true).await
 }
 
 #[op2]
@@ -965,8 +1129,7 @@ pub(crate) async fn op_phase0_online_resume(
     #[cppgc] context: &NativePhase0OnlineContext,
 ) -> Result<u32, JsErrorBox> {
     let state = Arc::clone(&context.state);
-    let receipt = request_state_change(&state, false)?;
-    observe_state_change(state, receipt).await
+    request_and_observe_state_change(state, false).await
 }
 
 #[op2]
@@ -974,6 +1137,7 @@ pub(crate) async fn op_phase0_online_close(
     #[cppgc] context: &NativePhase0OnlineContext,
 ) -> Result<bool, JsErrorBox> {
     let state = Arc::clone(&context.state);
+    state.lifecycle_requests.begin_close();
     let native = state.context()?;
     let request = panic::catch_unwind(AssertUnwindSafe(|| native.request_close()));
     let receipt = match request {
@@ -1013,6 +1177,16 @@ pub(crate) async fn op_phase0_online_close(
 mod tests {
     use super::*;
 
+    async fn wait_for_attempts(attempts: &AtomicUsize, expected: usize) {
+        for _ in 0..64 {
+            if attempts.load(Ordering::Acquire) == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("lifecycle retry loop did not reach attempt {expected}");
+    }
+
     #[test]
     fn isolate_permit_rolls_back_then_retains_after_commit() {
         let runtime = Arc::new(AudioRuntimeState::new(
@@ -1030,5 +1204,56 @@ mod tests {
         drop(permit);
         assert_eq!(runtime.online_contexts(), 1);
         assert!(runtime.try_reserve_online_context().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transient_lifecycle_failures_require_explicit_wakes() {
+        let coordinator = LifecycleRequestCoordinator::new(Some(4));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let request_attempts = Arc::clone(&attempts);
+        let request = retry_lifecycle_request(&coordinator, move || {
+            let attempt = request_attempts.fetch_add(1, Ordering::AcqRel);
+            Ok(match attempt {
+                0 => Err(AudioContextLifecycleError::Contended),
+                1 => Err(AudioContextLifecycleError::Capacity),
+                _ => Ok(7_u8),
+            })
+        });
+        let drive = async {
+            wait_for_attempts(&attempts, 1).await;
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(attempts.load(Ordering::Acquire), 1, "retry loop spun");
+            coordinator.wake_retry();
+
+            wait_for_attempts(&attempts, 2).await;
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(attempts.load(Ordering::Acquire), 2, "retry loop spun");
+            coordinator.wake_retry();
+        };
+        let (result, ()) = tokio::join!(request, drive);
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(attempts.load(Ordering::Acquire), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_wakes_and_dominates_transient_lifecycle_retry() {
+        let coordinator = LifecycleRequestCoordinator::new(Some(4));
+        let attempts = AtomicUsize::new(0);
+        let request = retry_lifecycle_request(&coordinator, || {
+            attempts.fetch_add(1, Ordering::AcqRel);
+            Ok::<_, JsErrorBox>(Err::<(), _>(AudioContextLifecycleError::Contended))
+        });
+        let close = async {
+            wait_for_attempts(&attempts, 1).await;
+            coordinator.begin_close();
+        };
+        let (result, ()) = tokio::join!(request, close);
+        let error = result.expect_err("Close must reject a transient retry");
+        assert!(error.to_string().contains("InvalidStateError"));
+        assert_eq!(attempts.load(Ordering::Acquire), 1);
     }
 }

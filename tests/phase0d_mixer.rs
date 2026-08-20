@@ -9,8 +9,8 @@ use deno_audio::{AudioExtensionOptions, AudioHost};
 use deno_core::futures::channel::oneshot;
 use deno_core::{JsRuntime, RuntimeOptions};
 use web_audio_api::context::{
-    AudioContext, AudioContextOptions, AudioContextShutdownOutcome, AudioContextState,
-    AudioContextStateChangeOutcome, BaseAudioContext,
+    AudioContext, AudioContextLifecycleError, AudioContextOptions, AudioContextShutdownOutcome,
+    AudioContextState, AudioContextStateChangeOutcome, BaseAudioContext,
 };
 use web_audio_api::node::{AudioNode, AudioScheduledSourceNode};
 use web_audio_api::output::{
@@ -574,12 +574,28 @@ fn drive_state_change(
     target: AudioContextState,
     suspend: bool,
 ) {
-    let receipt = if suspend {
-        context.request_suspend()
-    } else {
-        context.request_resume()
+    let mut receipt = None;
+    for _ in 0..64 {
+        let request = if suspend {
+            context.request_suspend()
+        } else {
+            context.request_resume()
+        };
+        match request {
+            Ok(accepted) => {
+                receipt = Some(accepted);
+                break;
+            }
+            Err(AudioContextLifecycleError::Contended | AudioContextLifecycleError::Capacity) => {
+                // Immediate refusal owns no command credit. This direct native consumer may retry
+                // after advancing the fake endpoint; the async Deno surface uses an explicit wake.
+                let _ = mixer.render(FRAMES);
+                thread::yield_now();
+            }
+            Err(error) => panic!("state transition failed before admission: {error:?}"),
+        }
     }
-    .expect("state transition should be admitted");
+    let receipt = receipt.expect("state transition should be admitted within 64 quanta");
     for _ in 0..64 {
         if context.state() == target {
             break;
