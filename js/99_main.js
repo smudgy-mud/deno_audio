@@ -5,6 +5,7 @@ import { AudioBuffer } from "ext:deno_audio/01_audio_buffer.js";
 import {
   AudioBufferSourceNode,
   AudioContext,
+  ConstantSourceNode,
   AudioDestinationNode,
   AudioNode,
   AudioParam,
@@ -14,11 +15,13 @@ import {
   OfflineAudioCompletionEvent,
   OfflineAudioContext,
   OscillatorNode,
+  PeriodicWave,
 } from "ext:deno_audio/02_offline_audio.js";
 
 installGlobal("AudioBuffer", AudioBuffer);
 installGlobal("AudioBufferSourceNode", AudioBufferSourceNode);
 installGlobal("AudioContext", AudioContext);
+installGlobal("ConstantSourceNode", ConstantSourceNode);
 installGlobal("AudioDestinationNode", AudioDestinationNode);
 installGlobal("AudioNode", AudioNode);
 installGlobal("AudioParam", AudioParam);
@@ -28,3 +31,4 @@ installGlobal("GainNode", GainNode);
 installGlobal("OfflineAudioCompletionEvent", OfflineAudioCompletionEvent);
 installGlobal("OfflineAudioContext", OfflineAudioContext);
 installGlobal("OscillatorNode", OscillatorNode);
+installGlobal("PeriodicWave", PeriodicWave);

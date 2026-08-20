@@ -47,6 +47,7 @@ deno_core::extension!(
         offline::NativePhase0OfflineRenderRequest,
         offline::NativeOfflineAudioContext,
         node::NativeAudioNode,
+        node::NativePeriodicWave,
         online::NativePhase0OnlineContext,
         scheduled::NativePhase0Oscillator,
     ],

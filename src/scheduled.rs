@@ -12,10 +12,11 @@ use deno_error::JsErrorBox;
 use web_audio_api::context::{AudioControlBatchReservation, AudioNodeLifetimeReservation};
 use web_audio_api::node::{
     AudioBufferSourceNode, AudioNode, AudioScheduledSourceNode as _,
-    AudioScheduledSourceNodeExt as _, OscillatorNode, OscillatorType,
+    AudioScheduledSourceNodeExt as _, ConstantSourceNode, ConstantSourceOptions, OscillatorNode,
+    OscillatorOptions, OscillatorType,
 };
-use web_audio_api::AudioBuffer;
 use web_audio_api::AudioParam;
+use web_audio_api::{AudioBuffer, PeriodicWave};
 
 use crate::host::{AudioHostReservation, AudioHostResourceKind};
 use crate::online::{
@@ -34,6 +35,8 @@ const OSCILLATOR_CONSTRUCTION_COMMAND_COST: usize = 7;
 const OSCILLATOR_SCHEDULE_COMMAND_COST: usize = 2;
 const BUFFER_SOURCE_GRAPH_NODE_COST: usize = 3;
 const BUFFER_SOURCE_CONSTRUCTION_COMMAND_COST: usize = 7;
+const CONSTANT_SOURCE_GRAPH_NODE_COST: usize = 2;
+const CONSTANT_SOURCE_CONSTRUCTION_COMMAND_COST: usize = 4;
 
 struct NativeEventWake {
     _source_id: u32,
@@ -49,6 +52,7 @@ struct GraphNodeReservations {
 enum ScheduledSourcePayload {
     Oscillator(OscillatorNode),
     BufferSource(AudioBufferSourceNode),
+    ConstantSource(ConstantSourceNode),
 }
 
 struct ScheduledSourceReservations {
@@ -86,6 +90,7 @@ impl ScheduledSourceRoot {
         match payload {
             ScheduledSourcePayload::Oscillator(source) => operation(source),
             ScheduledSourcePayload::BufferSource(source) => operation(source),
+            ScheduledSourcePayload::ConstantSource(source) => operation(source),
         }
     }
 
@@ -105,34 +110,12 @@ impl ScheduledSourceRoot {
         self.with_buffer_source(|source| source.detune().clone())
     }
 
+    pub(crate) fn offset(&self) -> AudioParam {
+        self.with_constant_source(|source| source.offset().clone())
+    }
+
     pub(crate) fn type_(&self) -> OscillatorType {
         self.with_oscillator(OscillatorNode::type_)
-    }
-
-    pub(crate) fn set_frequency(
-        &self,
-        value: f32,
-        reservation: AudioControlBatchReservation,
-        context: &NativeOnlineContextState,
-    ) -> Result<(), JsErrorBox> {
-        self.mutate_oscillator(context, move |oscillator| {
-            oscillator
-                .frequency()
-                .set_value_with_control_reservation(value, reservation);
-        })
-    }
-
-    pub(crate) fn set_detune(
-        &self,
-        value: f32,
-        reservation: AudioControlBatchReservation,
-        context: &NativeOnlineContextState,
-    ) -> Result<(), JsErrorBox> {
-        self.mutate_oscillator(context, move |oscillator| {
-            oscillator
-                .detune()
-                .set_value_with_control_reservation(value, reservation);
-        })
     }
 
     pub(crate) fn set_type(
@@ -143,6 +126,17 @@ impl ScheduledSourceRoot {
     ) -> Result<(), JsErrorBox> {
         self.mutate_oscillator(context, move |oscillator| {
             oscillator.set_type_with_control_reservation(value, reservation);
+        })
+    }
+
+    pub(crate) fn set_periodic_wave(
+        &self,
+        wave: PeriodicWave,
+        reservation: AudioControlBatchReservation,
+        context: &NativeOnlineContextState,
+    ) -> Result<(), JsErrorBox> {
+        self.mutate_oscillator(context, move |oscillator| {
+            oscillator.set_periodic_wave_with_control_reservation(wave, reservation);
         })
     }
 
@@ -205,6 +199,32 @@ impl ScheduledSourceRoot {
         })
     }
 
+    pub(crate) fn start_constant_source(
+        self: &Arc<Self>,
+        when: f64,
+        reservation: AudioControlBatchReservation,
+        context: &NativeOnlineContextState,
+    ) -> Result<(), JsErrorBox> {
+        if self.scheduled.load(Ordering::Acquire) {
+            return Err(JsErrorBox::generic(
+                "InvalidStateError: ConstantSourceNode has already been started",
+            ));
+        }
+        self.ensure_rooted(context)?;
+        if self
+            .scheduled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(JsErrorBox::generic(
+                "InvalidStateError: ConstantSourceNode has already been started",
+            ));
+        }
+        self.mutate_constant_source(context, move |source| {
+            source.start_at_with_control_reservation(when, reservation);
+        })
+    }
+
     fn ensure_rooted(
         self: &Arc<Self>,
         context: &NativeOnlineContextState,
@@ -261,6 +281,9 @@ impl ScheduledSourceRoot {
             ScheduledSourcePayload::BufferSource(source) => {
                 source.stop_at_with_control_reservation(when, reservation);
             }
+            ScheduledSourcePayload::ConstantSource(source) => {
+                source.stop_at_with_control_reservation(when, reservation);
+            }
         })
     }
 
@@ -274,7 +297,7 @@ impl ScheduledSourceRoot {
             .expect("a live scheduled-source root retains its native source");
         match payload {
             ScheduledSourcePayload::Oscillator(oscillator) => operation(oscillator),
-            ScheduledSourcePayload::BufferSource(_) => {
+            ScheduledSourcePayload::BufferSource(_) | ScheduledSourcePayload::ConstantSource(_) => {
                 panic!("scheduled-source kind mismatch: expected OscillatorNode")
             }
         }
@@ -290,8 +313,24 @@ impl ScheduledSourceRoot {
             .expect("a live scheduled-source root retains its native source");
         match payload {
             ScheduledSourcePayload::BufferSource(source) => operation(source),
-            ScheduledSourcePayload::Oscillator(_) => {
+            ScheduledSourcePayload::Oscillator(_) | ScheduledSourcePayload::ConstantSource(_) => {
                 panic!("scheduled-source kind mismatch: expected AudioBufferSourceNode")
+            }
+        }
+    }
+
+    fn with_constant_source<T>(&self, operation: impl FnOnce(&ConstantSourceNode) -> T) -> T {
+        let payload = self
+            .payload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let payload = payload
+            .as_ref()
+            .expect("a live scheduled-source root retains its native source");
+        match payload {
+            ScheduledSourcePayload::ConstantSource(source) => operation(source),
+            ScheduledSourcePayload::Oscillator(_) | ScheduledSourcePayload::BufferSource(_) => {
+                panic!("scheduled-source kind mismatch: expected ConstantSourceNode")
             }
         }
     }
@@ -330,7 +369,7 @@ impl ScheduledSourceRoot {
     ) -> Result<(), JsErrorBox> {
         self.mutate_payload(context, move |payload| match payload {
             ScheduledSourcePayload::Oscillator(source) => operation(source),
-            ScheduledSourcePayload::BufferSource(_) => {
+            ScheduledSourcePayload::BufferSource(_) | ScheduledSourcePayload::ConstantSource(_) => {
                 panic!("scheduled-source kind mismatch: expected OscillatorNode")
             }
         })
@@ -343,8 +382,21 @@ impl ScheduledSourceRoot {
     ) -> Result<(), JsErrorBox> {
         self.mutate_payload(context, move |payload| match payload {
             ScheduledSourcePayload::BufferSource(source) => operation(source),
-            ScheduledSourcePayload::Oscillator(_) => {
+            ScheduledSourcePayload::Oscillator(_) | ScheduledSourcePayload::ConstantSource(_) => {
                 panic!("scheduled-source kind mismatch: expected AudioBufferSourceNode")
+            }
+        })
+    }
+
+    fn mutate_constant_source(
+        &self,
+        context: &NativeOnlineContextState,
+        operation: impl FnOnce(&mut ConstantSourceNode),
+    ) -> Result<(), JsErrorBox> {
+        self.mutate_payload(context, move |payload| match payload {
+            ScheduledSourcePayload::ConstantSource(source) => operation(source),
+            ScheduledSourcePayload::Oscillator(_) | ScheduledSourcePayload::BufferSource(_) => {
+                panic!("scheduled-source kind mismatch: expected ConstantSourceNode")
             }
         })
     }
@@ -541,6 +593,7 @@ impl ContextEventHub {
         self: &Arc<Self>,
         context: &Arc<NativeOnlineContextState>,
         root_immediately: bool,
+        options: OscillatorOptions,
     ) -> Result<Arc<ScheduledSourceRoot>, JsErrorBox> {
         if self.closed.load(Ordering::Acquire) {
             return Err(JsErrorBox::generic("AudioContext event hub is closed"));
@@ -571,8 +624,11 @@ impl ContextEventHub {
         });
         let construction_commands = AudioControlBatchReservation::new(construction_commands);
         let oscillator = match panic::catch_unwind(AssertUnwindSafe(move || {
-            native_context
-                .create_oscillator_with_reservations(graph_lifetime, construction_commands)
+            native_context.create_oscillator_with_options_and_reservations(
+                options,
+                graph_lifetime,
+                construction_commands,
+            )
         })) {
             Ok(oscillator) => oscillator,
             Err(payload) => {
@@ -610,6 +666,113 @@ impl ContextEventHub {
             completion,
             hub: Arc::downgrade(self),
             payload: Mutex::new(Some(ScheduledSourcePayload::Oscillator(oscillator))),
+            reservations: Mutex::new(reservations),
+            rooted: AtomicBool::new(root_immediately),
+            scheduled: AtomicBool::new(false),
+        });
+
+        if !root_immediately {
+            return Ok(root);
+        }
+
+        let mut roots = self
+            .roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.closed.load(Ordering::Acquire) {
+            drop(roots);
+            root.retire();
+            return Err(JsErrorBox::generic("AudioContext event hub is closed"));
+        }
+        if roots.insert(id, Arc::clone(&root)).is_some() {
+            drop(roots);
+            root.retire();
+            self.shutdown();
+            context.poison();
+            return Err(JsErrorBox::generic(
+                "duplicate scheduled-source identity poisoned the event hub",
+            ));
+        }
+        Ok(root)
+    }
+
+    pub(crate) fn register_constant_source(
+        self: &Arc<Self>,
+        context: &Arc<NativeOnlineContextState>,
+        root_immediately: bool,
+        options: ConstantSourceOptions,
+    ) -> Result<Arc<ScheduledSourceRoot>, JsErrorBox> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(JsErrorBox::generic("AudioContext event hub is closed"));
+        }
+        let reservations = root_immediately
+            .then(|| self.reserve_scheduled_source())
+            .transpose()?;
+        let isolate_graph_nodes = self
+            .runtime
+            .try_reserve_graph_nodes(CONSTANT_SOURCE_GRAPH_NODE_COST)?;
+        let host_graph_nodes = self
+            .runtime
+            .host()
+            .try_reserve(
+                AudioHostResourceKind::GraphNodes,
+                CONSTANT_SOURCE_GRAPH_NODE_COST,
+            )
+            .map_err(|error| {
+                JsErrorBox::range_error(format!("AudioHost graph-node limit exceeded: {error}"))
+            })?;
+        let construction_commands = self
+            .runtime
+            .try_reserve_control_commands(CONSTANT_SOURCE_CONSTRUCTION_COMMAND_COST)?;
+        let native_context = context.context()?;
+        let graph_lifetime = AudioNodeLifetimeReservation::new(GraphNodeReservations {
+            _isolate: isolate_graph_nodes,
+            _host: host_graph_nodes,
+        });
+        let construction_commands = AudioControlBatchReservation::new(construction_commands);
+        let source = match panic::catch_unwind(AssertUnwindSafe(move || {
+            native_context.create_constant_source_with_options_and_reservations(
+                options,
+                graph_lifetime,
+                construction_commands,
+            )
+        })) {
+            Ok(source) => source,
+            Err(payload) => {
+                std::mem::forget(payload);
+                context.poison();
+                return Err(JsErrorBox::generic(
+                    "ConstantSource construction panicked and poisoned its AudioContext",
+                ));
+            }
+        };
+        let completion = source.completion_token();
+        let id = match self.next_source_id() {
+            Ok(id) => id,
+            Err(error) => {
+                context.poison();
+                return Err(error);
+            }
+        };
+        let weak_hub = Arc::downgrade(self);
+        if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| {
+            source.set_onended(move |_| {
+                if let Some(hub) = Weak::upgrade(&weak_hub) {
+                    hub.enqueue_wake(id);
+                }
+            });
+        })) {
+            std::mem::forget(payload);
+            context.poison();
+            return Err(JsErrorBox::generic(
+                "ended-handler installation panicked and poisoned its AudioContext",
+            ));
+        }
+        let root = Arc::new(ScheduledSourceRoot {
+            id,
+            completion,
+            hub: Arc::downgrade(self),
+            payload: Mutex::new(Some(ScheduledSourcePayload::ConstantSource(source))),
             reservations: Mutex::new(reservations),
             rooted: AtomicBool::new(root_immediately),
             scheduled: AtomicBool::new(false),
@@ -922,7 +1085,7 @@ impl NativePhase0Oscillator {
         let hub = context.event_hub();
         let lifecycle = context.lifecycle_state();
         Ok(NativePhase0Oscillator {
-            root: hub.register_oscillator(&lifecycle, true)?,
+            root: hub.register_oscillator(&lifecycle, true, OscillatorOptions::default())?,
             context: lifecycle,
             runtime: Arc::clone(&hub.runtime),
         })

@@ -13,7 +13,7 @@ For a local run, create a sparse checkout and point the runner at it:
 
 ```console
 git clone --filter=blob:none --no-checkout https://github.com/web-platform-tests/wpt target/wpt
-git -C target/wpt sparse-checkout set resources webaudio/resources webaudio/the-audio-api/the-audiobuffer-interface webaudio/the-audio-api/the-audionode-interface webaudio/the-audio-api/the-gainnode-interface webaudio/the-audio-api/the-offlineaudiocontext-interface webaudio/the-audio-api/the-oscillatornode-interface
+git -C target/wpt sparse-checkout set resources webaudio/resources webaudio/the-audio-api/the-audiobuffer-interface webaudio/the-audio-api/the-audionode-interface webaudio/the-audio-api/the-constantsourcenode-interface webaudio/the-audio-api/the-gainnode-interface webaudio/the-audio-api/the-offlineaudiocontext-interface webaudio/the-audio-api/the-oscillatornode-interface webaudio/the-audio-api/the-periodicwave-interface
 git -C target/wpt checkout fbc1b90e28b38e919acabeeb14d1b074f2c125ec
 DENO_AUDIO_WPT_ROOT=target/wpt cargo test --test wpt --no-default-features --locked -- --nocapture
 ```

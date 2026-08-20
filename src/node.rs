@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::CStr;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use deno_core::{op2, v8, GarbageCollected};
 use deno_error::JsErrorBox;
@@ -15,10 +15,14 @@ use web_audio_api::context::{
 use web_audio_api::node::{
     AudioBufferSourceNode, AudioBufferSourceOptions, AudioDestinationNode, AudioNode,
     AudioNodeDisconnectSelector, AudioNodeOptions, AudioScheduledSourceNode,
-    AudioScheduledSourceNodeExt, ChannelCountMode, ChannelInterpretation, GainNode, GainOptions,
-    OscillatorNode, OscillatorOptions, OscillatorType,
+    AudioScheduledSourceNodeExt, ChannelCountMode, ChannelInterpretation, ConstantSourceNode,
+    ConstantSourceOptions, GainNode, GainOptions, OscillatorNode, OscillatorOptions,
+    OscillatorType,
 };
-use web_audio_api::{AudioParam, AutomationRate};
+use web_audio_api::{
+    AudioParam, AutomationRate, PeriodicWave, PeriodicWaveOptions, PeriodicWaveStorageLease,
+    MAX_PERIODIC_WAVE_COMPONENTS, PERIODIC_WAVE_TABLE_BYTES,
+};
 
 use crate::buffer::{NativeAudioBuffer, NativeAudioByteBudget, NativeAudioByteReservation};
 use crate::host::{AudioHostReservation, AudioHostResourceKind};
@@ -33,9 +37,10 @@ const GAIN_NODE_COUNT: usize = 2;
 const GAIN_COMMAND_COUNT_WITH_TEARDOWN: usize = 6;
 const OSCILLATOR_NODE_COUNT: usize = 3;
 const OSCILLATOR_COMMAND_COUNT_WITH_TEARDOWN: usize = 10;
+const CONSTANT_SOURCE_NODE_COUNT: usize = 2;
+const CONSTANT_SOURCE_COMMAND_COUNT_WITH_TEARDOWN: usize = 6;
 const EXACT_GAIN_NODE_COUNT: usize = 2;
 const EXACT_GAIN_CONSTRUCTION_COMMAND_COUNT: usize = 4;
-const EXACT_OSCILLATOR_OPTION_COMMAND_LIMIT: usize = 3;
 const BUFFER_SOURCE_NODE_COUNT: usize = 3;
 const BUFFER_SOURCE_CONSTRUCTION_COMMAND_COUNT: usize = 7;
 const EXACT_BUFFER_SOURCE_OPTION_COMMAND_LIMIT: usize = 5;
@@ -70,6 +75,76 @@ fn mutex<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn validate_periodic_wave_coefficients(
+    real: Option<&[f32]>,
+    imag: Option<&[f32]>,
+) -> Result<usize, JsErrorBox> {
+    if let (Some(real), Some(imag)) = (real, imag) {
+        if real.len() != imag.len() {
+            return Err(JsErrorBox::generic(
+                "IndexSizeError: PeriodicWave real and imag lengths must match",
+            ));
+        }
+    }
+    for coefficients in [real, imag].into_iter().flatten() {
+        if coefficients.len() < 2 {
+            return Err(JsErrorBox::generic(
+                "IndexSizeError: PeriodicWave needs at least two coefficients",
+            ));
+        }
+        if coefficients.len() > MAX_PERIODIC_WAVE_COMPONENTS {
+            return Err(JsErrorBox::generic(format!(
+                "NotSupportedError: PeriodicWave supports at most {MAX_PERIODIC_WAVE_COMPONENTS} coefficients"
+            )));
+        }
+        if coefficients.iter().any(|value| !value.is_finite()) {
+            return Err(JsErrorBox::type_error(
+                "PeriodicWave coefficients must be finite",
+            ));
+        }
+    }
+    Ok(real.or(imag).map_or(2, <[f32]>::len))
+}
+
+fn create_periodic_wave<C: BaseAudioContext>(
+    context: &C,
+    byte_budget: &Arc<NativeAudioByteBudget>,
+    real: Option<&[f32]>,
+    imag: Option<&[f32]>,
+    disable_normalization: bool,
+) -> Result<PeriodicWave, JsErrorBox> {
+    let coefficient_count = validate_periodic_wave_coefficients(real, imag)?;
+    let temporary_bytes = coefficient_count
+        .checked_mul(2)
+        .and_then(|samples| samples.checked_mul(size_of::<f32>()))
+        .ok_or_else(|| JsErrorBox::range_error("PeriodicWave coefficient byte count overflow"))?;
+    let persistent = byte_budget
+        .reserve(PERIODIC_WAVE_TABLE_BYTES)
+        .map_err(|error| {
+            JsErrorBox::range_error(format!("PeriodicWave table reservation failed: {error}"))
+        })?;
+    let temporary = byte_budget.reserve(temporary_bytes).map_err(|error| {
+        JsErrorBox::range_error(format!(
+            "PeriodicWave coefficient reservation failed: {error}"
+        ))
+    })?;
+    let options = PeriodicWaveOptions {
+        real: real.map(<[f32]>::to_vec),
+        imag: imag.map(<[f32]>::to_vec),
+        disable_normalization,
+    };
+    let wave = panic::catch_unwind(AssertUnwindSafe(|| {
+        PeriodicWave::new_with_storage_lease(
+            context,
+            options,
+            PeriodicWaveStorageLease::new(persistent),
+        )
+    }))
+    .map_err(|payload| JsErrorBox::generic(panic_message(payload)))?;
+    drop(temporary);
+    Ok(wave)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -354,6 +429,25 @@ impl OfflineGraph {
         }))
     }
 
+    pub(crate) fn create_periodic_wave(
+        self: &Arc<Self>,
+        real: Option<&[f32]>,
+        imag: Option<&[f32]>,
+        disable_normalization: bool,
+    ) -> Result<NativePeriodicWave, JsErrorBox> {
+        let wave = create_periodic_wave(
+            self.context.as_ref(),
+            &self.byte_budget,
+            real,
+            imag,
+            disable_normalization,
+        )?;
+        Ok(NativePeriodicWave {
+            graph: NativeGraphIdentity::Offline(Arc::downgrade(self)),
+            wave,
+        })
+    }
+
     pub(crate) fn create_gain(
         self: &Arc<Self>,
         gain: f32,
@@ -400,10 +494,51 @@ impl OfflineGraph {
         })))
     }
 
+    pub(crate) fn create_constant_source(
+        self: &Arc<Self>,
+        offset: f32,
+    ) -> Result<NativeAudioNode, JsErrorBox> {
+        if !offset.is_finite() {
+            return Err(JsErrorBox::type_error(
+                "ConstantSource offset must be finite",
+            ));
+        }
+        let mut inner = mutex(&self.inner);
+        let first = self.reserve_nodes(
+            &mut inner,
+            CONSTANT_SOURCE_NODE_COUNT,
+            CONSTANT_SOURCE_COMMAND_COUNT_WITH_TEARDOWN,
+            true,
+        )?;
+        let node = match panic::catch_unwind(AssertUnwindSafe(|| {
+            ConstantSourceNode::new(self.context.as_ref(), ConstantSourceOptions { offset })
+        })) {
+            Ok(node) => node,
+            Err(payload) => {
+                inner.phase = OfflineGraphPhase::Poisoned;
+                return Err(JsErrorBox::generic(panic_message(payload)));
+            }
+        };
+        let parameter = Arc::new(NativeNodeHandle {
+            graph: NativeGraph::Offline(Arc::clone(self)),
+            id: first + 1,
+            kind: NativeNodeKind::Param(node.offset().clone()),
+        });
+        Ok(NativeAudioNode::from_handle(Arc::new(NativeNodeHandle {
+            graph: NativeGraph::Offline(Arc::clone(self)),
+            id: first,
+            kind: NativeNodeKind::ConstantSource {
+                node: Box::new(Mutex::new(node)),
+                parameter,
+            },
+        })))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_oscillator(
         self: &Arc<Self>,
         oscillator_type: OscillatorType,
+        periodic_wave: Option<&NativePeriodicWave>,
         frequency: f32,
         detune: f32,
         channel_count: usize,
@@ -415,11 +550,19 @@ impl OfflineGraph {
                 "oscillator frequency and detune must be finite",
             ));
         }
-        if oscillator_type == OscillatorType::Custom {
+        let periodic_wave = periodic_wave
+            .map(|wave| wave.for_graph(&NativeGraph::Offline(Arc::clone(self))))
+            .transpose()?;
+        if oscillator_type == OscillatorType::Custom && periodic_wave.is_none() {
             return Err(JsErrorBox::generic(
                 "InvalidStateError: custom oscillators require a PeriodicWave",
             ));
         }
+        let oscillator_type = if periodic_wave.is_some() {
+            OscillatorType::Custom
+        } else {
+            oscillator_type
+        };
         let mut inner = mutex(&self.inner);
         let first = self.reserve_nodes(
             &mut inner,
@@ -431,7 +574,7 @@ impl OfflineGraph {
             type_: oscillator_type,
             frequency,
             detune,
-            periodic_wave: None,
+            periodic_wave,
             audio_node_options: AudioNodeOptions {
                 channel_count,
                 channel_count_mode: count_mode,
@@ -728,14 +871,20 @@ impl OfflineGraph {
 pub(crate) struct OnlineGraph {
     state: Arc<NativeOnlineContextState>,
     runtime: Arc<AudioRuntimeState>,
+    byte_budget: Arc<NativeAudioByteBudget>,
 }
 
 impl OnlineGraph {
     pub(crate) fn new(
         state: Arc<NativeOnlineContextState>,
         runtime: Arc<AudioRuntimeState>,
+        byte_budget: Arc<NativeAudioByteBudget>,
     ) -> Arc<Self> {
-        Arc::new(Self { state, runtime })
+        Arc::new(Self {
+            state,
+            runtime,
+            byte_budget,
+        })
     }
 
     fn context(&self) -> Result<Arc<AudioContext>, JsErrorBox> {
@@ -796,6 +945,26 @@ impl OnlineGraph {
         })))
     }
 
+    pub(crate) fn create_periodic_wave(
+        self: &Arc<Self>,
+        real: Option<&[f32]>,
+        imag: Option<&[f32]>,
+        disable_normalization: bool,
+    ) -> Result<NativePeriodicWave, JsErrorBox> {
+        let context = self.context()?;
+        let wave = create_periodic_wave(
+            context.as_ref(),
+            &self.byte_budget,
+            real,
+            imag,
+            disable_normalization,
+        )?;
+        Ok(NativePeriodicWave {
+            graph: NativeGraphIdentity::Online(Arc::downgrade(self)),
+            wave,
+        })
+    }
+
     pub(crate) fn create_gain(
         self: &Arc<Self>,
         gain: f32,
@@ -835,10 +1004,37 @@ impl OnlineGraph {
         })))
     }
 
+    pub(crate) fn create_constant_source(
+        self: &Arc<Self>,
+        offset: f32,
+    ) -> Result<NativeAudioNode, JsErrorBox> {
+        if !offset.is_finite() {
+            return Err(JsErrorBox::type_error(
+                "ConstantSource offset must be finite",
+            ));
+        }
+        let root = self.state.event_hub().register_constant_source(
+            &self.state,
+            false,
+            ConstantSourceOptions { offset },
+        )?;
+        let parameter = Arc::new(NativeNodeHandle {
+            graph: NativeGraph::Online(Arc::clone(self)),
+            id: 0,
+            kind: NativeNodeKind::Param(root.offset()),
+        });
+        Ok(NativeAudioNode::from_handle(Arc::new(NativeNodeHandle {
+            graph: NativeGraph::Online(Arc::clone(self)),
+            id: u64::from(root.id()),
+            kind: NativeNodeKind::OnlineConstantSource { root, parameter },
+        })))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_oscillator(
         self: &Arc<Self>,
         oscillator_type: OscillatorType,
+        periodic_wave: Option<&NativePeriodicWave>,
         frequency: f32,
         detune: f32,
         channel_count: usize,
@@ -850,35 +1046,31 @@ impl OnlineGraph {
                 "oscillator frequency and detune must be finite",
             ));
         }
-        if oscillator_type == OscillatorType::Custom {
+        let periodic_wave = periodic_wave
+            .map(|wave| wave.for_graph(&NativeGraph::Online(Arc::clone(self))))
+            .transpose()?;
+        if oscillator_type == OscillatorType::Custom && periodic_wave.is_none() {
             return Err(JsErrorBox::generic(
-                "NotSupportedError: custom oscillators require a PeriodicWave",
+                "InvalidStateError: custom oscillators require a PeriodicWave",
             ));
         }
         Self::ensure_default_channel_options(channel_count, count_mode, interpretation)?;
-        let frequency_is_custom = frequency.to_bits() != 440.0_f32.to_bits();
-        let detune_is_custom = detune.to_bits() != 0.0_f32.to_bits();
-        let option_count = usize::from(frequency_is_custom)
-            + usize::from(detune_is_custom)
-            + usize::from(oscillator_type != OscillatorType::Sine);
-        debug_assert!(option_count <= EXACT_OSCILLATOR_OPTION_COMMAND_LIMIT);
-        let mut option_reservations = Vec::with_capacity(option_count);
-        for _ in 0..option_count {
-            option_reservations.push(self.reserve_control(1)?);
-        }
+        let oscillator_type = if periodic_wave.is_some() {
+            OscillatorType::Custom
+        } else {
+            oscillator_type
+        };
+        let options = OscillatorOptions {
+            type_: oscillator_type,
+            frequency,
+            detune,
+            periodic_wave,
+            audio_node_options: AudioNodeOptions::default(),
+        };
         let root = self
             .state
             .event_hub()
-            .register_oscillator(&self.state, false)?;
-        if frequency_is_custom {
-            root.set_frequency(frequency, option_reservations.remove(0), &self.state)?;
-        }
-        if detune_is_custom {
-            root.set_detune(detune, option_reservations.remove(0), &self.state)?;
-        }
-        if oscillator_type != OscillatorType::Sine {
-            root.set_type(oscillator_type, option_reservations.remove(0), &self.state)?;
-        }
+            .register_oscillator(&self.state, false, options)?;
         let frequency = Arc::new(NativeNodeHandle {
             graph: NativeGraph::Online(Arc::clone(self)),
             id: 0,
@@ -1228,6 +1420,55 @@ impl NativeGraph {
     }
 }
 
+enum NativeGraphIdentity {
+    Offline(Weak<OfflineGraph>),
+    Online(Weak<OnlineGraph>),
+}
+
+impl NativeGraphIdentity {
+    fn matches(&self, graph: &NativeGraph) -> bool {
+        match (self, graph) {
+            (Self::Offline(identity), NativeGraph::Offline(candidate)) => {
+                Weak::ptr_eq(identity, &Arc::downgrade(candidate))
+            }
+            (Self::Online(identity), NativeGraph::Online(candidate)) => {
+                Weak::ptr_eq(identity, &Arc::downgrade(candidate))
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Private native storage behind the public JavaScript `PeriodicWave` facade.
+pub(crate) struct NativePeriodicWave {
+    graph: NativeGraphIdentity,
+    wave: PeriodicWave,
+}
+
+impl NativePeriodicWave {
+    fn for_graph(&self, graph: &NativeGraph) -> Result<PeriodicWave, JsErrorBox> {
+        if !self.graph.matches(graph) {
+            return Err(JsErrorBox::generic(
+                "InvalidAccessError: PeriodicWave belongs to a different audio context",
+            ));
+        }
+        Ok(self.wave.clone())
+    }
+}
+
+// SAFETY: the object owns only thread-safe native graph and wavetable storage and contains no V8
+// or CppGC pointers.
+unsafe impl GarbageCollected for NativePeriodicWave {
+    fn trace(&self, _visitor: &mut v8::cppgc::Visitor) {}
+
+    fn get_name(&self) -> &'static CStr {
+        c"NativePeriodicWave"
+    }
+}
+
+#[op2]
+impl NativePeriodicWave {}
+
 enum NativeNodeKind {
     Destination(AudioDestinationNode),
     Gain {
@@ -1254,6 +1495,14 @@ enum NativeNodeKind {
         playback_rate: Arc<NativeNodeHandle>,
         detune: Arc<NativeNodeHandle>,
     },
+    ConstantSource {
+        node: Box<Mutex<ConstantSourceNode>>,
+        parameter: Arc<NativeNodeHandle>,
+    },
+    OnlineConstantSource {
+        root: Arc<ScheduledSourceRoot>,
+        parameter: Arc<NativeNodeHandle>,
+    },
     Param(AudioParam),
 }
 
@@ -1270,8 +1519,10 @@ impl NativeNodeHandle {
             NativeNodeKind::Gain { node, .. } => operation(node),
             NativeNodeKind::Oscillator { node, .. } => operation(&*mutex(node)),
             NativeNodeKind::OnlineOscillator { root, .. }
-            | NativeNodeKind::OnlineBufferSource { root, .. } => root.with_audio_node(operation),
+            | NativeNodeKind::OnlineBufferSource { root, .. }
+            | NativeNodeKind::OnlineConstantSource { root, .. } => root.with_audio_node(operation),
             NativeNodeKind::BufferSource { node, .. } => operation(&*mutex(node)),
+            NativeNodeKind::ConstantSource { node, .. } => operation(&*mutex(node)),
             NativeNodeKind::Param(param) => operation(param),
         }
     }
@@ -1337,6 +1588,9 @@ impl NativeAudioNode {
             NativeNodeKind::Oscillator { .. } | NativeNodeKind::OnlineOscillator { .. } => 2,
             NativeNodeKind::Param(_) => 3,
             NativeNodeKind::BufferSource { .. } | NativeNodeKind::OnlineBufferSource { .. } => 4,
+            NativeNodeKind::ConstantSource { .. } | NativeNodeKind::OnlineConstantSource { .. } => {
+                5
+            }
         }
     }
 
@@ -1501,6 +1755,19 @@ impl NativeAudioNode {
             }
             _ => Err(JsErrorBox::type_error(
                 "native binding expected an AudioBufferSourceNode",
+            )),
+        }
+    }
+
+    #[cppgc]
+    fn offset(&self) -> Result<NativeAudioNode, JsErrorBox> {
+        match &self.handle.kind {
+            NativeNodeKind::ConstantSource { parameter, .. }
+            | NativeNodeKind::OnlineConstantSource { parameter, .. } => {
+                Ok(Self::from_handle(Arc::clone(parameter)))
+            }
+            _ => Err(JsErrorBox::type_error(
+                "native binding expected a ConstantSourceNode",
             )),
         }
     }
@@ -1821,6 +2088,26 @@ impl NativeAudioNode {
     }
 
     #[fast]
+    fn set_periodic_wave(
+        &self,
+        #[cppgc] periodic_wave: &NativePeriodicWave,
+    ) -> Result<(), JsErrorBox> {
+        let periodic_wave = periodic_wave.for_graph(&self.handle.graph)?;
+        match (&self.handle.graph, &self.handle.kind) {
+            (NativeGraph::Offline(graph), NativeNodeKind::Oscillator { node, .. }) => {
+                graph.run_command(false, 0, || mutex(node).set_periodic_wave(periodic_wave))
+            }
+            (NativeGraph::Online(graph), NativeNodeKind::OnlineOscillator { root, .. }) => {
+                let reservation = graph.reserve_control(1)?;
+                root.set_periodic_wave(periodic_wave, reservation, &graph.state)
+            }
+            _ => Err(JsErrorBox::type_error(
+                "native binding expected an OscillatorNode",
+            )),
+        }
+    }
+
+    #[fast]
     fn start(&self, when: f64) -> Result<(), JsErrorBox> {
         if !when.is_finite() || when < 0.0 {
             return Err(JsErrorBox::type_error(
@@ -1833,6 +2120,12 @@ impl NativeAudioNode {
             }
             (NativeGraph::Online(graph), NativeNodeKind::OnlineOscillator { root, .. }) => {
                 root.start(when, graph.reserve_control(1)?, &graph.state)
+            }
+            (NativeGraph::Offline(graph), NativeNodeKind::ConstantSource { node, .. }) => {
+                graph.run_command(false, 0, || mutex(node).start_at(when))
+            }
+            (NativeGraph::Online(graph), NativeNodeKind::OnlineConstantSource { root, .. }) => {
+                root.start_constant_source(when, graph.reserve_control(1)?, &graph.state)
             }
             _ => Err(JsErrorBox::type_error(
                 "native binding expected an OscillatorNode",
@@ -1886,10 +2179,14 @@ impl NativeAudioNode {
             (NativeGraph::Offline(graph), NativeNodeKind::BufferSource { node, .. }) => {
                 graph.run_command(false, 0, || mutex(node).stop_at(when))
             }
+            (NativeGraph::Offline(graph), NativeNodeKind::ConstantSource { node, .. }) => {
+                graph.run_command(false, 0, || mutex(node).stop_at(when))
+            }
             (
                 NativeGraph::Online(graph),
                 NativeNodeKind::OnlineOscillator { root, .. }
-                | NativeNodeKind::OnlineBufferSource { root, .. },
+                | NativeNodeKind::OnlineBufferSource { root, .. }
+                | NativeNodeKind::OnlineConstantSource { root, .. },
             ) => root.stop(when, graph.reserve_control(1)?, &graph.state),
             _ => Err(JsErrorBox::type_error(
                 "native binding expected an AudioScheduledSourceNode",
@@ -1906,8 +2203,12 @@ impl NativeAudioNode {
             NativeNodeKind::BufferSource { node, .. } => {
                 Ok(mutex(node).completion_token().is_complete())
             }
+            NativeNodeKind::ConstantSource { node, .. } => {
+                Ok(mutex(node).completion_token().is_complete())
+            }
             NativeNodeKind::OnlineOscillator { root, .. }
-            | NativeNodeKind::OnlineBufferSource { root, .. } => Ok(root.is_complete()),
+            | NativeNodeKind::OnlineBufferSource { root, .. }
+            | NativeNodeKind::OnlineConstantSource { root, .. } => Ok(root.is_complete()),
             _ => Err(JsErrorBox::type_error(
                 "native binding expected an AudioScheduledSourceNode",
             )),
@@ -1918,7 +2219,8 @@ impl NativeAudioNode {
     fn source_id(&self) -> f64 {
         match &self.handle.kind {
             NativeNodeKind::OnlineOscillator { root, .. }
-            | NativeNodeKind::OnlineBufferSource { root, .. } => f64::from(root.id()),
+            | NativeNodeKind::OnlineBufferSource { root, .. }
+            | NativeNodeKind::OnlineConstantSource { root, .. } => f64::from(root.id()),
             _ => 0.0,
         }
     }

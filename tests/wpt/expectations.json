@@ -32,8 +32,17 @@
     {
       "path": "webaudio/the-audio-api/the-oscillatornode-interface/ctor-oscillator.html",
       "category": "constructors",
-      "status": "skip",
-      "reason": "The file requires custom PeriodicWave support; the current online and offline slices expose only fixed-wave oscillators."
+      "status": "pass"
+    },
+    {
+      "path": "webaudio/the-audio-api/the-constantsourcenode-interface/ctor-constantsource.html",
+      "category": "constructors",
+      "status": "pass"
+    },
+    {
+      "path": "webaudio/the-audio-api/the-periodicwave-interface/createPeriodicWaveInfiniteValuesThrows.html",
+      "category": "PeriodicWave",
+      "status": "pass"
     },
     {
       "path": "webaudio/the-audio-api/the-audionode-interface/audionode-connect-return-value.html",

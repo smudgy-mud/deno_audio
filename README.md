@@ -9,15 +9,15 @@ the [Smudgy `web-audio-api-rs` fork](https://github.com/smudgy-mud/web-audio-api
 ownership model, and hosted silent/CPAL/Cubeb output paths have passed their
 Phase 0 acceptance gates, and the deterministic Phase 1 offline graph is
 complete. The extension now also exposes the first production-bounded online
-slice: `AudioContext`, destination, `GainNode`, fixed-wave `OscillatorNode`,
+slice: `AudioContext`, destination, `GainNode`, fixed and custom-wave
+`OscillatorNode`, `PeriodicWave`, `ConstantSourceNode`,
 `AudioBufferSourceNode`, scalar `AudioParam.value`, explicit connections,
 lifecycle methods, `statechange`, exactly-once `ended`, and bounded off-isolate
 `decodeAudioData` with both promise and legacy callback forms. The same
 JavaScript surface renders through built-in system output or an
-embedder-supplied `AudioOutputFactory`. `ConstantSourceNode`, custom
-`PeriodicWave`, online parameter automation, additional node families, and full
-browser conformance remain later Phase 2/3 slices, so this is not yet a complete
-Web Audio API.
+embedder-supplied `AudioOutputFactory`. Online parameter automation, additional
+node families, and full browser conformance remain later Phase 2/3 slices, so
+this is not yet a complete Web Audio API.
 
 The public `AudioBuffer` implements Web IDL conversion, nominal-range and brand
 checks, standard prototype descriptors, `getChannelData()`,
@@ -34,9 +34,10 @@ automation records, legacy control traffic, render jobs, and output PCM before
 the represented operation mutates the engine. It supports both
 `OfflineAudioContext` constructor forms, branded/cross-context port checks,
 duplicate and no-match connection semantics, one-shot `startRendering()`,
-`complete`/`ended` delivery, the four fixed oscillator waveforms, and the
-standard scalar/automation methods on the exposed parameters. Graph ownership
-remains charged while retained native node wrappers could still enqueue their
+`complete`/`ended` delivery, constant sources, the four fixed oscillator
+waveforms, bounded custom `PeriodicWave` playback, and the standard
+scalar/automation methods on the exposed parameters. Graph ownership remains
+charged while retained native node wrappers could still enqueue their
 pre-reserved teardown records; rendering itself runs off the isolate thread.
 Value-curve conversion is iterator-safe and capped at 1,048,576 samples before
 the Rust copy; that copy is additionally charged to the isolate and shared-host
@@ -51,6 +52,14 @@ buffer assignment and does not permit clearing it afterward. A started online
 source is rooted by its exact native generation until authoritative completion;
 lossy event wakeups are reconciled from completion tokens, and confirmed context
 shutdown releases any callback whose event could not be delivered.
+
+Both graph modes also expose `ConstantSourceNode` with its scalar `offset`
+parameter and the same generation-safe scheduled-source rooting. Each
+`PeriodicWave` accepts at most 8,192 Fourier components and owns one fixed
+32-KiB native table whose isolate and shared-host byte lease follows every
+native clone, staged command, renderer replacement, and final reclamation. The
+JavaScript wrapper carries only a weak context identity, so retaining a wave
+does not retain an otherwise unreachable online context.
 
 Extension JavaScript uses Deno's captured primordials. Installation is
 idempotent for the same constructor and refuses to overwrite an unrelated
@@ -76,10 +85,10 @@ The research baseline is deliberately locked to one compatibility set:
 - `deno_error` 0.7.1
 - `serde_v8` 0.319.0
 - the Smudgy `web-audio-api` fork at commit
-  `faf6ec34878cc9add6f9e1326508669e8dd7cd4d` (the reviewed hosted-output
+  `d0e967a136472389312c475ac1851b6836ad7292` (the reviewed hosted-output
   compatibility stack plus exact node, connection, scheduled-source,
-  buffer-source, PCM-storage, and control-command reservation lifetimes, based
-  on 1.7.0)
+  buffer-source, ConstantSource, PeriodicWave, PCM-storage, and control-command
+  reservation lifetimes, based on 1.7.0)
 
 The Deno crates move as a coordinated tuple. Upgrade them together in one
 reviewed change, and keep `Cargo.lock` committed so Phase 0 evidence remains
@@ -121,8 +130,8 @@ Phase 1 Web Platform Test coverage is pinned to WPT commit
 [`tests/wpt/expectations.json`](tests/wpt/expectations.json) for every runnable
 file and reviewed skip reason. CI supplies the checkout and runs the subset
 through this extension's `JsRuntime`; no browser or system audio device is
-required. The initial reviewed subset contains four passing files and seven
-explicitly skipped files across constructors, `AudioBuffer`,
+required. The reviewed subset contains seven passing files and six explicitly
+skipped files across constructors, `AudioBuffer`, `PeriodicWave`,
 connect/disconnect, and offline rendering.
 
 Each extension instance is initialized with `AudioExtensionOptions`. Sharing

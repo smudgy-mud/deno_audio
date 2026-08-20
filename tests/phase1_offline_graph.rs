@@ -237,7 +237,9 @@ async fn public_offline_graph_has_brands_overloads_and_closed_connection_semanti
                   "GainNode",
                   "AudioScheduledSourceNode",
                   "AudioBufferSourceNode",
+                  "ConstantSourceNode",
                   "OscillatorNode",
+                  "PeriodicWave",
                   "AudioParam",
                   "OfflineAudioCompletionEvent",
                 ]) {
@@ -250,7 +252,8 @@ async fn public_offline_graph_has_brands_overloads_and_closed_connection_semanti
                 }
                 assert(OfflineAudioContext.length === 1, "offline constructor length");
                 assert(GainNode.length === 1 && OscillatorNode.length === 1 &&
-                    AudioBufferSourceNode.length === 1,
+                    AudioBufferSourceNode.length === 1 &&
+                    ConstantSourceNode.length === 1 && PeriodicWave.length === 1,
                   "node constructor length");
                 assert(BaseAudioContext.prototype.createBufferSource.length === 0 &&
                     AudioBufferSourceNode.prototype.start.length === 0,
@@ -334,9 +337,22 @@ async fn public_offline_graph_has_brands_overloads_and_closed_connection_semanti
                 throws(() => oscillator.type = "custom",
                   DOMException, "InvalidStateError");
                 throws(() => new OscillatorNode(context, { type: "custom" }),
-                  DOMException, "NotSupportedError");
+                  DOMException, "InvalidStateError");
                 throws(() => oscillator.setPeriodicWave({}),
-                  DOMException, "NotSupportedError");
+                  TypeError);
+                const wave = new PeriodicWave(context, { real: [0, 1] });
+                oscillator.setPeriodicWave(wave);
+                assert(oscillator.type === "custom", "PeriodicWave type mirror");
+                const custom = new OscillatorNode(context, {
+                  type: "sine",
+                  periodicWave: wave,
+                });
+                assert(custom.type === "custom", "PeriodicWave constructor precedence");
+                const constant = new ConstantSourceNode(context, { offset: -0.25 });
+                assert(constant instanceof AudioScheduledSourceNode &&
+                    constant.offset.value === -0.25 &&
+                    constant.numberOfInputs === 0 && constant.numberOfOutputs === 1,
+                  "ConstantSource surface");
 
                 assert(oscillator.connect(gain) === gain, "connect return value");
                 assert(oscillator.connect(gain) === gain, "duplicate connect");
@@ -745,4 +761,226 @@ async fn accepted_public_render_outlives_a_discarded_javascript_waiter() {
         .expect("discarding the public waiter must not cancel native rendering");
     assert_eq!(host.usage().offline_render_jobs(), 0);
     collect_until_all_public_graph_resources_retire(&mut runtime, &host);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn constant_source_and_periodic_wave_render_through_the_public_offline_graph() {
+    let host = Arc::new(AudioHost::default());
+    let mut runtime = runtime(Arc::clone(&host), AudioLimits::unlimited());
+    runtime
+        .execute_script(
+            "phase2_offline_constant_periodic.js",
+            r#"
+              globalThis.__phase2OfflineSources = (async () => {
+                const assert = (condition, message) => {
+                  if (!condition) throw new Error(message);
+                };
+                const customContext = new OfflineAudioContext(1, 32, 48000);
+                const wave = new PeriodicWave(customContext, {
+                  real: [0, 0],
+                  imag: [0, 1],
+                  disableNormalization: true,
+                });
+                const custom = new OscillatorNode(customContext, {
+                  frequency: 6000,
+                  periodicWave: wave,
+                });
+                assert(custom.type === "custom", "custom constructor type");
+                custom.connect(customContext.destination);
+                custom.start();
+                custom.stop(32 / 48000);
+
+                const sineContext = new OfflineAudioContext(1, 32, 48000);
+                const sine = new OscillatorNode(sineContext, {
+                  type: "sine",
+                  frequency: 6000,
+                });
+                sine.connect(sineContext.destination);
+                sine.start();
+                sine.stop(32 / 48000);
+
+                let foreign;
+                try { sine.setPeriodicWave(wave); } catch (error) { foreign = error; }
+                assert(foreign?.name === "InvalidAccessError",
+                  "foreign PeriodicWave must reject");
+
+                const constantContext = new OfflineAudioContext(1, 32, 48000);
+                const constant = constantContext.createConstantSource();
+                constant.offset.value = 0.25;
+                let ended = 0;
+                constant.onended = () => ended++;
+                constant.connect(constantContext.destination);
+                constant.start();
+                constant.stop(16 / 48000);
+
+                const [customBuffer, sineBuffer, constantBuffer] = await Promise.all([
+                  customContext.startRendering(),
+                  sineContext.startRendering(),
+                  constantContext.startRendering(),
+                ]);
+                const actual = customBuffer.getChannelData(0);
+                const expected = sineBuffer.getChannelData(0);
+                for (let i = 0; i < actual.length; ++i) {
+                  assert(Math.abs(actual[i] - expected[i]) < 0.00001,
+                    `custom sine mismatch at ${i}: ${actual[i]} vs ${expected[i]}`);
+                }
+                const constantOutput = constantBuffer.getChannelData(0);
+                for (let i = 0; i < constantOutput.length; ++i) {
+                  const expectedValue = i < 16 ? 0.25 : 0;
+                  assert(Math.abs(constantOutput[i] - expectedValue) < 0.00001,
+                    `constant sample ${i}: ${constantOutput[i]}`);
+                }
+                assert(ended === 1, `ConstantSource ended count ${ended}`);
+                // PeriodicWave is a non-graph factory and remains available on a
+                // context after its one-shot offline render closes.
+                globalThis.__phase2ClosedWave = customContext.createPeriodicWave(
+                  new Float32Array([0, 0]),
+                  new Float32Array([0, 1]),
+                );
+                globalThis.__phase2OfflineSourcesDone = true;
+              })();
+            "#,
+        )
+        .expect("offline ConstantSource/PeriodicWave scenario should start");
+    runtime
+        .run_event_loop(deno_core::PollEventLoopOptions::default())
+        .await
+        .expect("offline ConstantSource/PeriodicWave scenario should settle");
+    runtime
+        .execute_script(
+            "phase2_offline_constant_periodic_result.js",
+            "if (globalThis.__phase2OfflineSourcesDone !== true) throw new Error('offline source scenario did not finish'); globalThis.__phase2ClosedWave = undefined; globalThis.__phase2OfflineSources = undefined;",
+        )
+        .expect("offline ConstantSource/PeriodicWave scenario should finish");
+    collect_until_all_public_graph_resources_retire(&mut runtime, &host);
+}
+
+#[test]
+fn periodic_wave_reserves_coefficients_before_copy_and_storage_until_gc() {
+    const TABLE_BYTES: usize = 32 * 1024;
+    const TWO_COMPONENT_INPUT_BYTES: usize = 4 * std::mem::size_of::<f32>();
+
+    let rejected_host = Arc::new(AudioHost::default());
+    {
+        let mut runtime = runtime(
+            Arc::clone(&rejected_host),
+            AudioLimits::unlimited().max_live_audio_bytes(Some(TABLE_BYTES)),
+        );
+        runtime
+            .execute_script(
+                "phase2_periodic_wave_coefficient_limit.js",
+                r#"
+                  const context = new OfflineAudioContext(1, 8, 3000);
+                  let error;
+                  try {
+                    new PeriodicWave(context, { real: [0, 0], imag: [0, 1] });
+                  } catch (caught) { error = caught; }
+                  if (error?.name !== "QuotaExceededError") throw error ??
+                    new Error("coefficient reservation did not reject");
+                "#,
+            )
+            .expect("temporary coefficient capacity should reject before copying");
+        assert_eq!(rejected_host.usage().live_audio_bytes(), 0);
+    }
+
+    let accepted_host = Arc::new(AudioHost::default());
+    let mut runtime = runtime(
+        Arc::clone(&accepted_host),
+        AudioLimits::unlimited()
+            .max_live_audio_bytes(Some(TABLE_BYTES + TWO_COMPONENT_INPUT_BYTES)),
+    );
+    runtime
+        .execute_script(
+            "phase2_periodic_wave_storage_lease.js",
+            r"
+              const context = new OfflineAudioContext(1, 8, 3000);
+              globalThis.__phase2HeldWave = new PeriodicWave(context, {
+                real: [0, 0], imag: [0, 1],
+              });
+            ",
+        )
+        .expect("bounded PeriodicWave should construct");
+    assert_eq!(accepted_host.usage().live_audio_bytes(), TABLE_BYTES);
+    runtime
+        .execute_script(
+            "phase2_periodic_wave_storage_release.js",
+            "globalThis.__phase2HeldWave = undefined;",
+        )
+        .unwrap();
+    collect_until_live_bytes(&mut runtime, &accepted_host, 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn periodic_wave_webidl_bounds_close_iterators_before_native_allocation() {
+    const TABLE_BYTES: usize = 32 * 1024;
+    let host = Arc::new(AudioHost::default());
+    let mut runtime = runtime(Arc::clone(&host), AudioLimits::unlimited());
+    runtime
+        .execute_script(
+            "phase2_periodic_wave_validation.js",
+            r#"
+              const context = new OfflineAudioContext(1, 8, 3000);
+              const expect = (callback, name) => {
+                let error;
+                try { callback(); } catch (caught) { error = caught; }
+                if (error?.name !== name) {
+                  throw new Error(`expected ${name}, got ${error}`);
+                }
+              };
+              expect(() => new PeriodicWave(context, { real: [0] }),
+                "IndexSizeError");
+              expect(() => new PeriodicWave(context, {
+                real: [0, 1], imag: [0, 1, 2],
+              }), "IndexSizeError");
+              expect(() => new PeriodicWave(context, { real: [0, Infinity] }),
+                "TypeError");
+              expect(() => new PeriodicWave(null, {}), "TypeError");
+
+              let iteratorClosed = false;
+              const oversized = {
+                [Symbol.iterator]() {
+                  let index = 0;
+                  return {
+                    next() {
+                      return index++ <= 8192
+                        ? { value: 0, done: false }
+                        : { value: undefined, done: true };
+                    },
+                    return() {
+                      iteratorClosed = true;
+                      return { value: undefined, done: true };
+                    },
+                  };
+                },
+              };
+              expect(() => new PeriodicWave(context, { real: oversized }),
+                "QuotaExceededError");
+              if (!iteratorClosed) {
+                throw new Error("bounded PeriodicWave conversion did not close its iterator");
+              }
+            "#,
+        )
+        .expect("PeriodicWave validation failures should be catchable");
+    assert_eq!(host.usage().live_audio_bytes(), 0);
+
+    runtime
+        .execute_script(
+            "phase2_periodic_wave_missing_counterparts.js",
+            r"
+              globalThis.__phase2WaveVariants = [
+                new PeriodicWave(context),
+                new PeriodicWave(context, { real: [0, 1] }),
+                new PeriodicWave(context, { imag: [0, 1] }),
+              ];
+            ",
+        )
+        .expect("missing PeriodicWave coefficient arrays should be synthesized");
+    assert_eq!(host.usage().live_audio_bytes(), 3 * TABLE_BYTES);
+    runtime
+        .execute_script(
+            "phase2_periodic_wave_variant_release.js",
+            "globalThis.__phase2WaveVariants = undefined;",
+        )
+        .unwrap();
+    collect_until_live_bytes(&mut runtime, &host, 0);
 }

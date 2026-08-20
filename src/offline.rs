@@ -17,7 +17,7 @@ use crate::buffer::{
     checked_pcm_bytes, NativeAudioBuffer, NativeAudioByteBudget, NativeAudioByteReservation,
 };
 use crate::host::{AudioHostReservation, AudioHostResourceKind};
-use crate::node::{NativeAudioNode, OfflineGraph};
+use crate::node::{NativeAudioNode, NativePeriodicWave, OfflineGraph};
 use crate::online::{AudioRuntimeState, IsolateReservation};
 
 fn channel_count_mode(value: u32) -> Result<ChannelCountMode, JsErrorBox> {
@@ -43,8 +43,9 @@ fn oscillator_type(value: u32) -> Result<OscillatorType, JsErrorBox> {
         1 => Ok(OscillatorType::Square),
         2 => Ok(OscillatorType::Sawtooth),
         3 => Ok(OscillatorType::Triangle),
+        4 => Ok(OscillatorType::Custom),
         _ => Err(JsErrorBox::generic(
-            "InvalidStateError: custom oscillator type is unavailable",
+            "InvalidStateError: unknown oscillator type",
         )),
     }
 }
@@ -263,10 +264,32 @@ impl NativeOfflineAudioContext {
     }
 
     #[cppgc]
+    fn create_constant_source(&self, offset: f32) -> Result<NativeAudioNode, JsErrorBox> {
+        self.graph.create_constant_source(offset)
+    }
+
+    #[cppgc]
+    fn create_periodic_wave(
+        &self,
+        #[buffer] real: &[f32],
+        real_present: bool,
+        #[buffer] imag: &[f32],
+        imag_present: bool,
+        disable_normalization: bool,
+    ) -> Result<NativePeriodicWave, JsErrorBox> {
+        self.graph.create_periodic_wave(
+            real_present.then_some(real),
+            imag_present.then_some(imag),
+            disable_normalization,
+        )
+    }
+
+    #[cppgc]
     #[allow(clippy::too_many_arguments)]
     fn create_oscillator(
         &self,
         oscillator_type_code: u32,
+        #[cppgc] periodic_wave: Option<&NativePeriodicWave>,
         frequency: f32,
         detune: f32,
         channel_count: u32,
@@ -275,6 +298,7 @@ impl NativeOfflineAudioContext {
     ) -> Result<NativeAudioNode, JsErrorBox> {
         self.graph.create_oscillator(
             oscillator_type(oscillator_type_code)?,
+            periodic_wave,
             frequency,
             detune,
             channel_count as usize,

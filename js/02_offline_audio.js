@@ -58,11 +58,13 @@ const {
 } = primordials;
 
 const MAX_AUTOMATION_CURVE_SAMPLES = 1_048_576;
+const MAX_PERIODIC_WAVE_COMPONENTS = 8192;
 const constructNode = Symbol("[[constructAudioNode]]");
 const constructContext = Symbol("[[constructBaseAudioContext]]");
 const nativeContexts = new SafeWeakMap();
 const nativeNodes = new SafeWeakMap();
 const nativeParams = new SafeWeakMap();
+const nativePeriodicWaves = new SafeWeakMap();
 const completionBuffers = new SafeWeakMap();
 
 webidl.converters.AudioContextState = webidl.createEnumConverter(
@@ -177,6 +179,53 @@ webidl.converters.GainOptions = webidl.createDictionaryConverter(
     defaultValue: 1,
   }],
 );
+function convertPeriodicWave(value, prefix, context) {
+  webidl.assertBranded(value, PeriodicWavePrototype);
+  return value;
+}
+function convertPeriodicWaveSequence(value, prefix, context) {
+  return boundedFloatSequence(
+    value,
+    prefix,
+    context,
+    MAX_PERIODIC_WAVE_COMPONENTS,
+    "The PeriodicWave exceeds the fixed Fourier-component limit.",
+  );
+}
+webidl.converters.PeriodicWaveOptions = webidl.createDictionaryConverter(
+  "PeriodicWaveOptions",
+  [
+    {
+      key: "disableNormalization",
+      converter: webidl.converters.boolean,
+      defaultValue: false,
+    },
+    {
+      key: "imag",
+      converter: convertPeriodicWaveSequence,
+    },
+    {
+      key: "real",
+      converter: convertPeriodicWaveSequence,
+    },
+  ],
+);
+webidl.converters.PeriodicWaveConstraints = webidl.createDictionaryConverter(
+  "PeriodicWaveConstraints",
+  [{
+    key: "disableNormalization",
+    converter: webidl.converters.boolean,
+    defaultValue: false,
+  }],
+);
+webidl.converters.ConstantSourceOptions = webidl.createDictionaryConverter(
+  "ConstantSourceOptions",
+  [{
+    key: "offset",
+    converter: webidl.converters.float,
+    defaultValue: 1,
+  }],
+);
 webidl.converters.OscillatorOptions = webidl.createDictionaryConverter(
   "OscillatorOptions",
   audioNodeOptionsMembers,
@@ -193,7 +242,7 @@ webidl.converters.OscillatorOptions = webidl.createDictionaryConverter(
     },
     {
       key: "periodicWave",
-      converter: webidl.converters.object,
+      converter: convertPeriodicWave,
     },
     {
       key: "type",
@@ -267,7 +316,13 @@ function closeIterator(iterator) {
   }
 }
 
-function boundedFloatSequence(value, prefix, context) {
+function boundedFloatSequence(
+  value,
+  prefix,
+  context,
+  limit = MAX_AUTOMATION_CURVE_SAMPLES,
+  limitMessage = "The AudioParam value curve exceeds the fixed sample limit.",
+) {
   if (value === null || value === undefined) {
     throw new TypeError(`${prefix}: ${context} is not iterable.`);
   }
@@ -298,9 +353,9 @@ function boundedFloatSequence(value, prefix, context) {
         throw new TypeError("Iterator result is not an object.");
       }
       if (item.done) return converted;
-      if (converted.length === MAX_AUTOMATION_CURVE_SAMPLES) {
+      if (converted.length === limit) {
         throw domException(
-          "The AudioParam value curve exceeds the fixed sample limit.",
+          limitMessage,
           "QuotaExceededError",
         );
       }
@@ -332,6 +387,11 @@ function nodeRecord(value) {
 function paramRecord(value) {
   webidl.assertBranded(value, AudioParamPrototype);
   return WeakMapPrototypeGet(nativeParams, value);
+}
+
+function periodicWaveRecord(value) {
+  webidl.assertBranded(value, PeriodicWavePrototype);
+  return WeakMapPrototypeGet(nativePeriodicWaves, value);
 }
 
 function messageOf(error) {
@@ -452,6 +512,44 @@ function createParam(context, native) {
     native,
   });
   return param;
+}
+
+function initializePeriodicWave(value, contextState, options, operation) {
+  const realPresent = options.real !== undefined;
+  const imagPresent = options.imag !== undefined;
+  if (realPresent && options.real.length < 2) {
+    throw domException(
+      "PeriodicWave real coefficients must contain at least two values.",
+      "IndexSizeError",
+    );
+  }
+  if (imagPresent && options.imag.length < 2) {
+    throw domException(
+      "PeriodicWave imag coefficients must contain at least two values.",
+      "IndexSizeError",
+    );
+  }
+  if (realPresent && imagPresent && options.real.length !== options.imag.length) {
+    throw domException(
+      "PeriodicWave real and imag coefficient lengths must match.",
+      "IndexSizeError",
+    );
+  }
+  const real = new Float32Array(realPresent ? options.real : 0);
+  const imag = new Float32Array(imagPresent ? options.imag : 0);
+  const native = callNative(operation, () =>
+    contextState.native.createPeriodicWave(
+      real,
+      realPresent,
+      imag,
+      imagPresent,
+      options.disableNormalization,
+    ));
+  WeakMapPrototypeSet(nativePeriodicWaves, value, {
+    __proto__: null,
+    identity: contextState.identity,
+    native,
+  });
 }
 
 function createDestination(context, native) {
@@ -721,6 +819,37 @@ class BaseAudioContext extends EventTarget {
     return new OscillatorNode(this);
   }
 
+  createConstantSource() {
+    contextRecord(this);
+    return new ConstantSourceNode(this);
+  }
+
+  createPeriodicWave(real, imag, constraints = undefined) {
+    const prefix = "Failed to execute 'createPeriodicWave' on 'BaseAudioContext'";
+    const contextState = contextRecord(this);
+    webidl.requiredArguments(arguments.length, 2, prefix);
+    real = convertPeriodicWaveSequence(real, prefix, "Argument 1");
+    imag = convertPeriodicWaveSequence(imag, prefix, "Argument 2");
+    constraints = webidl.converters.PeriodicWaveConstraints(
+      constraints,
+      prefix,
+      "Argument 3",
+    );
+    const wave = webidl.createBranded(PeriodicWave);
+    initializePeriodicWave(
+      wave,
+      contextState,
+      {
+        __proto__: null,
+        real,
+        imag,
+        disableNormalization: constraints.disableNormalization,
+      },
+      "PeriodicWave construction",
+    );
+    return wave;
+  }
+
   createBufferSource() {
     contextRecord(this);
     return new AudioBufferSourceNode(this);
@@ -783,6 +912,7 @@ class OfflineAudioContext extends BaseAudioContext {
     const record = {
       __proto__: null,
       destination: undefined,
+      identity: Symbol("AudioContext identity"),
       native,
       online: false,
       rendering: false,
@@ -893,6 +1023,7 @@ class AudioContext extends BaseAudioContext {
       eventPumpPromise: undefined,
       eventPumpRefed: native.eventPumpRefed,
       eventPumpRetired: false,
+      identity: Symbol("AudioContext identity"),
       native,
       online: true,
       sampleRate: native.sampleRate,
@@ -1354,6 +1485,79 @@ class AudioBufferSourceNode extends AudioScheduledSourceNode {
   }
 }
 
+class ConstantSourceNode extends AudioScheduledSourceNode {
+  constructor(context, options = undefined) {
+    super(constructNode);
+    const prefix = "Failed to construct 'ConstantSourceNode'";
+    webidl.requiredArguments(arguments.length, 1, prefix);
+    const contextState = contextRecord(context);
+    options = webidl.converters.ConstantSourceOptions(options, prefix, "Argument 2");
+    if (!NumberIsFinite(options.offset)) {
+      throw new TypeError("ConstantSourceNode offset must be finite.");
+    }
+    const native = callNative("ConstantSourceNode construction", () =>
+      contextState.native.createConstantSource(options.offset));
+    initializeNode(this, context, native, 0, 1);
+    const record = nodeRecord(this);
+    record.ended = false;
+    record.offset = createParam(context, native.offset());
+    record.started = false;
+  }
+
+  get offset() {
+    return nodeRecord(this).offset;
+  }
+
+  start(when = 0) {
+    const prefix = "Failed to execute 'start' on 'ConstantSourceNode'";
+    const record = nodeRecord(this);
+    when = webidl.converters.double(when, prefix, "Argument 1");
+    if (!NumberIsFinite(when) || when < 0) {
+      throw new RangeError("The start time must be finite and non-negative.");
+    }
+    if (record.started) {
+      throw domException(
+        "A ConstantSourceNode can only be started once.",
+        "InvalidStateError",
+      );
+    }
+    callNative("ConstantSourceNode start", () => record.native.start(when));
+    retainStartedSource(this, record);
+  }
+
+  stop(when = 0) {
+    const prefix = "Failed to execute 'stop' on 'ConstantSourceNode'";
+    const record = nodeRecord(this);
+    when = webidl.converters.double(when, prefix, "Argument 1");
+    if (!NumberIsFinite(when) || when < 0) {
+      throw new RangeError("The stop time must be finite and non-negative.");
+    }
+    if (!record.started) {
+      throw domException(
+        "The ConstantSourceNode has not been started.",
+        "InvalidStateError",
+      );
+    }
+    callNative("ConstantSourceNode stop", () => record.native.stop(when));
+  }
+}
+
+class PeriodicWave {
+  constructor(context, options = undefined) {
+    const prefix = "Failed to construct 'PeriodicWave'";
+    webidl.requiredArguments(arguments.length, 1, prefix);
+    const contextState = contextRecord(context);
+    options = webidl.converters.PeriodicWaveOptions(options, prefix, "Argument 2");
+    this[webidl.brand] = webidl.brand;
+    initializePeriodicWave(
+      this,
+      contextState,
+      options,
+      "PeriodicWave construction",
+    );
+  }
+}
+
 class OscillatorNode extends AudioScheduledSourceNode {
   constructor(context, options = undefined) {
     super(constructNode);
@@ -1362,15 +1566,26 @@ class OscillatorNode extends AudioScheduledSourceNode {
     const contextState = contextRecord(context);
     options = webidl.converters.OscillatorOptions(options, prefix, "Argument 2");
     validateNodeOptions(options, prefix);
-    if (options.type === "custom" || options.periodicWave !== undefined) {
+    let periodicWaveNative;
+    if (options.periodicWave !== undefined) {
+      const wave = periodicWaveRecord(options.periodicWave);
+      if (wave.identity !== contextState.identity) {
+        throw domException(
+          "The PeriodicWave belongs to a different BaseAudioContext.",
+          "InvalidAccessError",
+        );
+      }
+      periodicWaveNative = wave.native;
+    } else if (options.type === "custom") {
       throw domException(
-        "Custom PeriodicWave oscillators are not available in this bounded Web Audio slice.",
-        "NotSupportedError",
+        "A custom oscillator type requires a PeriodicWave.",
+        "InvalidStateError",
       );
     }
     const native = callNative("OscillatorNode construction", () =>
       contextState.native.createOscillator(
         oscillatorTypeCode(options.type),
+        periodicWaveNative,
         options.frequency,
         options.detune,
         options.channelCount,
@@ -1442,13 +1657,18 @@ class OscillatorNode extends AudioScheduledSourceNode {
 
   setPeriodicWave(periodicWave) {
     const prefix = "Failed to execute 'setPeriodicWave' on 'OscillatorNode'";
-    nodeRecord(this);
+    const record = nodeRecord(this);
     webidl.requiredArguments(arguments.length, 1, prefix);
-    webidl.converters.object(periodicWave, prefix, "Argument 1");
-    throw domException(
-      "PeriodicWave is not available in this bounded Web Audio slice.",
-      "NotSupportedError",
-    );
+    periodicWave = convertPeriodicWave(periodicWave, prefix, "Argument 1");
+    const wave = periodicWaveRecord(periodicWave);
+    if (wave.identity !== contextRecord(record.context).identity) {
+      throw domException(
+        "The PeriodicWave belongs to a different BaseAudioContext.",
+        "InvalidAccessError",
+      );
+    }
+    callNative("OscillatorNode PeriodicWave mutation", () =>
+      record.native.setPeriodicWave(wave.native));
   }
 }
 
@@ -1633,6 +1853,10 @@ webidl.configureInterface(AudioScheduledSourceNode);
 const AudioScheduledSourceNodePrototype = AudioScheduledSourceNode.prototype;
 webidl.configureInterface(AudioBufferSourceNode);
 const AudioBufferSourceNodePrototype = AudioBufferSourceNode.prototype;
+webidl.configureInterface(ConstantSourceNode);
+const ConstantSourceNodePrototype = ConstantSourceNode.prototype;
+webidl.configureInterface(PeriodicWave);
+const PeriodicWavePrototype = PeriodicWave.prototype;
 webidl.configureInterface(OscillatorNode);
 const OscillatorNodePrototype = OscillatorNode.prototype;
 webidl.configureInterface(AudioParam);
@@ -1656,6 +1880,10 @@ webidl.converters.AudioParam = webidl.createInterfaceConverter(
   "AudioParam",
   AudioParamPrototype,
 );
+webidl.converters.PeriodicWave = webidl.createInterfaceConverter(
+  "PeriodicWave",
+  PeriodicWavePrototype,
+);
 
 const publicPrototypes = [
   BaseAudioContextPrototype,
@@ -1666,6 +1894,8 @@ const publicPrototypes = [
   GainNodePrototype,
   AudioScheduledSourceNodePrototype,
   AudioBufferSourceNodePrototype,
+  ConstantSourceNodePrototype,
+  PeriodicWavePrototype,
   OscillatorNodePrototype,
   AudioParamPrototype,
   OfflineAudioCompletionEventPrototype,
@@ -1677,6 +1907,7 @@ for (let i = 0; i < publicPrototypes.length; ++i) {
 export {
   AudioContext,
   AudioBufferSourceNode,
+  ConstantSourceNode,
   AudioDestinationNode,
   AudioNode,
   AudioParam,
@@ -1686,4 +1917,5 @@ export {
   OfflineAudioCompletionEvent,
   OfflineAudioContext,
   OscillatorNode,
+  PeriodicWave,
 };

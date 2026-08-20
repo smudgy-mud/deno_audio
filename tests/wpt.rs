@@ -394,6 +394,7 @@ async fn pinned_wpt_subset_matches_reviewed_expectations() {
     let expected_categories = HashSet::from([
         "constructors",
         "AudioBuffer",
+        "PeriodicWave",
         "connect/disconnect",
         "offline rendering",
     ]);

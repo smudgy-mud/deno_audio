@@ -90,6 +90,332 @@ fn wait_for_online_retirement(host: &AudioHost) {
     }
 }
 
+fn collect_until_online_audio_bytes_retire(runtime: &mut JsRuntime, host: &AudioHost) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        runtime
+            .v8_isolate()
+            .request_garbage_collection_for_testing(deno_core::v8::GarbageCollectionType::Full);
+        if host.usage().live_audio_bytes() == 0 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "online PeriodicWave storage did not retire: {:?}",
+            host.usage()
+        );
+        std::thread::yield_now();
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_online_constant_source_and_periodic_wave_share_exact_rooting() {
+    let host = Arc::new(AudioHost::default());
+    let mut runtime = runtime_with_options(
+        AudioExtensionOptions::new(Arc::clone(&host))
+            .limits(AudioLimits::unlimited())
+            .output_factory(Arc::new(SystemAudioOutput::new()))
+            .event_pump_liveness(AudioEventPumpLiveness::Ref),
+    );
+    runtime
+        .execute_script(
+            "phase2_online_constant_periodic.js",
+            r#"
+              globalThis.__phase2OnlineSources = (async () => {
+                const assert = (condition, message) => {
+                  if (!condition) throw new Error(message);
+                };
+                const context = new AudioContext({ sinkId: { type: "none" } });
+                const other = new AudioContext({ sinkId: { type: "none" } });
+                const wave = context.createPeriodicWave(
+                  new Float32Array([0, 0]),
+                  new Float32Array([0, 1]),
+                );
+                assert(wave instanceof PeriodicWave, "factory PeriodicWave result");
+                const replacement = new PeriodicWave(context, {
+                  real: [0, 0, 0],
+                  imag: [0, 1, 0.25],
+                });
+                const oscillator = new OscillatorNode(context, {
+                  type: "sine",
+                  periodicWave: wave,
+                  frequency: 220,
+                });
+                assert(oscillator.type === "custom", "custom constructor mirror");
+                oscillator.setPeriodicWave(replacement);
+                assert(oscillator.type === "custom", "runtime custom mirror");
+                let foreign;
+                try {
+                  new OscillatorNode(other, { periodicWave: replacement });
+                } catch (error) { foreign = error; }
+                assert(foreign?.name === "InvalidAccessError",
+                  "foreign online PeriodicWave must reject");
+                const otherWave = other.createPeriodicWave(
+                  new Float32Array([0, 0]),
+                  new Float32Array([0, 1]),
+                );
+                foreign = undefined;
+                try { oscillator.setPeriodicWave(otherWave); }
+                catch (error) { foreign = error; }
+                assert(foreign?.name === "InvalidAccessError",
+                  "foreign runtime PeriodicWave must reject before mutation");
+
+                const constant = new ConstantSourceNode(context, { offset: -0.5 });
+                assert(constant instanceof AudioScheduledSourceNode &&
+                    constant.offset.value === -0.5,
+                  "ConstantSource constructor and offset");
+                constant.offset.value = 0.125;
+                assert(constant.offset.value === 0.125, "exact offset mutation");
+                oscillator.connect(context.destination);
+                constant.connect(context.destination);
+                const oscillatorEnded = new Promise((resolve) => {
+                  oscillator.onended = resolve;
+                });
+                const constantEnded = new Promise((resolve) => {
+                  constant.onended = resolve;
+                });
+                const now = context.currentTime;
+                oscillator.start(now);
+                oscillator.stop(now + 0.01);
+                constant.start(now);
+                constant.stop(now + 0.01);
+                await Promise.all([oscillatorEnded, constantEnded]);
+                assert(oscillator.__proto__ !== constant.__proto__,
+                  "source interfaces remain distinct");
+                await other.close();
+                await context.close();
+                globalThis.__phase2OnlineSourcesDone = true;
+              })().catch((error) => {
+                globalThis.__phase2OnlineSourcesError = error;
+              });
+            "#,
+        )
+        .expect("online ConstantSource/PeriodicWave scenario should start");
+    runtime
+        .run_event_loop(deno_core::PollEventLoopOptions::default())
+        .await
+        .expect("online ConstantSource/PeriodicWave scenario should settle");
+    runtime
+        .execute_script(
+            "phase2_online_constant_periodic_result.js",
+            "if (globalThis.__phase2OnlineSourcesError !== undefined) throw globalThis.__phase2OnlineSourcesError; if (globalThis.__phase2OnlineSourcesDone !== true) throw new Error('online source scenario did not finish'); globalThis.__phase2OnlineSources = undefined; globalThis.__phase2OnlineSourcesError = undefined;",
+        )
+        .expect("online ConstantSource/PeriodicWave scenario should finish");
+    wait_for_online_retirement(&host);
+    collect_until_online_audio_bytes_retire(&mut runtime, &host);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn surviving_periodic_wave_does_not_retain_its_online_context_owner() {
+    const TABLE_BYTES: usize = 32 * 1024;
+    let host = Arc::new(AudioHost::default());
+    let mut runtime = runtime(Arc::clone(&host), AudioLimits::unlimited());
+    runtime
+        .execute_script(
+            "phase2_online_wave_weak_context.js",
+            r#"
+              globalThis.__phase2SurvivingWave = (() => {
+                const context = new AudioContext({ sinkId: { type: "none" } });
+                return new PeriodicWave(context, {
+                  real: [0, 0], imag: [0, 1],
+                });
+              })();
+            "#,
+        )
+        .expect("PeriodicWave should not require a retained context wrapper");
+    assert_eq!(host.usage().live_audio_bytes(), TABLE_BYTES);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        runtime
+            .v8_isolate()
+            .request_garbage_collection_for_testing(deno_core::v8::GarbageCollectionType::Full);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        runtime
+            .run_event_loop(deno_core::PollEventLoopOptions::default())
+            .await
+            .expect("the collected PeriodicWave context should retire cleanly");
+        if host.usage().online_contexts() == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a surviving PeriodicWave retained its AudioContext: {:?}",
+            host.usage()
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(host.usage().live_audio_bytes(), TABLE_BYTES);
+    runtime
+        .execute_script(
+            "phase2_online_wave_release.js",
+            "globalThis.__phase2SurvivingWave = undefined;",
+        )
+        .unwrap();
+    collect_until_online_audio_bytes_retire(&mut runtime, &host);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn constant_source_initial_offset_fits_its_exact_four_command_transaction() {
+    let host = Arc::new(AudioHost::new(
+        AudioHostLimits::default()
+            .max_graph_nodes(Some(13))
+            .max_queued_control_commands(Some(25)),
+    ));
+    let limits = AudioLimits::unlimited()
+        .max_graph_nodes(Some(13))
+        .max_queued_control_commands(Some(25));
+    let mut runtime = runtime(Arc::clone(&host), limits);
+    runtime
+        .execute_script(
+            "phase2_constant_source_exact_construction.js",
+            r#"
+              globalThis.__phase2ConstantContext = new AudioContext({
+                sampleRate: 48000,
+                sinkId: "none",
+              });
+              globalThis.__phase2ConstantFillers = [
+                globalThis.__phase2ConstantContext.createOscillator(),
+                globalThis.__phase2ConstantContext.createOscillator(),
+                globalThis.__phase2ConstantContext.createOscillator(),
+              ];
+              globalThis.__phase2Constant = new ConstantSourceNode(
+                globalThis.__phase2ConstantContext,
+                { offset: 0.75 },
+              );
+              if (globalThis.__phase2Constant.offset.value !== 0.75) {
+                throw new Error("initial ConstantSource offset was not atomic");
+              }
+              let quota;
+              try {
+                new ConstantSourceNode(globalThis.__phase2ConstantContext);
+              } catch (error) { quota = error; }
+              if (quota?.name !== "QuotaExceededError") {
+                throw new Error(`expected exact second-source refusal, got ${quota}`);
+              }
+            "#,
+        )
+        .expect("the exact ConstantSource construction boundary should be public");
+    let usage = host.usage();
+    assert_eq!(usage.graph_nodes(), 11);
+    assert_eq!(usage.queued_control_commands(), 25);
+
+    runtime
+        .execute_script(
+            "phase2_constant_source_exact_close.js",
+            r"
+              globalThis.__phase2ConstantClose = (async () => {
+                await globalThis.__phase2ConstantContext.close();
+                globalThis.__phase2Constant = undefined;
+                globalThis.__phase2ConstantFillers = undefined;
+                globalThis.__phase2ConstantContext = undefined;
+              })();
+            ",
+        )
+        .expect("the bounded ConstantSource context should begin closing");
+    runtime
+        .run_event_loop(deno_core::PollEventLoopOptions::default())
+        .await
+        .expect("the bounded ConstantSource context should close");
+    wait_for_online_retirement(&host);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn staged_periodic_wave_replacement_retains_both_tables_until_resume() {
+    const TABLE_BYTES: usize = 32 * 1024;
+    let host = Arc::new(AudioHost::default());
+    let mut runtime = runtime(Arc::clone(&host), AudioLimits::unlimited());
+    runtime
+        .execute_script(
+            "phase2_periodic_wave_stage_suspend.js",
+            r#"
+              globalThis.__phase2WaveContext = new AudioContext({
+                sampleRate: 48000,
+                sinkId: "none",
+              });
+              globalThis.__phase2WaveSuspend = (async () => {
+                await globalThis.__phase2WaveContext.suspend();
+                globalThis.__phase2WaveSuspended = true;
+              })();
+            "#,
+        )
+        .expect("the PeriodicWave staging context should begin suspending");
+    runtime
+        .run_event_loop(deno_core::PollEventLoopOptions::default())
+        .await
+        .expect("the PeriodicWave staging context should suspend");
+    runtime
+        .execute_script(
+            "phase2_periodic_wave_stage_commands.js",
+            r#"
+              if (globalThis.__phase2WaveSuspended !== true) {
+                throw new Error("PeriodicWave commands were not staged after Suspend");
+              }
+              (() => {
+                let initial = new PeriodicWave(globalThis.__phase2WaveContext, {
+                  real: [0, 0], imag: [0, 1],
+                });
+                let replacement = new PeriodicWave(globalThis.__phase2WaveContext, {
+                  real: [0, 0, 0], imag: [0, 1, 0.25],
+                });
+                const oscillator = new OscillatorNode(
+                  globalThis.__phase2WaveContext,
+                  { periodicWave: initial, frequency: 440 },
+                );
+                oscillator.setPeriodicWave(replacement);
+                oscillator.connect(globalThis.__phase2WaveContext.destination);
+                globalThis.__phase2WaveEndedCount = 0;
+                oscillator.onended = () => globalThis.__phase2WaveEndedCount++;
+                oscillator.start(0);
+                oscillator.stop(0.02);
+                globalThis.__phase2WaveOscillator = oscillator;
+                initial = undefined;
+                replacement = undefined;
+              })();
+            "#,
+        )
+        .expect("custom construction and replacement should stage in FIFO order");
+    for _ in 0..3 {
+        runtime
+            .v8_isolate()
+            .request_garbage_collection_for_testing(deno_core::v8::GarbageCollectionType::Full);
+    }
+    assert_eq!(host.usage().live_audio_bytes(), 2 * TABLE_BYTES);
+
+    runtime
+        .execute_script(
+            "phase2_periodic_wave_stage_resume.js",
+            r"
+              globalThis.__phase2WaveResume = (async () => {
+                await globalThis.__phase2WaveContext.resume();
+                while (globalThis.__phase2WaveContext.currentTime < 0.05) {}
+                await globalThis.__phase2WaveContext.close();
+                if (globalThis.__phase2WaveEndedCount !== 1) {
+                  throw new Error(
+                    `expected one staged ended event, got ${globalThis.__phase2WaveEndedCount}`,
+                  );
+                }
+                globalThis.__phase2WaveOscillator = undefined;
+                globalThis.__phase2WaveContext = undefined;
+                globalThis.__phase2WaveDone = true;
+              })();
+            ",
+        )
+        .expect("the staged PeriodicWave context should begin resuming");
+    runtime
+        .run_event_loop(deno_core::PollEventLoopOptions::default())
+        .await
+        .expect("the staged PeriodicWave source should finish and close");
+    runtime
+        .execute_script(
+            "phase2_periodic_wave_stage_result.js",
+            "if (globalThis.__phase2WaveDone !== true) throw new Error('staged PeriodicWave scenario did not finish');",
+        )
+        .expect("the staged PeriodicWave scenario should finish");
+    wait_for_online_retirement(&host);
+    collect_until_online_audio_bytes_retire(&mut runtime, &host);
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[allow(
     clippy::too_many_lines,
@@ -163,7 +489,7 @@ async fn public_online_graph_runs_lifecycle_and_exact_ended() {
                 assert(gain.gain.value === 0.25, "rejected automation was inert");
                 throws(
                   () => new OscillatorNode(context, { type: "custom" }),
-                  "NotSupportedError",
+                  "InvalidStateError",
                 );
 
                 assert(oscillator.connect(gain) === gain, "connect result");
@@ -840,5 +1166,75 @@ async fn an_unstarted_public_source_is_not_rooted_by_the_context() {
         .run_event_loop(deno_core::PollEventLoopOptions::default())
         .await
         .expect("context close should settle after source collection");
+    wait_for_online_retirement(&host);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_started_constant_source_outlives_its_wrapper_until_exact_completion() {
+    let host = Arc::new(AudioHost::default());
+    let mut runtime = runtime(Arc::clone(&host), AudioLimits::unlimited());
+    runtime
+        .execute_script(
+            "phase2_constant_source_root.js",
+            r#"
+              globalThis.__phase2ConstantRootContext = new AudioContext({
+                sampleRate: 48000,
+                sinkId: "none",
+              });
+              globalThis.__phase2ConstantRootEnded = 0;
+              (() => {
+                const source = new ConstantSourceNode(
+                  globalThis.__phase2ConstantRootContext,
+                  { offset: -0.375 },
+                );
+                source.connect(globalThis.__phase2ConstantRootContext.destination);
+                source.onended = () => globalThis.__phase2ConstantRootEnded++;
+                source.start();
+                source.stop(0.02);
+              })();
+            "#,
+        )
+        .expect("a finite ConstantSource should start without an external wrapper root");
+    assert_eq!(host.usage().scheduled_sources(), 1);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while host.usage().scheduled_sources() != 0 {
+        runtime
+            .run_event_loop(deno_core::PollEventLoopOptions::default())
+            .await
+            .expect("the ConstantSource completion pump should remain healthy");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            Instant::now() < deadline,
+            "native ConstantSource completion did not release its root"
+        );
+    }
+
+    runtime
+        .execute_script(
+            "phase2_constant_source_root_close.js",
+            r"
+              globalThis.__phase2ConstantRootClose = (async () => {
+                await globalThis.__phase2ConstantRootContext.close();
+                if (globalThis.__phase2ConstantRootEnded !== 1) {
+                  throw new Error(
+                    `ConstantSource ended reconciliation mismatch: ${globalThis.__phase2ConstantRootEnded}`,
+                  );
+                }
+                globalThis.__phase2ConstantRootDone = true;
+              })();
+            ",
+        )
+        .expect("the ConstantSource context should begin closing");
+    runtime
+        .run_event_loop(deno_core::PollEventLoopOptions::default())
+        .await
+        .expect("the ConstantSource context should close");
+    runtime
+        .execute_script(
+            "phase2_constant_source_root_result.js",
+            "if (globalThis.__phase2ConstantRootDone !== true) throw new Error('ConstantSource root scenario did not finish');",
+        )
+        .expect("the ConstantSource completion should dispatch exactly once");
     wait_for_online_retirement(&host);
 }

@@ -16,11 +16,12 @@ use web_audio_api::context::{
 use web_audio_api::node::{ChannelCountMode, ChannelInterpretation, OscillatorType};
 use web_audio_api::output::AudioOutputFactory;
 
+use crate::buffer::NativeAudioByteBudget;
 use crate::host::{
     release_atomic, AudioHost, AudioHostLimitError, AudioHostOnlineContextPermit,
     AudioHostReservation, AudioHostResourceKind,
 };
-use crate::node::{NativeAudioNode, OnlineGraph};
+use crate::node::{NativeAudioNode, NativePeriodicWave, OnlineGraph};
 use crate::options::{AudioEventPumpLiveness, AudioLimits, AudioPermissions};
 use crate::scheduled::ContextEventHub;
 
@@ -573,8 +574,9 @@ fn oscillator_type(value: u32) -> Result<OscillatorType, JsErrorBox> {
         1 => Ok(OscillatorType::Square),
         2 => Ok(OscillatorType::Sawtooth),
         3 => Ok(OscillatorType::Triangle),
+        4 => Ok(OscillatorType::Custom),
         _ => Err(JsErrorBox::generic(
-            "InvalidStateError: custom oscillator type is unavailable",
+            "InvalidStateError: unknown oscillator type",
         )),
     }
 }
@@ -598,6 +600,13 @@ fn install_state_wake_handler(
     })
 }
 
+fn runtime_resources(state: &OpState) -> (Arc<AudioRuntimeState>, Arc<NativeAudioByteBudget>) {
+    (
+        Arc::clone(state.borrow::<Arc<AudioRuntimeState>>()),
+        Arc::clone(state.borrow::<Arc<NativeAudioByteBudget>>()),
+    )
+}
+
 #[op2]
 impl NativePhase0OnlineContext {
     #[constructor]
@@ -610,7 +619,7 @@ impl NativePhase0OnlineContext {
         latency_hint: Option<u32>,
         custom_latency: Option<f64>,
     ) -> Result<NativePhase0OnlineContext, JsErrorBox> {
-        let runtime = Arc::clone(state.borrow::<Arc<AudioRuntimeState>>());
+        let (runtime, byte_budget) = runtime_resources(state);
         validate_online_dimensions(&runtime, sample_rate)?;
         let options =
             exact_context_options(&runtime, sample_rate, sink_id, latency_hint, custom_latency)?;
@@ -718,7 +727,7 @@ impl NativePhase0OnlineContext {
             context: Mutex::new(Some(Arc::new(context))),
             event_hub,
         });
-        let graph = OnlineGraph::new(Arc::clone(&state), Arc::clone(&runtime));
+        let graph = OnlineGraph::new(Arc::clone(&state), Arc::clone(&runtime), byte_budget);
         Ok(NativePhase0OnlineContext { state, graph })
     }
 
@@ -801,9 +810,31 @@ impl NativePhase0OnlineContext {
     }
 
     #[cppgc]
+    fn create_constant_source(&self, offset: f32) -> Result<NativeAudioNode, JsErrorBox> {
+        self.graph.create_constant_source(offset)
+    }
+
+    #[cppgc]
+    fn create_periodic_wave(
+        &self,
+        #[buffer] real: &[f32],
+        real_present: bool,
+        #[buffer] imag: &[f32],
+        imag_present: bool,
+        disable_normalization: bool,
+    ) -> Result<NativePeriodicWave, JsErrorBox> {
+        self.graph.create_periodic_wave(
+            real_present.then_some(real),
+            imag_present.then_some(imag),
+            disable_normalization,
+        )
+    }
+
+    #[cppgc]
     fn create_oscillator(
         &self,
         oscillator_type_value: u32,
+        #[cppgc] periodic_wave: Option<&NativePeriodicWave>,
         frequency: f32,
         detune: f32,
         channel_count: u32,
@@ -812,6 +843,7 @@ impl NativePhase0OnlineContext {
     ) -> Result<NativeAudioNode, JsErrorBox> {
         self.graph.create_oscillator(
             oscillator_type(oscillator_type_value)?,
+            periodic_wave,
             frequency,
             detune,
             channel_count as usize,
