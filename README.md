@@ -5,19 +5,19 @@ A [Web Audio API](https://webaudio.github.io/web-audio-api/) extension for
 standard Web Platform extensions, delegating DSP and rendering to
 the [Smudgy `web-audio-api-rs` fork](https://github.com/smudgy-mud/web-audio-api-rs).
 
-**Status: Phase 2 in progress and unreleased.** The native engine, bounded
-ownership model, and hosted silent/CPAL/Cubeb output paths have passed their
-Phase 0 acceptance gates, and the deterministic Phase 1 offline graph is
-complete. The extension now also exposes the first production-bounded online
-slice: `AudioContext`, destination, `GainNode`, fixed and custom-wave
+**Status: `0.1.0-alpha.1`.** The native engine, bounded ownership model, and
+hosted silent/CPAL/Cubeb output paths have passed their Phase 0 acceptance
+gates. The deterministic Phase 1 offline graph and the planned Phase 2 useful
+online playback MVP are complete. This alpha exposes `AudioContext`,
+destination, `GainNode`, fixed and custom-wave
 `OscillatorNode`, `PeriodicWave`, `ConstantSourceNode`,
 `AudioBufferSourceNode`, scalar `AudioParam.value`, explicit connections,
 lifecycle methods, `statechange`, exactly-once `ended`, and bounded off-isolate
 `decodeAudioData` with both promise and legacy callback forms. The same
 JavaScript surface renders through built-in system output or an
 embedder-supplied `AudioOutputFactory`. Online parameter automation, additional
-node families, and full browser conformance remain later Phase 2/3 slices, so
-this is not yet a complete Web Audio API.
+node families, and full browser conformance remain later releases, so this is
+not yet a complete Web Audio API.
 
 Same-context `suspend()` and `resume()` calls enter one FIFO coordinator before
 native admission. An accepted transition remains owned after its JavaScript
