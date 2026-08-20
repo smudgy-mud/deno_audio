@@ -650,7 +650,7 @@ dependencies = [
 
 [[package]]
 name = "deno_audio"
-version = "0.0.1"
+version = "0.1.0-alpha.1"
 dependencies = [
  "deno_core",
  "deno_error",

@@ -164,10 +164,9 @@ remain available only through unsafe native exposure in tests and are not a
 supported JavaScript API. Public code should use `OfflineAudioContext` for
 deterministic rendering and `AudioContext` for the supported audible subset.
 
-The engine revision is currently available only in the maintainer's local fork
-history. A fresh external checkout cannot resolve the canonical Git dependency
-until that exact reviewed revision is published; no moving branch is an
-acceptable substitute.
+Published revisions of this crate resolve the engine through the exact Git
+commit named above. No moving branch is an acceptable substitute for that
+reviewed dependency tuple.
 
 Phase 0 evidence is recorded in [`research/upstream-baseline.md`](research/upstream-baseline.md)
 and [`research/existing-deno-audio-packages.md`](research/existing-deno-audio-packages.md).

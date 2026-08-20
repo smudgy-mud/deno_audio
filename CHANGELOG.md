@@ -8,6 +8,8 @@ Web Audio surface.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.1] - 2026-08-19
+
 ### Added
 
 - The first public online Web Audio slice: `AudioContext`, destination, Gain,
@@ -56,6 +58,15 @@ Web Audio surface.
   `web-audio-api` 1.7.0 seams.
 - Exact-version buy-versus-build survey of existing Deno audio packages.
 - Cross-platform baseline CI and dependency-source/license policy.
+
+### Compatibility
+
+- Requires Rust 1.91 or newer and the coordinated Deno dependency tuple
+  `deno_core` 0.410.0, `deno_webidl` 0.257.0, `deno_web` 0.288.0,
+  `deno_error` 0.7.1, and `serde_v8` 0.319.0.
+- Pins `smudgy-mud/web-audio-api-rs` commit
+  `d0e967a136472389312c475ac1851b6836ad7292`, based on
+  `web-audio-api` 1.7.0.
 
 ## [0.0.1]
 
