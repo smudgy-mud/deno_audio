@@ -53,6 +53,9 @@ Web Audio surface.
 - Phase 0 repository skeleton and provenance records.
 - Exact Deno 2.9.5-compatible dependency tuple.
 - Exact-revision Git dependency on the Smudgy `web-audio-api-rs` fork.
+- Direct re-exports of the fork's neutral hosted-output contracts, allowing an
+  embedder to implement a logical output factory without adding its own direct
+  engine dependency or creating wrapper type identities.
 - Empty-extension `JsRuntime` compatibility smoke test.
 - Silent/offline executable characterizations of the five blocking
   `web-audio-api` 1.7.0 seams.

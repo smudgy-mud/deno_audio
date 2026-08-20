@@ -109,6 +109,13 @@ The audio fork is intentionally a pinned Git dependency and has no separate
 crates.io identity. Consequently, functional `deno_audio` versions are consumed
 from this repository at an immutable tag or revision rather than from crates.io.
 
+Embedders that provide a shared logical mixer can implement the re-exported
+`AudioOutputFactory`, `PreparedAudioOutput`, and `RunningAudioOutput` contracts
+using only `deno_audio`'s public API. These names are direct aliases of the
+pinned engine contracts, not wrapper traits, so
+`AudioExtensionOptions::output_factory` accepts the implementation without a
+second public type boundary.
+
 The selected engine compiles its complete Symphonia decoder set unconditionally:
 AAC, ADPCM, ALAC, FLAC, MPEG layers I/II/III, PCM, and Vorbis, with AIFF, CAF,
 ISO MP4/M4A, Matroska/WebM, Ogg, and WAV containers. These are native dependency

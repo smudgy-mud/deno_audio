@@ -25,6 +25,14 @@ pub use options::{
     AllowAllAudioPermissions, AudioEventPumpLiveness, AudioExtensionOptions, AudioLimits,
     AudioPermissions,
 };
+pub use web_audio_api::context::{AudioContextLatencyCategory, AudioContextRenderSizeCategory};
+pub use web_audio_api::output::{
+    AudioOutputConfig, AudioOutputContextId, AudioOutputDeathReason, AudioOutputEndpointShutdown,
+    AudioOutputError, AudioOutputErrorKind, AudioOutputEvent, AudioOutputEventSink,
+    AudioOutputFactory, AudioOutputRequest, AudioOutputStartFailure, AudioRenderCallback,
+    AudioRenderFormat, AudioRenderStatus, PreparedAudioOutput, RunningAudioOutput,
+    SystemAudioOutput, MAX_AUDIO_OUTPUT_CALLBACK_FRAMES,
+};
 
 deno_core::extension!(
     deno_audio,
