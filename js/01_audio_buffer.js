@@ -6,8 +6,8 @@ import {
   primordials,
   webidl,
 } from "ext:deno_audio/00_webidl.js";
+import { NativeAudioBuffer } from "ext:core/ops";
 
-const { NativeAudioBuffer } = core.ops;
 const { markNotSerializable } = core.loadExtScript(
   "ext:deno_web/13_message_port.js",
 );

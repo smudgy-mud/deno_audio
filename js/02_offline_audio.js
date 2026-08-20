@@ -11,8 +11,18 @@ import {
   createAudioBuffer,
   getNativeAudioBuffer,
 } from "ext:deno_audio/01_audio_buffer.js";
+import {
+  NativeOfflineAudioContext,
+  NativePhase0DecodeRequest,
+  NativePhase0OnlineContext,
+  op_decode_audio_data,
+  op_offline_start_rendering,
+  op_online_wait_events,
+  op_phase0_online_close,
+  op_phase0_online_resume,
+  op_phase0_online_suspend,
+} from "ext:core/ops";
 
-const { NativeOfflineAudioContext, NativePhase0OnlineContext } = core.ops;
 const { markNotSerializable } = core.loadExtScript(
   "ext:deno_web/13_message_port.js",
 );
@@ -647,7 +657,7 @@ async function pumpOnlineEvents(contextRef, native, refed) {
       let batch;
       let pending;
       try {
-        pending = core.ops.op_online_wait_events(native);
+        pending = op_online_wait_events(native);
         if (!refed) core.unrefOpPromise(pending);
         publishOnlineEventWait(contextRef, pending);
         batch = await pending;
@@ -715,11 +725,11 @@ function attachDecodeCallbacks(promise, successCallback, errorCallback) {
 
 async function decodeAudioBuffer(record, encoded) {
   try {
-    const request = new core.ops.NativePhase0DecodeRequest(
+    const request = new NativePhase0DecodeRequest(
       new Uint8Array(encoded),
       record.sampleRate,
     );
-    return createAudioBuffer(await core.ops.op_decode_audio_data(request));
+    return createAudioBuffer(await op_decode_audio_data(request));
   } catch (error) {
     if (StringPrototypeIncludes(String(error), "audio decode failed")) {
       throw domException("Unable to decode audio data.", "EncodingError");
@@ -939,7 +949,7 @@ class OfflineAudioContext extends BaseAudioContext {
     record.rendering = true;
     let rendering;
     try {
-      rendering = core.ops.op_offline_start_rendering(record.native);
+      rendering = op_offline_start_rendering(record.native);
     } catch (error) {
       record.rendering = false;
       rethrowNativeError(error, "OfflineAudioContext rendering");
@@ -1058,7 +1068,7 @@ class AudioContext extends BaseAudioContext {
       throw domException("The AudioContext is closed.", "InvalidStateError");
     }
     try {
-      await core.ops.op_phase0_online_suspend(record.native);
+      await op_phase0_online_suspend(record.native);
     } catch (error) {
       updateOnlineState(this, record);
       rethrowNativeError(error, "AudioContext suspend");
@@ -1072,7 +1082,7 @@ class AudioContext extends BaseAudioContext {
       throw domException("The AudioContext is closed.", "InvalidStateError");
     }
     try {
-      await core.ops.op_phase0_online_resume(record.native);
+      await op_phase0_online_resume(record.native);
     } catch (error) {
       updateOnlineState(this, record);
       rethrowNativeError(error, "AudioContext resume");
@@ -1095,7 +1105,7 @@ async function closeOnlineContext(context, record) {
     core.refOpPromise(record.eventPumpPending);
   }
   try {
-    await core.ops.op_phase0_online_close(record.native);
+    await op_phase0_online_close(record.native);
   } catch (error) {
     record.eventPumpClosing = false;
     if (!record.eventPumpRefed && record.eventPumpPending !== undefined) {
