@@ -282,6 +282,32 @@ impl NativeOfflineAudioContext {
             channel_interpretation(interpretation)?,
         )
     }
+
+    #[cppgc]
+    #[allow(clippy::too_many_arguments)]
+    fn create_buffer_source(
+        &self,
+        detune: f32,
+        loop_: bool,
+        loop_start: f64,
+        loop_end: f64,
+        playback_rate: f32,
+        channel_count: u32,
+        count_mode: u32,
+        interpretation: u32,
+    ) -> Result<NativeAudioNode, JsErrorBox> {
+        let max_channels = u32::try_from(web_audio_api::MAX_CHANNELS)
+            .expect("the native maximum channel count fits u32");
+        if !(1..=max_channels).contains(&channel_count) {
+            return Err(JsErrorBox::generic(
+                "NotSupportedError: channelCount is outside the supported range",
+            ));
+        }
+        let _ = channel_count_mode(count_mode)?;
+        let _ = channel_interpretation(interpretation)?;
+        self.graph
+            .create_buffer_source(detune, loop_, loop_start, loop_end, playback_rate)
+    }
 }
 
 struct PublicOfflineRenderPayload {

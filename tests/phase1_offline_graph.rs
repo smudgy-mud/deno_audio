@@ -80,6 +80,126 @@ fn collect_until_all_public_graph_resources_retire(runtime: &mut JsRuntime, host
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn public_offline_buffer_source_acquires_pcm_and_renders_once() {
+    let host = Arc::new(AudioHost::default());
+    let mut runtime = runtime(Arc::clone(&host), AudioLimits::unlimited());
+    runtime
+        .execute_script(
+            "phase3_offline_buffer_source.js",
+            r#"
+              globalThis.__phase3OfflineBuffer = (async () => {
+                const assert = (condition, message) => {
+                  if (!condition) throw new Error(message);
+                };
+                const context = new OfflineAudioContext(1, 8, 3000);
+                const buffer = context.createBuffer(1, 8, 3000);
+                const exposed = buffer.getChannelData(0);
+                exposed[0] = 0.25;
+                exposed[1] = -0.5;
+                const source = context.createBufferSource();
+                assert(source instanceof AudioBufferSourceNode,
+                  "createBufferSource result");
+                assert(source instanceof AudioScheduledSourceNode,
+                  "BufferSource inheritance");
+                source.buffer = buffer;
+                assert(exposed.length === 0, "buffer assignment acquired exposed PCM");
+                assert(source.buffer === buffer, "buffer identity");
+                assert(source.playbackRate.value === 1 && source.detune.value === 0,
+                  "BufferSource AudioParams");
+                source.loopStart = 0.001;
+                source.loopEnd = 0.002;
+                source.loop = true;
+                assert(source.loop && source.loopStart === 0.001 &&
+                    source.loopEnd === 0.002, "BufferSource loop mirrors");
+                source.loop = false;
+                let duplicateBuffer;
+                try { source.buffer = buffer; } catch (error) { duplicateBuffer = error; }
+                assert(duplicateBuffer?.name === "InvalidStateError",
+                  "second bounded buffer assignment must reject");
+                source.connect(context.destination);
+                let ended = 0;
+                source.onended = () => ended++;
+                source.start();
+                let duplicateStart;
+                try { source.start(); } catch (error) { duplicateStart = error; }
+                assert(duplicateStart?.name === "InvalidStateError",
+                  "duplicate BufferSource start must reject");
+                const rendered = await context.startRendering();
+                const output = rendered.getChannelData(0);
+                assert(Math.abs(output[0] - 0.25) < 0.00001,
+                  `first sample mismatch: ${output[0]}`);
+                assert(Math.abs(output[1] + 0.5) < 0.00001,
+                  `second sample mismatch: ${output[1]}`);
+                assert(ended === 1, `expected one ended event, got ${ended}`);
+                globalThis.__phase3OfflineBufferDone = true;
+              })();
+            "#,
+        )
+        .expect("offline BufferSource scenario should start");
+    runtime
+        .run_event_loop(deno_core::PollEventLoopOptions::default())
+        .await
+        .expect("offline BufferSource scenario should settle");
+    runtime
+        .execute_script(
+            "phase3_offline_buffer_source_result.js",
+            "if (globalThis.__phase3OfflineBufferDone !== true) throw new Error('offline BufferSource did not finish');",
+        )
+        .expect("offline BufferSource scenario should finish");
+    collect_until_all_public_graph_resources_retire(&mut runtime, &host);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_offline_buffer_source_routes_loop_boundaries_into_rendering() {
+    let host = Arc::new(AudioHost::default());
+    let mut runtime = runtime(Arc::clone(&host), AudioLimits::unlimited());
+    runtime
+        .execute_script(
+            "phase3_offline_buffer_source_loop.js",
+            r"
+              globalThis.__phase3OfflineLoop = (async () => {
+                const context = new OfflineAudioContext(1, 6, 3000);
+                const buffer = context.createBuffer(1, 4, 3000);
+                buffer.copyToChannel(new Float32Array([0.1, 0.2, 0.3, 0.4]), 0);
+                const source = new AudioBufferSourceNode(context, { buffer });
+                source.loop = true;
+                source.loopStart = 1 / 3000;
+                source.loopEnd = 3 / 3000;
+                source.connect(context.destination);
+                source.start(0, 0, 6 / 3000);
+                const rendered = await context.startRendering();
+                const actual = rendered.getChannelData(0);
+                // The selected engine interpolates at loop points using the
+                // following sample. This sequence distinguishes the requested
+                // inner loop from a whole-buffer repeat while pinning that
+                // native convention at the public boundary.
+                const expected = [0.1, 0.2, 0.3, 0.4, 0.3, 0.4];
+                for (let i = 0; i < expected.length; ++i) {
+                  if (Math.abs(actual[i] - expected[i]) > 0.00001) {
+                    throw new Error(
+                      `loop sample ${i} mismatch: expected ${expected[i]}, got ${actual[i]}; all=${Array.from(actual)}`,
+                    );
+                  }
+                }
+                globalThis.__phase3OfflineLoopDone = true;
+              })();
+            ",
+        )
+        .expect("offline BufferSource loop scenario should start");
+    runtime
+        .run_event_loop(deno_core::PollEventLoopOptions::default())
+        .await
+        .expect("offline BufferSource loop scenario should settle");
+    runtime
+        .execute_script(
+            "phase3_offline_buffer_source_loop_result.js",
+            "if (globalThis.__phase3OfflineLoopDone !== true) throw new Error('offline BufferSource loop did not finish');",
+        )
+        .expect("offline BufferSource loop scenario should finish");
+    collect_until_all_public_graph_resources_retire(&mut runtime, &host);
+}
+
+#[tokio::test(flavor = "current_thread")]
 #[allow(
     clippy::too_many_lines,
     reason = "one embedded JavaScript scenario keeps the related Web IDL hierarchy and overload assertions in one realm"
@@ -116,6 +236,7 @@ async fn public_offline_graph_has_brands_overloads_and_closed_connection_semanti
                   "AudioDestinationNode",
                   "GainNode",
                   "AudioScheduledSourceNode",
+                  "AudioBufferSourceNode",
                   "OscillatorNode",
                   "AudioParam",
                   "OfflineAudioCompletionEvent",
@@ -128,8 +249,12 @@ async fn public_offline_graph_has_brands_overloads_and_closed_connection_semanti
                     `${name} toStringTag mismatch`);
                 }
                 assert(OfflineAudioContext.length === 1, "offline constructor length");
-                assert(GainNode.length === 1 && OscillatorNode.length === 1,
+                assert(GainNode.length === 1 && OscillatorNode.length === 1 &&
+                    AudioBufferSourceNode.length === 1,
                   "node constructor length");
+                assert(BaseAudioContext.prototype.createBufferSource.length === 0 &&
+                    AudioBufferSourceNode.prototype.start.length === 0,
+                  "BufferSource method lengths");
                 assert(AudioNode.prototype.connect.length === 1,
                   "connect overload length");
                 assert(AudioNode.prototype.disconnect.length === 0,

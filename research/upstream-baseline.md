@@ -49,14 +49,16 @@ new contract. A green baseline suite alone is not evidence of readiness.
 
 ## Selected production fork
 
-The current Phase 0 dependency is reviewed fork commit
-`3455e57bde836a142faa3083cfbd3635dcf21b79`. It retains the upstream package
+The current production dependency is reviewed fork commit
+`faf6ec34878cc9add6f9e1326508669e8dd7cd4d`. It retains the upstream package
 name and the legacy behavior characterized above while adding a public hosted
 `AudioContext` builder, bounded exact lifecycle/control ownership, a public
 `AudioOutputFactory`, and `SystemAudioOutput` implementations for the silent,
-CPAL, and Cubeb paths. The dependency remains Git-only; the canonical remote
-must publish that exact commit before a fresh checkout can reproduce the lockfile
-without the maintainer's local repository.
+CPAL, and Cubeb paths, followed by exact hosted `AudioBufferSourceNode`
+construction, mutation, completion, and storage-lease ownership. The dependency
+remains Git-only; the canonical remote must publish that exact commit before a
+fresh checkout can reproduce the lockfile without the maintainer's local
+repository.
 
 The working-lockfile acceptance evidence maps the five gates as follows:
 
@@ -87,9 +89,11 @@ surface will use:
 | Thread bounds | The erased-node test plus the blocking-op type checks | `AudioBuffer`, `OfflineAudioContext`, the selected concrete node types, the erased enum, and blocking request/result ownership satisfy the required `Send`/`Sync` or `Send` bounds at compile time. |
 
 The buffer proof deliberately uses safe `rusty_v8` backing-store ownership, not
-an external raw PCM pointer. Actual `AudioBufferSourceNode` and `ConvolverNode`
-acquisition remain later public-surface work; their native consumers must retain
-the canonical byte lease alongside every acquired engine buffer clone.
+an external raw PCM pointer. `AudioBufferSourceNode` acquisition now retains the
+canonical byte lease alongside every acquired engine buffer clone and is
+exercised through offline, hosted-system, and injected-mixer playback.
+`ConvolverNode` acquisition remains later public-surface work under the same
+ownership requirement.
 
 ## Phase 0D lifecycle and resource checkpoint
 

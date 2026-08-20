@@ -11,9 +11,10 @@ use deno_core::{op2, v8, GarbageCollected};
 use deno_error::JsErrorBox;
 use web_audio_api::context::{AudioControlBatchReservation, AudioNodeLifetimeReservation};
 use web_audio_api::node::{
-    AudioNode, AudioScheduledSourceNode as _, AudioScheduledSourceNodeExt as _, OscillatorNode,
-    OscillatorType,
+    AudioBufferSourceNode, AudioNode, AudioScheduledSourceNode as _,
+    AudioScheduledSourceNodeExt as _, OscillatorNode, OscillatorType,
 };
+use web_audio_api::AudioBuffer;
 use web_audio_api::AudioParam;
 
 use crate::host::{AudioHostReservation, AudioHostResourceKind};
@@ -31,6 +32,8 @@ const OSCILLATOR_GRAPH_NODE_COST: usize = 3;
 // and the two hidden parameter-owner edges form one exact construction batch.
 const OSCILLATOR_CONSTRUCTION_COMMAND_COST: usize = 7;
 const OSCILLATOR_SCHEDULE_COMMAND_COST: usize = 2;
+const BUFFER_SOURCE_GRAPH_NODE_COST: usize = 3;
+const BUFFER_SOURCE_CONSTRUCTION_COMMAND_COST: usize = 7;
 
 struct NativeEventWake {
     _source_id: u32,
@@ -43,8 +46,9 @@ struct GraphNodeReservations {
     _host: AudioHostReservation,
 }
 
-struct ScheduledSourcePayload {
-    oscillator: OscillatorNode,
+enum ScheduledSourcePayload {
+    Oscillator(OscillatorNode),
+    BufferSource(AudioBufferSourceNode),
 }
 
 struct ScheduledSourceReservations {
@@ -78,8 +82,11 @@ impl ScheduledSourceRoot {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let payload = payload
             .as_ref()
-            .expect("a live scheduled-source root retains its oscillator");
-        operation(&payload.oscillator)
+            .expect("a live scheduled-source root retains its native source");
+        match payload {
+            ScheduledSourcePayload::Oscillator(source) => operation(source),
+            ScheduledSourcePayload::BufferSource(source) => operation(source),
+        }
     }
 
     pub(crate) fn frequency(&self) -> AudioParam {
@@ -88,6 +95,14 @@ impl ScheduledSourceRoot {
 
     pub(crate) fn detune(&self) -> AudioParam {
         self.with_oscillator(|oscillator| oscillator.detune().clone())
+    }
+
+    pub(crate) fn playback_rate(&self) -> AudioParam {
+        self.with_buffer_source(|source| source.playback_rate().clone())
+    }
+
+    pub(crate) fn buffer_detune(&self) -> AudioParam {
+        self.with_buffer_source(|source| source.detune().clone())
     }
 
     pub(crate) fn type_(&self) -> OscillatorType {
@@ -100,7 +115,7 @@ impl ScheduledSourceRoot {
         reservation: AudioControlBatchReservation,
         context: &NativeOnlineContextState,
     ) -> Result<(), JsErrorBox> {
-        self.mutate(context, move |oscillator| {
+        self.mutate_oscillator(context, move |oscillator| {
             oscillator
                 .frequency()
                 .set_value_with_control_reservation(value, reservation);
@@ -113,7 +128,7 @@ impl ScheduledSourceRoot {
         reservation: AudioControlBatchReservation,
         context: &NativeOnlineContextState,
     ) -> Result<(), JsErrorBox> {
-        self.mutate(context, move |oscillator| {
+        self.mutate_oscillator(context, move |oscillator| {
             oscillator
                 .detune()
                 .set_value_with_control_reservation(value, reservation);
@@ -126,7 +141,7 @@ impl ScheduledSourceRoot {
         reservation: AudioControlBatchReservation,
         context: &NativeOnlineContextState,
     ) -> Result<(), JsErrorBox> {
-        self.mutate(context, move |oscillator| {
+        self.mutate_oscillator(context, move |oscillator| {
             oscillator.set_type_with_control_reservation(value, reservation);
         })
     }
@@ -152,8 +167,41 @@ impl ScheduledSourceRoot {
                 "InvalidStateError: OscillatorNode has already been started",
             ));
         }
-        self.mutate(context, move |oscillator| {
+        self.mutate_oscillator(context, move |oscillator| {
             oscillator.start_at_with_control_reservation(when, reservation);
+        })
+    }
+
+    pub(crate) fn start_buffer_source(
+        self: &Arc<Self>,
+        when: f64,
+        offset: f64,
+        duration: f64,
+        reservation: AudioControlBatchReservation,
+        context: &NativeOnlineContextState,
+    ) -> Result<(), JsErrorBox> {
+        if self.scheduled.load(Ordering::Acquire) {
+            return Err(JsErrorBox::generic(
+                "InvalidStateError: AudioBufferSourceNode has already been started",
+            ));
+        }
+        self.ensure_rooted(context)?;
+        if self
+            .scheduled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(JsErrorBox::generic(
+                "InvalidStateError: AudioBufferSourceNode has already been started",
+            ));
+        }
+        self.mutate_buffer_source(context, move |source| {
+            source.start_at_with_offset_and_duration_with_control_reservation(
+                when,
+                offset,
+                duration,
+                reservation,
+            );
         })
     }
 
@@ -203,11 +251,16 @@ impl ScheduledSourceRoot {
     ) -> Result<(), JsErrorBox> {
         if !self.scheduled.load(Ordering::Acquire) {
             return Err(JsErrorBox::generic(
-                "InvalidStateError: OscillatorNode cannot stop before start",
+                "InvalidStateError: scheduled source cannot stop before start",
             ));
         }
-        self.mutate(context, move |oscillator| {
-            oscillator.stop_at_with_control_reservation(when, reservation);
+        self.mutate_payload(context, move |payload| match payload {
+            ScheduledSourcePayload::Oscillator(source) => {
+                source.stop_at_with_control_reservation(when, reservation);
+            }
+            ScheduledSourcePayload::BufferSource(source) => {
+                source.stop_at_with_control_reservation(when, reservation);
+            }
         })
     }
 
@@ -218,14 +271,35 @@ impl ScheduledSourceRoot {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let payload = payload
             .as_ref()
-            .expect("a live scheduled-source root retains its oscillator");
-        operation(&payload.oscillator)
+            .expect("a live scheduled-source root retains its native source");
+        match payload {
+            ScheduledSourcePayload::Oscillator(oscillator) => operation(oscillator),
+            ScheduledSourcePayload::BufferSource(_) => {
+                panic!("scheduled-source kind mismatch: expected OscillatorNode")
+            }
+        }
     }
 
-    fn mutate(
+    fn with_buffer_source<T>(&self, operation: impl FnOnce(&AudioBufferSourceNode) -> T) -> T {
+        let payload = self
+            .payload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let payload = payload
+            .as_ref()
+            .expect("a live scheduled-source root retains its native source");
+        match payload {
+            ScheduledSourcePayload::BufferSource(source) => operation(source),
+            ScheduledSourcePayload::Oscillator(_) => {
+                panic!("scheduled-source kind mismatch: expected AudioBufferSourceNode")
+            }
+        }
+    }
+
+    fn mutate_payload(
         &self,
         context: &NativeOnlineContextState,
-        operation: impl FnOnce(&mut OscillatorNode),
+        operation: impl FnOnce(&mut ScheduledSourcePayload),
     ) -> Result<(), JsErrorBox> {
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
             let mut payload = self
@@ -234,8 +308,8 @@ impl ScheduledSourceRoot {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let payload = payload
                 .as_mut()
-                .expect("a live scheduled-source root retains its oscillator");
-            operation(&mut payload.oscillator);
+                .expect("a live scheduled-source root retains its native source");
+            operation(payload);
         }));
         match result {
             Ok(()) => Ok(()),
@@ -247,6 +321,114 @@ impl ScheduledSourceRoot {
                 ))
             }
         }
+    }
+
+    fn mutate_oscillator(
+        &self,
+        context: &NativeOnlineContextState,
+        operation: impl FnOnce(&mut OscillatorNode),
+    ) -> Result<(), JsErrorBox> {
+        self.mutate_payload(context, move |payload| match payload {
+            ScheduledSourcePayload::Oscillator(source) => operation(source),
+            ScheduledSourcePayload::BufferSource(_) => {
+                panic!("scheduled-source kind mismatch: expected OscillatorNode")
+            }
+        })
+    }
+
+    fn mutate_buffer_source(
+        &self,
+        context: &NativeOnlineContextState,
+        operation: impl FnOnce(&mut AudioBufferSourceNode),
+    ) -> Result<(), JsErrorBox> {
+        self.mutate_payload(context, move |payload| match payload {
+            ScheduledSourcePayload::BufferSource(source) => operation(source),
+            ScheduledSourcePayload::Oscillator(_) => {
+                panic!("scheduled-source kind mismatch: expected AudioBufferSourceNode")
+            }
+        })
+    }
+
+    pub(crate) fn set_playback_rate(
+        &self,
+        value: f32,
+        reservation: AudioControlBatchReservation,
+        context: &NativeOnlineContextState,
+    ) -> Result<(), JsErrorBox> {
+        self.mutate_buffer_source(context, move |source| {
+            source
+                .playback_rate()
+                .set_value_with_control_reservation(value, reservation);
+        })
+    }
+
+    pub(crate) fn set_buffer_detune(
+        &self,
+        value: f32,
+        reservation: AudioControlBatchReservation,
+        context: &NativeOnlineContextState,
+    ) -> Result<(), JsErrorBox> {
+        self.mutate_buffer_source(context, move |source| {
+            source
+                .detune()
+                .set_value_with_control_reservation(value, reservation);
+        })
+    }
+
+    pub(crate) fn set_buffer(
+        &self,
+        buffer: AudioBuffer,
+        reservation: AudioControlBatchReservation,
+        context: &NativeOnlineContextState,
+    ) -> Result<(), JsErrorBox> {
+        self.mutate_buffer_source(context, move |source| {
+            source.set_buffer_with_control_reservation(buffer, reservation);
+        })
+    }
+
+    pub(crate) fn loop_(&self) -> bool {
+        self.with_buffer_source(AudioBufferSourceNode::loop_)
+    }
+
+    pub(crate) fn loop_start(&self) -> f64 {
+        self.with_buffer_source(AudioBufferSourceNode::loop_start)
+    }
+
+    pub(crate) fn loop_end(&self) -> f64 {
+        self.with_buffer_source(AudioBufferSourceNode::loop_end)
+    }
+
+    pub(crate) fn set_loop(
+        &self,
+        value: bool,
+        reservation: AudioControlBatchReservation,
+        context: &NativeOnlineContextState,
+    ) -> Result<(), JsErrorBox> {
+        self.mutate_buffer_source(context, move |source| {
+            source.set_loop_with_control_reservation(value, reservation);
+        })
+    }
+
+    pub(crate) fn set_loop_start(
+        &self,
+        value: f64,
+        reservation: AudioControlBatchReservation,
+        context: &NativeOnlineContextState,
+    ) -> Result<(), JsErrorBox> {
+        self.mutate_buffer_source(context, move |source| {
+            source.set_loop_start_with_control_reservation(value, reservation);
+        })
+    }
+
+    pub(crate) fn set_loop_end(
+        &self,
+        value: f64,
+        reservation: AudioControlBatchReservation,
+        context: &NativeOnlineContextState,
+    ) -> Result<(), JsErrorBox> {
+        self.mutate_buffer_source(context, move |source| {
+            source.set_loop_end_with_control_reservation(value, reservation);
+        })
     }
 
     fn release_reservations(&self) {
@@ -427,7 +609,110 @@ impl ContextEventHub {
             id,
             completion,
             hub: Arc::downgrade(self),
-            payload: Mutex::new(Some(ScheduledSourcePayload { oscillator })),
+            payload: Mutex::new(Some(ScheduledSourcePayload::Oscillator(oscillator))),
+            reservations: Mutex::new(reservations),
+            rooted: AtomicBool::new(root_immediately),
+            scheduled: AtomicBool::new(false),
+        });
+
+        if !root_immediately {
+            return Ok(root);
+        }
+
+        let mut roots = self
+            .roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.closed.load(Ordering::Acquire) {
+            drop(roots);
+            root.retire();
+            return Err(JsErrorBox::generic("AudioContext event hub is closed"));
+        }
+        if roots.insert(id, Arc::clone(&root)).is_some() {
+            drop(roots);
+            root.retire();
+            self.shutdown();
+            context.poison();
+            return Err(JsErrorBox::generic(
+                "duplicate scheduled-source identity poisoned the event hub",
+            ));
+        }
+        Ok(root)
+    }
+
+    pub(crate) fn register_buffer_source(
+        self: &Arc<Self>,
+        context: &Arc<NativeOnlineContextState>,
+        root_immediately: bool,
+    ) -> Result<Arc<ScheduledSourceRoot>, JsErrorBox> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(JsErrorBox::generic("AudioContext event hub is closed"));
+        }
+        let reservations = root_immediately
+            .then(|| self.reserve_scheduled_source())
+            .transpose()?;
+        let isolate_graph_nodes = self
+            .runtime
+            .try_reserve_graph_nodes(BUFFER_SOURCE_GRAPH_NODE_COST)?;
+        let host_graph_nodes = self
+            .runtime
+            .host()
+            .try_reserve(
+                AudioHostResourceKind::GraphNodes,
+                BUFFER_SOURCE_GRAPH_NODE_COST,
+            )
+            .map_err(|error| {
+                JsErrorBox::range_error(format!("AudioHost graph-node limit exceeded: {error}"))
+            })?;
+        let construction_commands = self
+            .runtime
+            .try_reserve_control_commands(BUFFER_SOURCE_CONSTRUCTION_COMMAND_COST)?;
+        let native_context = context.context()?;
+        let graph_lifetime = AudioNodeLifetimeReservation::new(GraphNodeReservations {
+            _isolate: isolate_graph_nodes,
+            _host: host_graph_nodes,
+        });
+        let construction_commands = AudioControlBatchReservation::new(construction_commands);
+        let source = match panic::catch_unwind(AssertUnwindSafe(move || {
+            native_context
+                .create_buffer_source_with_reservations(graph_lifetime, construction_commands)
+        })) {
+            Ok(source) => source,
+            Err(payload) => {
+                std::mem::forget(payload);
+                context.poison();
+                return Err(JsErrorBox::generic(
+                    "AudioBufferSource construction panicked and poisoned its AudioContext",
+                ));
+            }
+        };
+        let completion = source.completion_token();
+        let id = match self.next_source_id() {
+            Ok(id) => id,
+            Err(error) => {
+                context.poison();
+                return Err(error);
+            }
+        };
+        let weak_hub = Arc::downgrade(self);
+        if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| {
+            source.set_onended(move |_| {
+                if let Some(hub) = Weak::upgrade(&weak_hub) {
+                    hub.enqueue_wake(id);
+                }
+            });
+        })) {
+            std::mem::forget(payload);
+            context.poison();
+            return Err(JsErrorBox::generic(
+                "ended-handler installation panicked and poisoned its AudioContext",
+            ));
+        }
+        let root = Arc::new(ScheduledSourceRoot {
+            id,
+            completion,
+            hub: Arc::downgrade(self),
+            payload: Mutex::new(Some(ScheduledSourcePayload::BufferSource(source))),
             reservations: Mutex::new(reservations),
             rooted: AtomicBool::new(root_immediately),
             scheduled: AtomicBool::new(false),
@@ -683,33 +968,10 @@ impl NativePhase0Oscillator {
                 "scheduled source has already been started",
             ));
         }
-        let result = panic::catch_unwind(AssertUnwindSafe(|| {
-            let mut payload = self
-                .root
-                .payload
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let payload = payload
-                .as_mut()
-                .ok_or_else(|| JsErrorBox::generic("scheduled source has retired"))?;
-            payload
-                .oscillator
-                .start_at_with_control_reservation(start_when, start_reservation);
-            payload
-                .oscillator
-                .stop_at_with_control_reservation(stop_when, stop_reservation);
-            Ok::<(), JsErrorBox>(())
-        }));
-        match result {
-            Ok(result) => result,
-            Err(payload) => {
-                std::mem::forget(payload);
-                self.context.poison();
-                Err(JsErrorBox::generic(
-                    "scheduled-source mutation panicked and poisoned its AudioContext",
-                ))
-            }
-        }
+        self.root.mutate_oscillator(&self.context, move |source| {
+            source.start_at_with_control_reservation(start_when, start_reservation);
+            source.stop_at_with_control_reservation(stop_when, stop_reservation);
+        })
     }
 }
 

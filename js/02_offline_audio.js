@@ -9,6 +9,7 @@ import {
 import {
   AudioBuffer,
   createAudioBuffer,
+  getNativeAudioBuffer,
 } from "ext:deno_audio/01_audio_buffer.js";
 
 const { NativeOfflineAudioContext, NativePhase0OnlineContext } = core.ops;
@@ -198,6 +199,46 @@ webidl.converters.OscillatorOptions = webidl.createDictionaryConverter(
       key: "type",
       converter: webidl.converters.OscillatorType,
       defaultValue: "sine",
+    },
+  ],
+);
+function convertNullableAudioBuffer(value, prefix, context) {
+  if (value === null || value === undefined) return null;
+  return webidl.converters.AudioBuffer(value, prefix, context);
+}
+webidl.converters.AudioBufferSourceOptions = webidl.createDictionaryConverter(
+  "AudioBufferSourceOptions",
+  audioNodeOptionsMembers,
+  [
+    {
+      key: "buffer",
+      converter: convertNullableAudioBuffer,
+      defaultValue: null,
+    },
+    {
+      key: "detune",
+      converter: webidl.converters.float,
+      defaultValue: 0,
+    },
+    {
+      key: "loop",
+      converter: webidl.converters.boolean,
+      defaultValue: false,
+    },
+    {
+      key: "loopEnd",
+      converter: webidl.converters.double,
+      defaultValue: 0,
+    },
+    {
+      key: "loopStart",
+      converter: webidl.converters.double,
+      defaultValue: 0,
+    },
+    {
+      key: "playbackRate",
+      converter: webidl.converters.float,
+      defaultValue: 1,
     },
   ],
 );
@@ -679,6 +720,11 @@ class BaseAudioContext extends EventTarget {
     contextRecord(this);
     return new OscillatorNode(this);
   }
+
+  createBufferSource() {
+    contextRecord(this);
+    return new AudioBufferSourceNode(this);
+  }
 }
 
 class OfflineAudioContext extends BaseAudioContext {
@@ -1139,6 +1185,175 @@ class AudioScheduledSourceNode extends AudioNode {
   }
 }
 
+function retainStartedSource(source, record) {
+  record.started = true;
+  const contextState = contextRecord(record.context);
+  SetPrototypeAdd(contextState.sources, source);
+  if (contextState.online) {
+    const id = record.native.sourceId;
+    MapPrototypeSet(contextState.sourceById, id, source);
+  }
+}
+
+class AudioBufferSourceNode extends AudioScheduledSourceNode {
+  constructor(context, options = undefined) {
+    super(constructNode);
+    const prefix = "Failed to construct 'AudioBufferSourceNode'";
+    webidl.requiredArguments(arguments.length, 1, prefix);
+    const contextState = contextRecord(context);
+    options = webidl.converters.AudioBufferSourceOptions(
+      options,
+      prefix,
+      "Argument 2",
+    );
+    validateNodeOptions(options, prefix);
+    if (
+      !NumberIsFinite(options.detune) ||
+      !NumberIsFinite(options.playbackRate) ||
+      !NumberIsFinite(options.loopStart) ||
+      !NumberIsFinite(options.loopEnd)
+    ) {
+      throw new TypeError("AudioBufferSourceNode options must be finite.");
+    }
+    const native = callNative("AudioBufferSourceNode construction", () =>
+      contextState.native.createBufferSource(
+        options.detune,
+        options.loop,
+        options.loopStart,
+        options.loopEnd,
+        options.playbackRate,
+        options.channelCount,
+        channelCountModeCode(options.channelCountMode),
+        channelInterpretationCode(options.channelInterpretation),
+      ));
+    initializeNode(this, context, native, 0, 1);
+    const record = nodeRecord(this);
+    record.buffer = null;
+    record.detune = createParam(context, native.detune());
+    record.ended = false;
+    record.playbackRate = createParam(context, native.playbackRate());
+    record.started = false;
+    if (options.buffer !== null) this.buffer = options.buffer;
+  }
+
+  get buffer() {
+    return nodeRecord(this).buffer;
+  }
+
+  set buffer(value) {
+    const prefix = "Failed to set 'buffer' on 'AudioBufferSourceNode'";
+    const record = nodeRecord(this);
+    value = convertNullableAudioBuffer(value, prefix, "Value");
+    if (value === null) {
+      if (record.buffer === null) return;
+      throw domException(
+        "The bounded AudioBufferSourceNode buffer cannot be cleared after assignment.",
+        "InvalidStateError",
+      );
+    }
+    if (record.buffer !== null) {
+      throw domException(
+        "The bounded AudioBufferSourceNode buffer can only be assigned once.",
+        "InvalidStateError",
+      );
+    }
+    callNative("AudioBufferSourceNode buffer assignment", () =>
+      record.native.setBuffer(getNativeAudioBuffer(value)));
+    record.buffer = value;
+  }
+
+  get playbackRate() {
+    return nodeRecord(this).playbackRate;
+  }
+
+  get detune() {
+    return nodeRecord(this).detune;
+  }
+
+  get loop() {
+    return nodeRecord(this).native.loopEnabled;
+  }
+
+  set loop(value) {
+    const prefix = "Failed to set 'loop' on 'AudioBufferSourceNode'";
+    const record = nodeRecord(this);
+    value = webidl.converters.boolean(value, prefix, "Value");
+    if (value === record.native.loopEnabled) return;
+    callNative("AudioBufferSourceNode loop mutation", () =>
+      record.native.setLoopEnabled(value));
+  }
+
+  get loopStart() {
+    return nodeRecord(this).native.loopStart;
+  }
+
+  set loopStart(value) {
+    const prefix = "Failed to set 'loopStart' on 'AudioBufferSourceNode'";
+    const record = nodeRecord(this);
+    value = webidl.converters.double(value, prefix, "Value");
+    if (value === record.native.loopStart) return;
+    callNative("AudioBufferSourceNode loopStart mutation", () =>
+      record.native.setLoopStart(value));
+  }
+
+  get loopEnd() {
+    return nodeRecord(this).native.loopEnd;
+  }
+
+  set loopEnd(value) {
+    const prefix = "Failed to set 'loopEnd' on 'AudioBufferSourceNode'";
+    const record = nodeRecord(this);
+    value = webidl.converters.double(value, prefix, "Value");
+    if (value === record.native.loopEnd) return;
+    callNative("AudioBufferSourceNode loopEnd mutation", () =>
+      record.native.setLoopEnd(value));
+  }
+
+  start(when = 0, offset = 0, duration = undefined) {
+    const prefix = "Failed to execute 'start' on 'AudioBufferSourceNode'";
+    const record = nodeRecord(this);
+    when = webidl.converters.double(when, prefix, "Argument 1");
+    offset = webidl.converters.double(offset, prefix, "Argument 2");
+    duration = duration === undefined
+      ? 1.7976931348623157e308
+      : webidl.converters.double(duration, prefix, "Argument 3");
+    if (
+      !NumberIsFinite(when) || when < 0 ||
+      !NumberIsFinite(offset) || offset < 0 ||
+      !NumberIsFinite(duration) || duration < 0
+    ) {
+      throw new RangeError(
+        "The start time, offset, and duration must be finite and non-negative.",
+      );
+    }
+    if (record.started) {
+      throw domException(
+        "An AudioBufferSourceNode can only be started once.",
+        "InvalidStateError",
+      );
+    }
+    callNative("AudioBufferSourceNode start", () =>
+      record.native.startBuffer(when, offset, duration));
+    retainStartedSource(this, record);
+  }
+
+  stop(when = 0) {
+    const prefix = "Failed to execute 'stop' on 'AudioBufferSourceNode'";
+    const record = nodeRecord(this);
+    when = webidl.converters.double(when, prefix, "Argument 1");
+    if (!NumberIsFinite(when) || when < 0) {
+      throw new RangeError("The stop time must be finite and non-negative.");
+    }
+    if (!record.started) {
+      throw domException(
+        "The AudioBufferSourceNode has not been started.",
+        "InvalidStateError",
+      );
+    }
+    callNative("AudioBufferSourceNode stop", () => record.native.stop(when));
+  }
+}
+
 class OscillatorNode extends AudioScheduledSourceNode {
   constructor(context, options = undefined) {
     super(constructNode);
@@ -1209,13 +1424,7 @@ class OscillatorNode extends AudioScheduledSourceNode {
       throw domException("An OscillatorNode can only be started once.", "InvalidStateError");
     }
     callNative("OscillatorNode start", () => record.native.start(when));
-    record.started = true;
-    const contextState = contextRecord(record.context);
-    SetPrototypeAdd(contextState.sources, this);
-    if (contextState.online) {
-      const id = record.native.sourceId;
-      MapPrototypeSet(contextState.sourceById, id, this);
-    }
+    retainStartedSource(this, record);
   }
 
   stop(when = 0) {
@@ -1422,6 +1631,8 @@ webidl.configureInterface(GainNode);
 const GainNodePrototype = GainNode.prototype;
 webidl.configureInterface(AudioScheduledSourceNode);
 const AudioScheduledSourceNodePrototype = AudioScheduledSourceNode.prototype;
+webidl.configureInterface(AudioBufferSourceNode);
+const AudioBufferSourceNodePrototype = AudioBufferSourceNode.prototype;
 webidl.configureInterface(OscillatorNode);
 const OscillatorNodePrototype = OscillatorNode.prototype;
 webidl.configureInterface(AudioParam);
@@ -1454,6 +1665,7 @@ const publicPrototypes = [
   AudioDestinationNodePrototype,
   GainNodePrototype,
   AudioScheduledSourceNodePrototype,
+  AudioBufferSourceNodePrototype,
   OscillatorNodePrototype,
   AudioParamPrototype,
   OfflineAudioCompletionEventPrototype,
@@ -1464,6 +1676,7 @@ for (let i = 0; i < publicPrototypes.length; ++i) {
 
 export {
   AudioContext,
+  AudioBufferSourceNode,
   AudioDestinationNode,
   AudioNode,
   AudioParam,

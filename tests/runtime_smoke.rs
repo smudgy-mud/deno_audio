@@ -45,6 +45,7 @@ fn extension_loads_after_web_platform_dependencies() {
         }
         if (typeof OfflineAudioContext !== "function" ||
             typeof GainNode !== "function" ||
+            typeof AudioBufferSourceNode !== "function" ||
             typeof OscillatorNode !== "function") {
           throw new Error("Phase 1 offline graph globals were not installed");
         }

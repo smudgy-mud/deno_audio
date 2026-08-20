@@ -421,6 +421,76 @@ async fn exact_connection_limits_are_lazy_and_close_reclaims_every_guard() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn buffer_assignment_reserves_before_pcm_acquisition_and_recovers_after_resume() {
+    let host = Arc::new(AudioHost::new(
+        AudioHostLimits::default()
+            .max_graph_nodes(Some(23))
+            .max_queued_control_commands(Some(28)),
+    ));
+    let limits = AudioLimits::default()
+        .max_graph_nodes(Some(23))
+        .max_queued_control_commands(Some(28));
+    let mut runtime = runtime(Arc::clone(&host), limits);
+    runtime
+        .execute_script(
+            "phase3_buffer_assignment_reservation.js",
+            r#"
+              globalThis.__phase3BufferReservation = (async () => {
+                const context = new AudioContext({ sampleRate: 48000, sinkId: "none" });
+                await context.suspend();
+                const buffer = context.createBuffer(1, 8, 48000);
+                const exposed = buffer.getChannelData(0);
+                exposed[1] = 0.75;
+                const held = [
+                  context.createBufferSource(),
+                  context.createBufferSource(),
+                  context.createBufferSource(),
+                ];
+                const source = context.createBufferSource();
+                let quota;
+                try { source.buffer = buffer; } catch (error) { quota = error; }
+                if (quota?.name !== "QuotaExceededError") {
+                  throw new Error(`expected bounded buffer admission failure, got ${quota}`);
+                }
+                if (exposed.length !== 8 || source.buffer !== null) {
+                  throw new Error("rejected buffer assignment acquired or retained PCM");
+                }
+                await context.resume();
+                if (held.length !== 3) throw new Error("construction holders disappeared");
+                const retryDeadline = context.currentTime + 0.5;
+                while (source.buffer === null) {
+                  try {
+                    source.buffer = buffer;
+                  } catch (error) {
+                    if (error?.name !== "QuotaExceededError") throw error;
+                    if (context.currentTime >= retryDeadline) {
+                      throw new Error("buffer command capacity did not recover");
+                    }
+                  }
+                }
+                if (exposed.length !== 0 || source.buffer !== buffer) {
+                  throw new Error("retried buffer assignment did not acquire PCM");
+                }
+                await context.close();
+                globalThis.__phase3BufferReservationDone = true;
+              })();
+            "#,
+        )
+        .expect("bounded buffer assignment scenario should start");
+    runtime
+        .run_event_loop(deno_core::PollEventLoopOptions::default())
+        .await
+        .expect("bounded buffer assignment scenario should settle");
+    runtime
+        .execute_script(
+            "phase3_buffer_assignment_reservation_result.js",
+            "if (globalThis.__phase3BufferReservationDone !== true) throw new Error('buffer reservation scenario did not finish');",
+        )
+        .expect("bounded buffer assignment scenario should finish");
+    wait_for_online_retirement(&host);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn an_unbounded_started_source_does_not_pin_the_deno_event_loop() {
     let host = Arc::new(AudioHost::default());
     let mut runtime = runtime(Arc::clone(&host), AudioLimits::default());
@@ -474,6 +544,149 @@ async fn an_unbounded_started_source_does_not_pin_the_deno_event_loop() {
             "if (globalThis.__phase2UnrefClosed !== true) throw new Error('close did not settle');",
         )
         .expect("unbounded source close should complete");
+    wait_for_online_retirement(&host);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_started_buffer_source_is_rooted_until_native_completion_then_reconciled() {
+    let host = Arc::new(AudioHost::default());
+    let mut runtime = runtime(Arc::clone(&host), AudioLimits::unlimited());
+    runtime
+        .execute_script(
+            "phase3_buffer_source_root.js",
+            r#"
+              globalThis.__phase3BufferContext = new AudioContext({
+                sampleRate: 48000,
+                sinkId: "none",
+              });
+              globalThis.__phase3BufferEnded = 0;
+              (() => {
+                const buffer = __phase3BufferContext.createBuffer(1, 480, 48000);
+                buffer.getChannelData(0).fill(0.25);
+                const source = __phase3BufferContext.createBufferSource();
+                source.buffer = buffer;
+                source.connect(__phase3BufferContext.destination);
+                source.onended = () => __phase3BufferEnded++;
+                source.start();
+              })();
+            "#,
+        )
+        .expect("a finite BufferSource should start without an external wrapper root");
+    assert_eq!(host.usage().scheduled_sources(), 1);
+    runtime
+        .run_event_loop(deno_core::PollEventLoopOptions::default())
+        .await
+        .expect("the unreferenced event pump should let the runtime idle");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while host.usage().scheduled_sources() != 0 {
+        runtime
+            .run_event_loop(deno_core::PollEventLoopOptions::default())
+            .await
+            .expect("the unreferenced completion pump should remain healthy");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            Instant::now() < deadline,
+            "native completion did not release the scheduled-source root"
+        );
+        std::thread::yield_now();
+    }
+
+    runtime
+        .execute_script(
+            "phase3_buffer_source_close.js",
+            r"
+              globalThis.__phase3BufferClose = (async () => {
+                await globalThis.__phase3BufferContext.close();
+                if (globalThis.__phase3BufferEnded !== 1) {
+                  throw new Error(
+                    `BufferSource ended reconciliation mismatch: ${globalThis.__phase3BufferEnded}`,
+                  );
+                }
+                globalThis.__phase3BufferClosed = true;
+              })();
+            ",
+        )
+        .expect("the BufferSource context should begin closing");
+    runtime
+        .run_event_loop(deno_core::PollEventLoopOptions::default())
+        .await
+        .expect("the BufferSource context should close");
+    runtime
+        .execute_script(
+            "phase3_buffer_source_close_result.js",
+            "if (globalThis.__phase3BufferClosed !== true) throw new Error('BufferSource close did not settle');",
+        )
+        .expect("the BufferSource close should finish");
+    wait_for_online_retirement(&host);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn null_buffer_sources_reconcile_every_ended_without_wake_capacity() {
+    const SOURCE_COUNT: usize = 3;
+
+    let host = Arc::new(AudioHost::new(
+        AudioHostLimits::default()
+            .max_graph_nodes(Some(32))
+            .max_scheduled_sources(Some(SOURCE_COUNT))
+            .max_queued_events(Some(0)),
+    ));
+    let limits = AudioLimits::unlimited()
+        .max_graph_nodes(Some(32))
+        .max_scheduled_sources(Some(SOURCE_COUNT))
+        .max_queued_events(Some(0));
+    let mut runtime = runtime_with_options(
+        AudioExtensionOptions::new(Arc::clone(&host))
+            .limits(limits)
+            .event_pump_liveness(AudioEventPumpLiveness::Ref)
+            .output_factory(Arc::new(SystemAudioOutput::new())),
+    );
+    runtime
+        .execute_script(
+            "phase3_null_buffer_source_saturation.js",
+            r#"
+              globalThis.__phase3NullBuffer = (async () => {
+                const context = new AudioContext({ sampleRate: 48000, sinkId: "none" });
+                const counts = [0, 0, 0];
+                const sources = [];
+                let resolveAll;
+                const allEnded = new Promise((resolve) => resolveAll = resolve);
+                for (let i = 0; i < counts.length; ++i) {
+                  const source = context.createBufferSource();
+                  source.onended = () => {
+                    counts[i]++;
+                    if (counts.every((count) => count === 1)) resolveAll();
+                  };
+                  source.start();
+                  sources.push(source);
+                }
+                const blockedUntil = context.currentTime + 0.05;
+                while (context.currentTime < blockedUntil) {}
+                globalThis.__phase3NullBufferContext = context;
+                globalThis.__phase3NullBufferSources = sources;
+                globalThis.__phase3NullBufferCounts = counts;
+                await allEnded;
+                if (!counts.every((count) => count === 1)) {
+                  throw new Error(`null-buffer ended counts mismatch: ${counts}`);
+                }
+                await context.close();
+                globalThis.__phase3NullBufferDone = true;
+              })();
+            "#,
+        )
+        .expect("null-buffer wake-saturation scenario should start");
+    assert_eq!(host.usage().queued_events(), 0);
+    runtime
+        .run_event_loop(deno_core::PollEventLoopOptions::default())
+        .await
+        .expect("null-buffer completion reconciliation should settle");
+    runtime
+        .execute_script(
+            "phase3_null_buffer_source_saturation_result.js",
+            "if (globalThis.__phase3NullBufferDone !== true) throw new Error('null-buffer reconciliation did not finish');",
+        )
+        .expect("all null-buffer sources should dispatch ended exactly once");
+    drop(runtime);
     wait_for_online_retirement(&host);
 }
 

@@ -26,6 +26,38 @@ const MAX_SAMPLES: usize = CHANNELS * FRAMES;
 const MAX_LOGICAL_INPUTS: usize = 2;
 const NATIVE_SAMPLE: f32 = 0.125;
 
+fn pcm16_wav(channels: u16, sample_rate: u32, samples: &[i16]) -> Vec<u8> {
+    assert_ne!(channels, 0);
+    assert_eq!(samples.len() % usize::from(channels), 0);
+    let data_len = u32::try_from(std::mem::size_of_val(samples)).unwrap();
+    let block_align = channels * 2;
+    let mut wav = Vec::with_capacity(44 + data_len as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&channels.to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&(sample_rate * u32::from(block_align)).to_le_bytes());
+    wav.extend_from_slice(&block_align.to_le_bytes());
+    wav.extend_from_slice(&16_u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    for sample in samples {
+        wav.extend_from_slice(&sample.to_le_bytes());
+    }
+    wav
+}
+
+fn byte_literal(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 struct MixCapture {
     samples: usize,
     input_count: usize,
@@ -728,9 +760,11 @@ async fn public_audio_context_uses_the_same_injected_mixer_and_flushes_staged_gr
 
     let driving = Arc::new(AtomicBool::new(true));
     let audible = Arc::new(AtomicBool::new(false));
+    let decoded_audible = Arc::new(AtomicBool::new(false));
     let driver_mixer = mixer.clone();
     let driver_running = Arc::clone(&driving);
     let driver_audible = Arc::clone(&audible);
+    let driver_decoded_audible = Arc::clone(&decoded_audible);
     let driver = thread::Builder::new()
         .name("deno-audio-public-mixer-driver".to_owned())
         .spawn(move || {
@@ -742,14 +776,20 @@ async fn public_audio_context_uses_the_same_injected_mixer_and_flushes_staged_gr
                 {
                     driver_audible.store(true, Ordering::Release);
                 }
+                if capture.inputs[..capture.input_count].iter().any(|input| {
+                    input[..capture.samples]
+                        .windows(16)
+                        .any(|window| window.iter().all(|sample| (*sample - 0.25).abs() < 0.002))
+                }) {
+                    driver_decoded_audible.store(true, Ordering::Release);
+                }
                 thread::yield_now();
             }
         })
         .expect("public mixer driver should spawn");
 
-    let begin = runtime.execute_script(
-        "phase2_public_injected_mixer.js",
-        r#"
+    let wav = pcm16_wav(1, 48_000, &vec![8_192_i16; 2_400]);
+    let script = r#"
               globalThis.__publicMixerScenario = (async () => {
                 const context = new AudioContext({
                   sampleRate: 48000,
@@ -776,14 +816,29 @@ async fn public_audio_context_uses_the_same_injected_mixer_and_flushes_staged_gr
                 oscillator.stop(stop);
                 await context.resume();
                 while (context.currentTime < stop + 0.03) {}
+
+                const decoded = await context.decodeAudioData(
+                  new Uint8Array([__WAV__]).buffer,
+                );
+                const source = context.createBufferSource();
+                source.buffer = decoded;
+                source.connect(context.destination);
+                let bufferEnded = 0;
+                source.onended = () => bufferEnded++;
+                const bufferStart = context.currentTime;
+                source.start(bufferStart);
+                while (context.currentTime < bufferStart + 0.08) {}
                 await context.close();
-                if (ended !== 1 || context.state !== "closed") {
-                  throw new Error(`public staged retirement mismatch: ${ended}/${context.state}`);
+                if (ended !== 1 || bufferEnded !== 1 || context.state !== "closed") {
+                  throw new Error(
+                    `public staged retirement mismatch: ${ended}/${bufferEnded}/${context.state}`,
+                  );
                 }
                 globalThis.__publicMixerDone = true;
               })();
-            "#,
-    );
+            "#
+    .replace("__WAV__", &byte_literal(&wav));
+    let begin = runtime.execute_script("phase2_public_injected_mixer.js", script);
     let settle = if begin.is_ok() {
         Some(
             runtime
@@ -809,6 +864,10 @@ async fn public_audio_context_uses_the_same_injected_mixer_and_flushes_staged_gr
     assert!(
         audible.load(Ordering::Acquire),
         "the resumed public staged graph never reached the injected mixer"
+    );
+    assert!(
+        decoded_audible.load(Ordering::Acquire),
+        "decoded BufferSource PCM never reached the injected mixer"
     );
     assert_eq!(mixer.active_logical_inputs(), 0);
     let usage = host.usage();

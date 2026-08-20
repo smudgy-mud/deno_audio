@@ -135,6 +135,81 @@ async fn public_decode_detaches_resamples_and_invokes_the_legacy_callback() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn decoded_audio_buffer_plays_through_the_public_hosted_buffer_source() {
+    let host = Arc::new(AudioHost::default());
+    let mut runtime = runtime(Arc::clone(&host), AudioLimits::unlimited());
+    let mut samples = vec![16_384_i16; 600];
+    samples[0] = 0;
+    let wav = pcm16_wav(1, 6_000, &samples);
+    runtime
+        .execute_script(
+            "phase3_public_decoded_buffer_source.js",
+            format!(
+                r#"
+                  globalThis.__phase3DecodedPlayback = (async () => {{
+                    const assert = (condition, message) => {{
+                      if (!condition) throw new Error(message);
+                    }};
+                    const context = new AudioContext({{
+                      sampleRate: 6000,
+                      sinkId: {{ type: "none" }},
+                    }});
+                    const decoded = await context.decodeAudioData(
+                      new Uint8Array([{}]).buffer,
+                    );
+                    const exposed = decoded.getChannelData(0);
+                    exposed[1] = 0.75;
+                    const source = new AudioBufferSourceNode(context, {{
+                      buffer: decoded,
+                      detune: 0,
+                      playbackRate: 1,
+                    }});
+                    assert(source instanceof AudioScheduledSourceNode,
+                      "BufferSource inheritance");
+                    assert(source.buffer === decoded, "BufferSource buffer identity");
+                    assert(source.playbackRate.value === 1 && source.detune.value === 0,
+                      "BufferSource parameters");
+                    assert(exposed.length === 0,
+                      "assigning the buffer must acquire and detach exposed PCM");
+                    source.connect(context.destination);
+                    let ended = 0;
+                    source.onended = () => ended++;
+                    const start = context.currentTime;
+                    source.start(start, 0, 0.05);
+                    while (context.currentTime < start + 0.08) {{}}
+                    await context.close();
+                    assert(ended === 1, `expected one ended event, got ${{ended}}`);
+                    assert(source.buffer === decoded,
+                      "retired wrapper retains its assigned buffer identity");
+                    globalThis.__phase3DecodedPlaybackDone = true;
+                  }})();
+                "#,
+                byte_literal(&wav),
+            ),
+        )
+        .expect("decoded BufferSource scenario should start");
+    runtime
+        .run_event_loop(deno_core::PollEventLoopOptions::default())
+        .await
+        .expect("decoded BufferSource scenario should settle");
+    runtime
+        .execute_script(
+            "phase3_public_decoded_buffer_source_result.js",
+            "if (globalThis.__phase3DecodedPlaybackDone !== true) throw new Error('decoded playback did not finish');",
+        )
+        .expect("decoded BufferSource scenario should finish");
+    drop(runtime);
+    wait_until(|| {
+        let usage = host.usage();
+        usage.online_contexts() == 0
+            && usage.graph_nodes() == 0
+            && usage.scheduled_sources() == 0
+            && usage.queued_control_commands() == 0
+            && usage.queued_events() == 0
+    });
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn public_decode_rejects_detached_corrupt_and_limited_inputs_honestly() {
     let host = Arc::new(AudioHost::default());
     let limits = AudioLimits::unlimited().max_encoded_bytes(Some(48));

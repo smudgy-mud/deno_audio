@@ -10,13 +10,13 @@
       "path": "webaudio/the-audio-api/the-audiobuffer-interface/ctor-audiobuffer.html",
       "category": "AudioBuffer",
       "status": "skip",
-      "reason": "The file ends with AudioBufferSourceNode rendering, which is scheduled for Phase 3; the standalone AudioBuffer constructor/property file runs above."
+      "reason": "AudioBufferSourceNode rendering is now available, but this upstream file has not yet been promoted against the bounded one-assignment buffer-acquisition semantics; the standalone AudioBuffer constructor/property file runs above and integration tests cover rendered acquisition."
     },
     {
       "path": "webaudio/the-audio-api/the-audiobuffer-interface/audiobuffer-copy-channel.html",
       "category": "AudioBuffer",
       "status": "skip",
-      "reason": "The file requires AudioBufferSourceNode rendering, which is not yet in the current Phase 2 online slice; copyFromChannel/copyToChannel remain covered by integration tests."
+      "reason": "AudioBufferSourceNode rendering is now available, but this upstream file has not yet been promoted against the bounded one-assignment buffer-acquisition semantics; copyFromChannel/copyToChannel and rendered acquisition remain covered by integration tests."
     },
     {
       "path": "webaudio/the-audio-api/the-offlineaudiocontext-interface/ctor-offlineaudiocontext.html",
@@ -44,13 +44,13 @@
       "path": "webaudio/the-audio-api/the-audionode-interface/audionode-disconnect.html",
       "category": "connect/disconnect",
       "status": "skip",
-      "reason": "The rendering cases require AudioBufferSourceNode and ChannelSplitterNode; Phase 1 disconnect overloads remain covered by the bounded graph integration suite."
+      "reason": "AudioBufferSourceNode is available, but the rendering cases also require ChannelSplitterNode; disconnect overloads remain covered by the bounded graph integration suite."
     },
     {
       "path": "webaudio/the-audio-api/the-audionode-interface/audionode-disconnect-audioparam.html",
       "category": "connect/disconnect",
       "status": "skip",
-      "reason": "The file requires AudioBufferSourceNode and ChannelSplitterNode, which are not yet in the current public slices."
+      "reason": "AudioBufferSourceNode is available, but ChannelSplitterNode is not yet in the current public slices."
     },
     {
       "path": "webaudio/the-audio-api/the-offlineaudiocontext-interface/current-time-block-size.html",

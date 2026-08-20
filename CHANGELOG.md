@@ -11,9 +11,15 @@ Web Audio surface.
 ### Added
 
 - The first public online Web Audio slice: `AudioContext`, destination, Gain,
-  fixed-wave Oscillator, scalar `AudioParam.value`, exact connect/disconnect,
-  suspend/resume/close, acknowledged state changes, and exactly-once `ended`
-  over built-in or host-injected output.
+  fixed-wave Oscillator, one-shot `AudioBufferSourceNode`, scalar
+  `AudioParam.value`, exact connect/disconnect, suspend/resume/close,
+  acknowledged state changes, and exactly-once `ended` over built-in or
+  host-injected output.
+- Public offline and hosted `AudioBufferSourceNode` playback with bounded native
+  construction and mutation reservations, canonical PCM acquisition, exposed
+  view detachment, playback-rate/detune parameters, loop and scheduled playback
+  controls, native completion rooting, and generation-safe `ended`
+  reconciliation.
 - Public `BaseAudioContext.decodeAudioData`, including synchronous encoded-input
   detachment, off-isolate bounded decoding, promise and legacy callback forms,
   target-rate resampling, and decoder-owned PCM reservations.

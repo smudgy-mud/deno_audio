@@ -13,13 +13,14 @@ use web_audio_api::context::{
     OfflineAudioContext,
 };
 use web_audio_api::node::{
-    AudioDestinationNode, AudioNode, AudioNodeDisconnectSelector, AudioNodeOptions,
-    AudioScheduledSourceNode, AudioScheduledSourceNodeExt, ChannelCountMode, ChannelInterpretation,
-    GainNode, GainOptions, OscillatorNode, OscillatorOptions, OscillatorType,
+    AudioBufferSourceNode, AudioBufferSourceOptions, AudioDestinationNode, AudioNode,
+    AudioNodeDisconnectSelector, AudioNodeOptions, AudioScheduledSourceNode,
+    AudioScheduledSourceNodeExt, ChannelCountMode, ChannelInterpretation, GainNode, GainOptions,
+    OscillatorNode, OscillatorOptions, OscillatorType,
 };
 use web_audio_api::{AudioParam, AutomationRate};
 
-use crate::buffer::{NativeAudioByteBudget, NativeAudioByteReservation};
+use crate::buffer::{NativeAudioBuffer, NativeAudioByteBudget, NativeAudioByteReservation};
 use crate::host::{AudioHostReservation, AudioHostResourceKind};
 use crate::online::{
     AudioRuntimeState, ControlCommandReservations, IsolateReservation, NativeOnlineContextState,
@@ -35,6 +36,9 @@ const OSCILLATOR_COMMAND_COUNT_WITH_TEARDOWN: usize = 10;
 const EXACT_GAIN_NODE_COUNT: usize = 2;
 const EXACT_GAIN_CONSTRUCTION_COMMAND_COUNT: usize = 4;
 const EXACT_OSCILLATOR_OPTION_COMMAND_LIMIT: usize = 3;
+const BUFFER_SOURCE_NODE_COUNT: usize = 3;
+const BUFFER_SOURCE_CONSTRUCTION_COMMAND_COUNT: usize = 7;
+const EXACT_BUFFER_SOURCE_OPTION_COMMAND_LIMIT: usize = 5;
 const MAX_AUTOMATION_CURVE_SAMPLES: usize = 1_048_576;
 
 fn host_reservation(
@@ -314,6 +318,34 @@ impl OfflineGraph {
         }
     }
 
+    /// Reserve one legacy control command before acquiring an owned payload.
+    /// Acquisition may detach V8 storage, so it must not run until bounded
+    /// command capacity has been secured.
+    fn run_prepared_command<T>(
+        &self,
+        prepare: impl FnOnce() -> Result<T, JsErrorBox>,
+        operation: impl FnOnce(T),
+    ) -> Result<(), JsErrorBox> {
+        let mut inner = mutex(&self.inner);
+        Self::ensure_open(&inner)?;
+        let control = self.runtime.try_reserve_control_commands(1)?;
+        let prepared = match panic::catch_unwind(AssertUnwindSafe(prepare)) {
+            Ok(result) => result?,
+            Err(payload) => {
+                inner.phase = OfflineGraphPhase::Poisoned;
+                return Err(JsErrorBox::generic(panic_message(payload)));
+            }
+        };
+        inner.control_reservations.push(control);
+        match panic::catch_unwind(AssertUnwindSafe(|| operation(prepared))) {
+            Ok(()) => Ok(()),
+            Err(payload) => {
+                inner.phase = OfflineGraphPhase::Poisoned;
+                Err(JsErrorBox::generic(panic_message(payload)))
+            }
+        }
+    }
+
     pub(crate) fn destination(self: &Arc<Self>) -> NativeAudioNode {
         NativeAudioNode::from_handle(Arc::new(NativeNodeHandle {
             graph: NativeGraph::Offline(Arc::clone(self)),
@@ -431,6 +463,69 @@ impl OfflineGraph {
             kind: NativeNodeKind::Oscillator {
                 node: Box::new(Mutex::new(node)),
                 frequency,
+                detune,
+            },
+        })))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_buffer_source(
+        self: &Arc<Self>,
+        detune: f32,
+        loop_: bool,
+        loop_start: f64,
+        loop_end: f64,
+        playback_rate: f32,
+    ) -> Result<NativeAudioNode, JsErrorBox> {
+        if !detune.is_finite()
+            || !playback_rate.is_finite()
+            || !loop_start.is_finite()
+            || !loop_end.is_finite()
+        {
+            return Err(JsErrorBox::type_error(
+                "AudioBufferSource options must be finite",
+            ));
+        }
+        let mut inner = mutex(&self.inner);
+        let first = self.reserve_nodes(
+            &mut inner,
+            BUFFER_SOURCE_NODE_COUNT,
+            BUFFER_SOURCE_CONSTRUCTION_COMMAND_COUNT,
+            true,
+        )?;
+        let options = AudioBufferSourceOptions {
+            buffer: None,
+            detune,
+            loop_,
+            loop_start,
+            loop_end,
+            playback_rate,
+        };
+        let node = match panic::catch_unwind(AssertUnwindSafe(|| {
+            AudioBufferSourceNode::new(self.context.as_ref(), options)
+        })) {
+            Ok(node) => node,
+            Err(payload) => {
+                inner.phase = OfflineGraphPhase::Poisoned;
+                return Err(JsErrorBox::generic(panic_message(payload)));
+            }
+        };
+        let playback_rate = Arc::new(NativeNodeHandle {
+            graph: NativeGraph::Offline(Arc::clone(self)),
+            id: first + 1,
+            kind: NativeNodeKind::Param(node.playback_rate().clone()),
+        });
+        let detune = Arc::new(NativeNodeHandle {
+            graph: NativeGraph::Offline(Arc::clone(self)),
+            id: first + 2,
+            kind: NativeNodeKind::Param(node.detune().clone()),
+        });
+        Ok(NativeAudioNode::from_handle(Arc::new(NativeNodeHandle {
+            graph: NativeGraph::Offline(Arc::clone(self)),
+            id: first,
+            kind: NativeNodeKind::BufferSource {
+                node: Box::new(Mutex::new(node)),
+                playback_rate,
                 detune,
             },
         })))
@@ -805,6 +900,94 @@ impl OnlineGraph {
         })))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_buffer_source(
+        self: &Arc<Self>,
+        detune: f32,
+        loop_: bool,
+        loop_start: f64,
+        loop_end: f64,
+        playback_rate: f32,
+        channel_count: usize,
+        count_mode: ChannelCountMode,
+        interpretation: ChannelInterpretation,
+    ) -> Result<NativeAudioNode, JsErrorBox> {
+        if !detune.is_finite()
+            || !playback_rate.is_finite()
+            || !loop_start.is_finite()
+            || !loop_end.is_finite()
+        {
+            return Err(JsErrorBox::type_error(
+                "AudioBufferSource options must be finite",
+            ));
+        }
+        Self::ensure_default_channel_options(channel_count, count_mode, interpretation)?;
+        let playback_rate_reservation = (playback_rate.to_bits() != 1.0_f32.to_bits())
+            .then(|| self.reserve_control(1))
+            .transpose()?;
+        let detune_reservation = (detune.to_bits() != 0.0_f32.to_bits())
+            .then(|| self.reserve_control(1))
+            .transpose()?;
+        let loop_reservation = loop_.then(|| self.reserve_control(1)).transpose()?;
+        let loop_start_reservation = (loop_start.to_bits() != 0.0_f64.to_bits())
+            .then(|| self.reserve_control(1))
+            .transpose()?;
+        let loop_end_reservation = (loop_end.to_bits() != 0.0_f64.to_bits())
+            .then(|| self.reserve_control(1))
+            .transpose()?;
+        debug_assert!(
+            [
+                playback_rate_reservation.is_some(),
+                detune_reservation.is_some(),
+                loop_reservation.is_some(),
+                loop_start_reservation.is_some(),
+                loop_end_reservation.is_some(),
+            ]
+            .into_iter()
+            .filter(|present| *present)
+            .count()
+                <= EXACT_BUFFER_SOURCE_OPTION_COMMAND_LIMIT
+        );
+        let root = self
+            .state
+            .event_hub()
+            .register_buffer_source(&self.state, false)?;
+        if let Some(reservation) = playback_rate_reservation {
+            root.set_playback_rate(playback_rate, reservation, &self.state)?;
+        }
+        if let Some(reservation) = detune_reservation {
+            root.set_buffer_detune(detune, reservation, &self.state)?;
+        }
+        if let Some(reservation) = loop_reservation {
+            root.set_loop(loop_, reservation, &self.state)?;
+        }
+        if let Some(reservation) = loop_start_reservation {
+            root.set_loop_start(loop_start, reservation, &self.state)?;
+        }
+        if let Some(reservation) = loop_end_reservation {
+            root.set_loop_end(loop_end, reservation, &self.state)?;
+        }
+        let playback_rate = Arc::new(NativeNodeHandle {
+            graph: NativeGraph::Online(Arc::clone(self)),
+            id: 0,
+            kind: NativeNodeKind::Param(root.playback_rate()),
+        });
+        let detune = Arc::new(NativeNodeHandle {
+            graph: NativeGraph::Online(Arc::clone(self)),
+            id: 0,
+            kind: NativeNodeKind::Param(root.buffer_detune()),
+        });
+        Ok(NativeAudioNode::from_handle(Arc::new(NativeNodeHandle {
+            graph: NativeGraph::Online(Arc::clone(self)),
+            id: u64::from(root.id()),
+            kind: NativeNodeKind::OnlineBufferSource {
+                root,
+                playback_rate,
+                detune,
+            },
+        })))
+    }
+
     fn validate_pair(
         self: &Arc<Self>,
         source: &NativeNodeHandle,
@@ -1061,6 +1244,16 @@ enum NativeNodeKind {
         frequency: Arc<NativeNodeHandle>,
         detune: Arc<NativeNodeHandle>,
     },
+    BufferSource {
+        node: Box<Mutex<AudioBufferSourceNode>>,
+        playback_rate: Arc<NativeNodeHandle>,
+        detune: Arc<NativeNodeHandle>,
+    },
+    OnlineBufferSource {
+        root: Arc<ScheduledSourceRoot>,
+        playback_rate: Arc<NativeNodeHandle>,
+        detune: Arc<NativeNodeHandle>,
+    },
     Param(AudioParam),
 }
 
@@ -1076,7 +1269,9 @@ impl NativeNodeHandle {
             NativeNodeKind::Destination(node) => operation(node),
             NativeNodeKind::Gain { node, .. } => operation(node),
             NativeNodeKind::Oscillator { node, .. } => operation(&*mutex(node)),
-            NativeNodeKind::OnlineOscillator { root, .. } => root.with_audio_node(operation),
+            NativeNodeKind::OnlineOscillator { root, .. }
+            | NativeNodeKind::OnlineBufferSource { root, .. } => root.with_audio_node(operation),
+            NativeNodeKind::BufferSource { node, .. } => operation(&*mutex(node)),
             NativeNodeKind::Param(param) => operation(param),
         }
     }
@@ -1141,6 +1336,7 @@ impl NativeAudioNode {
             NativeNodeKind::Gain { .. } => 1,
             NativeNodeKind::Oscillator { .. } | NativeNodeKind::OnlineOscillator { .. } => 2,
             NativeNodeKind::Param(_) => 3,
+            NativeNodeKind::BufferSource { .. } | NativeNodeKind::OnlineBufferSource { .. } => 4,
         }
     }
 
@@ -1285,11 +1481,26 @@ impl NativeAudioNode {
     fn detune(&self) -> Result<NativeAudioNode, JsErrorBox> {
         match &self.handle.kind {
             NativeNodeKind::Oscillator { detune, .. }
-            | NativeNodeKind::OnlineOscillator { detune, .. } => {
+            | NativeNodeKind::OnlineOscillator { detune, .. }
+            | NativeNodeKind::BufferSource { detune, .. }
+            | NativeNodeKind::OnlineBufferSource { detune, .. } => {
                 Ok(Self::from_handle(Arc::clone(detune)))
             }
             _ => Err(JsErrorBox::type_error(
-                "native binding expected an OscillatorNode",
+                "native binding expected a scheduled source with detune",
+            )),
+        }
+    }
+
+    #[cppgc]
+    fn playback_rate(&self) -> Result<NativeAudioNode, JsErrorBox> {
+        match &self.handle.kind {
+            NativeNodeKind::BufferSource { playback_rate, .. }
+            | NativeNodeKind::OnlineBufferSource { playback_rate, .. } => {
+                Ok(Self::from_handle(Arc::clone(playback_rate)))
+            }
+            _ => Err(JsErrorBox::type_error(
+                "native binding expected an AudioBufferSourceNode",
             )),
         }
     }
@@ -1463,6 +1674,113 @@ impl NativeAudioNode {
             })
     }
 
+    #[fast]
+    fn set_buffer(
+        &self,
+        scope: &mut v8::PinScope<'_, '_>,
+        #[cppgc] buffer: &NativeAudioBuffer,
+    ) -> Result<(), JsErrorBox> {
+        match (&self.handle.graph, &self.handle.kind) {
+            (NativeGraph::Offline(graph), NativeNodeKind::BufferSource { node, .. }) => graph
+                .run_prepared_command(
+                    || buffer.acquire_for_playback(scope),
+                    |buffer| mutex(node).set_buffer(buffer),
+                ),
+            (NativeGraph::Online(graph), NativeNodeKind::OnlineBufferSource { root, .. }) => {
+                let reservation = graph.reserve_control(1)?;
+                let buffer = buffer.acquire_for_playback(scope)?;
+                root.set_buffer(buffer, reservation, &graph.state)
+            }
+            _ => Err(JsErrorBox::type_error(
+                "native binding expected an AudioBufferSourceNode",
+            )),
+        }
+    }
+
+    #[getter]
+    fn loop_enabled(&self) -> Result<bool, JsErrorBox> {
+        match &self.handle.kind {
+            NativeNodeKind::BufferSource { node, .. } => Ok(mutex(node).loop_()),
+            NativeNodeKind::OnlineBufferSource { root, .. } => Ok(root.loop_()),
+            _ => Err(JsErrorBox::type_error(
+                "native binding expected an AudioBufferSourceNode",
+            )),
+        }
+    }
+
+    #[fast]
+    fn set_loop_enabled(&self, value: bool) -> Result<(), JsErrorBox> {
+        match (&self.handle.graph, &self.handle.kind) {
+            (NativeGraph::Offline(graph), NativeNodeKind::BufferSource { node, .. }) => {
+                graph.run_command(false, 0, || mutex(node).set_loop(value))
+            }
+            (NativeGraph::Online(graph), NativeNodeKind::OnlineBufferSource { root, .. }) => {
+                root.set_loop(value, graph.reserve_control(1)?, &graph.state)
+            }
+            _ => Err(JsErrorBox::type_error(
+                "native binding expected an AudioBufferSourceNode",
+            )),
+        }
+    }
+
+    #[getter]
+    fn loop_start(&self) -> Result<f64, JsErrorBox> {
+        match &self.handle.kind {
+            NativeNodeKind::BufferSource { node, .. } => Ok(mutex(node).loop_start()),
+            NativeNodeKind::OnlineBufferSource { root, .. } => Ok(root.loop_start()),
+            _ => Err(JsErrorBox::type_error(
+                "native binding expected an AudioBufferSourceNode",
+            )),
+        }
+    }
+
+    #[fast]
+    fn set_loop_start(&self, value: f64) -> Result<(), JsErrorBox> {
+        if !value.is_finite() {
+            return Err(JsErrorBox::type_error("loopStart must be finite"));
+        }
+        match (&self.handle.graph, &self.handle.kind) {
+            (NativeGraph::Offline(graph), NativeNodeKind::BufferSource { node, .. }) => {
+                graph.run_command(false, 0, || mutex(node).set_loop_start(value))
+            }
+            (NativeGraph::Online(graph), NativeNodeKind::OnlineBufferSource { root, .. }) => {
+                root.set_loop_start(value, graph.reserve_control(1)?, &graph.state)
+            }
+            _ => Err(JsErrorBox::type_error(
+                "native binding expected an AudioBufferSourceNode",
+            )),
+        }
+    }
+
+    #[getter]
+    fn loop_end(&self) -> Result<f64, JsErrorBox> {
+        match &self.handle.kind {
+            NativeNodeKind::BufferSource { node, .. } => Ok(mutex(node).loop_end()),
+            NativeNodeKind::OnlineBufferSource { root, .. } => Ok(root.loop_end()),
+            _ => Err(JsErrorBox::type_error(
+                "native binding expected an AudioBufferSourceNode",
+            )),
+        }
+    }
+
+    #[fast]
+    fn set_loop_end(&self, value: f64) -> Result<(), JsErrorBox> {
+        if !value.is_finite() {
+            return Err(JsErrorBox::type_error("loopEnd must be finite"));
+        }
+        match (&self.handle.graph, &self.handle.kind) {
+            (NativeGraph::Offline(graph), NativeNodeKind::BufferSource { node, .. }) => {
+                graph.run_command(false, 0, || mutex(node).set_loop_end(value))
+            }
+            (NativeGraph::Online(graph), NativeNodeKind::OnlineBufferSource { root, .. }) => {
+                root.set_loop_end(value, graph.reserve_control(1)?, &graph.state)
+            }
+            _ => Err(JsErrorBox::type_error(
+                "native binding expected an AudioBufferSourceNode",
+            )),
+        }
+    }
+
     #[getter]
     fn oscillator_type(&self) -> Result<u32, JsErrorBox> {
         match &self.handle.kind {
@@ -1523,6 +1841,38 @@ impl NativeAudioNode {
     }
 
     #[fast]
+    fn start_buffer(&self, when: f64, offset: f64, duration: f64) -> Result<(), JsErrorBox> {
+        if !when.is_finite()
+            || when < 0.0
+            || !offset.is_finite()
+            || offset < 0.0
+            || !duration.is_finite()
+            || duration < 0.0
+        {
+            return Err(JsErrorBox::type_error(
+                "BufferSource start values must be finite and non-negative",
+            ));
+        }
+        match (&self.handle.graph, &self.handle.kind) {
+            (NativeGraph::Offline(graph), NativeNodeKind::BufferSource { node, .. }) => graph
+                .run_command(false, 0, || {
+                    mutex(node).start_at_with_offset_and_duration(when, offset, duration);
+                }),
+            (NativeGraph::Online(graph), NativeNodeKind::OnlineBufferSource { root, .. }) => root
+                .start_buffer_source(
+                    when,
+                    offset,
+                    duration,
+                    graph.reserve_control(1)?,
+                    &graph.state,
+                ),
+            _ => Err(JsErrorBox::type_error(
+                "native binding expected an AudioBufferSourceNode",
+            )),
+        }
+    }
+
+    #[fast]
     fn stop(&self, when: f64) -> Result<(), JsErrorBox> {
         if !when.is_finite() || when < 0.0 {
             return Err(JsErrorBox::type_error(
@@ -1533,11 +1883,16 @@ impl NativeAudioNode {
             (NativeGraph::Offline(graph), NativeNodeKind::Oscillator { node, .. }) => {
                 graph.run_command(false, 0, || mutex(node).stop_at(when))
             }
-            (NativeGraph::Online(graph), NativeNodeKind::OnlineOscillator { root, .. }) => {
-                root.stop(when, graph.reserve_control(1)?, &graph.state)
+            (NativeGraph::Offline(graph), NativeNodeKind::BufferSource { node, .. }) => {
+                graph.run_command(false, 0, || mutex(node).stop_at(when))
             }
+            (
+                NativeGraph::Online(graph),
+                NativeNodeKind::OnlineOscillator { root, .. }
+                | NativeNodeKind::OnlineBufferSource { root, .. },
+            ) => root.stop(when, graph.reserve_control(1)?, &graph.state),
             _ => Err(JsErrorBox::type_error(
-                "native binding expected an OscillatorNode",
+                "native binding expected an AudioScheduledSourceNode",
             )),
         }
     }
@@ -1548,9 +1903,13 @@ impl NativeAudioNode {
             NativeNodeKind::Oscillator { node, .. } => {
                 Ok(mutex(node).completion_token().is_complete())
             }
-            NativeNodeKind::OnlineOscillator { root, .. } => Ok(root.is_complete()),
+            NativeNodeKind::BufferSource { node, .. } => {
+                Ok(mutex(node).completion_token().is_complete())
+            }
+            NativeNodeKind::OnlineOscillator { root, .. }
+            | NativeNodeKind::OnlineBufferSource { root, .. } => Ok(root.is_complete()),
             _ => Err(JsErrorBox::type_error(
-                "native binding expected an OscillatorNode",
+                "native binding expected an AudioScheduledSourceNode",
             )),
         }
     }
@@ -1558,7 +1917,8 @@ impl NativeAudioNode {
     #[getter]
     fn source_id(&self) -> f64 {
         match &self.handle.kind {
-            NativeNodeKind::OnlineOscillator { root, .. } => f64::from(root.id()),
+            NativeNodeKind::OnlineOscillator { root, .. }
+            | NativeNodeKind::OnlineBufferSource { root, .. } => f64::from(root.id()),
             _ => 0.0,
         }
     }
@@ -1618,6 +1978,7 @@ mod tests {
         assert_send_sync::<OfflineAudioContext>();
         assert_send_sync::<GainNode>();
         assert_send_sync::<OscillatorNode>();
+        assert_send_sync::<AudioBufferSourceNode>();
         assert_send_sync::<AudioParam>();
         assert_send_sync::<NativeAudioNode>();
     }

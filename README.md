@@ -10,14 +10,14 @@ ownership model, and hosted silent/CPAL/Cubeb output paths have passed their
 Phase 0 acceptance gates, and the deterministic Phase 1 offline graph is
 complete. The extension now also exposes the first production-bounded online
 slice: `AudioContext`, destination, `GainNode`, fixed-wave `OscillatorNode`,
-scalar `AudioParam.value`, explicit connections, lifecycle methods,
-`statechange`, exactly-once `ended`, and bounded off-isolate `decodeAudioData`
-with both promise and legacy callback forms. The same JavaScript surface renders
-through built-in system output or an embedder-supplied `AudioOutputFactory`.
-`AudioBufferSourceNode`, `ConstantSourceNode`, custom
-`PeriodicWave`, online parameter automation, additional node families, and
-full browser conformance remain later Phase 2/3 slices, so this is not yet a
-complete Web Audio API.
+`AudioBufferSourceNode`, scalar `AudioParam.value`, explicit connections,
+lifecycle methods, `statechange`, exactly-once `ended`, and bounded off-isolate
+`decodeAudioData` with both promise and legacy callback forms. The same
+JavaScript surface renders through built-in system output or an
+embedder-supplied `AudioOutputFactory`. `ConstantSourceNode`, custom
+`PeriodicWave`, online parameter automation, additional node families, and full
+browser conformance remain later Phase 2/3 slices, so this is not yet a complete
+Web Audio API.
 
 The public `AudioBuffer` implements Web IDL conversion, nominal-range and brand
 checks, standard prototype descriptors, `getChannelData()`,
@@ -42,6 +42,16 @@ Value-curve conversion is iterator-safe and capped at 1,048,576 samples before
 the Rust copy; that copy is additionally charged to the isolate and shared-host
 live-byte budgets.
 
+Both graph modes support one-shot `AudioBufferSourceNode` playback with
+`playbackRate`, `detune`, loop bounds, start offset/duration, stop, and `ended`.
+Assigning a buffer acquires the Rust-owned canonical PCM only after the required
+native control capacity is reserved, copies any exposed channel edits back, and
+detaches the exposed views. This bounded slice permits at most one non-null
+buffer assignment and does not permit clearing it afterward. A started online
+source is rooted by its exact native generation until authoritative completion;
+lossy event wakeups are reconciled from completion tokens, and confirmed context
+shutdown releases any callback whose event could not be delivered.
+
 Extension JavaScript uses Deno's captured primordials. Installation is
 idempotent for the same constructor and refuses to overwrite an unrelated
 global. A startup-snapshot smoke test proves that immutable class bootstrap does
@@ -50,12 +60,13 @@ not capture an `AudioHost` or other runtime-native authority.
 The remaining private proof objects and ops cover `CppGC`, owned asynchronous
 work, shared `AudioHost` accounting, and bounded off-thread decoding. Online
 lifecycle ownership, render-death handling, scheduled-source reconciliation,
-exact oscillator graph nodes, and exact connection/control reservations now
-back the public `AudioContext` slice. Their resources are reserved against
-isolate and shared-host ceilings before mutation and remain charged through
-typed rollback or physical retirement. A bounded fake process mixer proves
-that independent hosted graphs and native input can share one physical-output
-owner without coupling clocks or retirement.
+exact oscillator and buffer-source graph nodes, and exact connection/control
+reservations now back the public `AudioContext` slice. Their resources are
+reserved against isolate and shared-host ceilings before mutation and remain
+charged through typed rollback or physical retirement. A bounded fake process
+mixer proves that independent hosted graphs and native input can share one
+physical-output owner without coupling clocks or retirement, including decoded
+PCM played through the public buffer-source surface.
 
 The research baseline is deliberately locked to one compatibility set:
 
@@ -65,9 +76,10 @@ The research baseline is deliberately locked to one compatibility set:
 - `deno_error` 0.7.1
 - `serde_v8` 0.319.0
 - the Smudgy `web-audio-api` fork at commit
-  `3455e57bde836a142faa3083cfbd3635dcf21b79` (the reviewed hosted-output
-  compatibility stack plus exact node, connection, scheduled-source, and
-  control-command reservation lifetimes, based on 1.7.0)
+  `faf6ec34878cc9add6f9e1326508669e8dd7cd4d` (the reviewed hosted-output
+  compatibility stack plus exact node, connection, scheduled-source,
+  buffer-source, PCM-storage, and control-command reservation lifetimes, based
+  on 1.7.0)
 
 The Deno crates move as a coordinated tuple. Upgrade them together in one
 reviewed change, and keep `Cargo.lock` committed so Phase 0 evidence remains
@@ -80,9 +92,9 @@ from this repository at an immutable tag or revision rather than from crates.io.
 The selected engine compiles its complete Symphonia decoder set unconditionally:
 AAC, ADPCM, ALAC, FLAC, MPEG layers I/II/III, PCM, and Vorbis, with AIFF, CAF,
 ISO MP4/M4A, Matroska/WebM, Ogg, and WAV containers. These are native dependency
-capabilities, not a claim that the current extension exposes
-`decodeAudioData`; supported JavaScript behavior is limited to the surface
-listed above and will expand as each vertical slice passes its gate.
+capabilities. The extension exposes them through bounded `decodeAudioData`;
+supported JavaScript behavior is otherwise limited to the surface listed above
+and will expand as each vertical slice passes its gate.
 
 ## Development
 

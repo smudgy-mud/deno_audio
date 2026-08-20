@@ -444,6 +444,80 @@ impl NativeAudioBuffer {
             budget,
         }
     }
+
+    /// Acquire any currently exposed V8 channel views into canonical PCM and
+    /// return a native clone suitable for an owned renderer command.
+    ///
+    /// The clone shares the canonical storage lease. Detaching the exposed
+    /// views first makes the Rust buffer the authoritative snapshot consumed by
+    /// a scheduled source without allowing later JavaScript writes to race it.
+    pub(crate) fn acquire_for_playback(
+        &self,
+        scope: &mut v8::PinScope<'_, '_>,
+    ) -> Result<AudioBuffer, JsErrorBox> {
+        let _complete = self.acquire_channels(scope)?;
+        Ok(self.state.get(scope).canonical.clone())
+    }
+
+    fn acquire_channels(&self, scope: &mut v8::PinScope<'_, '_>) -> Result<bool, JsErrorBox> {
+        let channel_count = self.state.get(scope).exposed.len();
+        let expected_length = self.state.get(scope).canonical.length();
+        let mut complete = true;
+        for channel in 0..channel_count {
+            let Some(exposed) = self.state.get_mut(scope).exposed[channel].take() else {
+                continue;
+            };
+            let Some(view) = exposed.get(scope) else {
+                self.state.get_mut(scope).exposed[channel] = Some(exposed);
+                return Err(JsErrorBox::generic(
+                    "traced AudioBuffer channel view disappeared",
+                ));
+            };
+            let Some(array_buffer) = view.buffer(scope) else {
+                complete = false;
+                continue;
+            };
+            if array_buffer.was_detached() {
+                complete = false;
+                continue;
+            }
+            if view.length() != expected_length {
+                self.state.get_mut(scope).exposed[channel] = Some(exposed);
+                return Err(JsErrorBox::generic(
+                    "AudioBuffer channel view length changed unexpectedly",
+                ));
+            }
+            let Some(store) = view.get_backing_store() else {
+                self.state.get_mut(scope).exposed[channel] = Some(exposed);
+                return Err(JsErrorBox::generic(
+                    "AudioBuffer channel backing store is inconsistent",
+                ));
+            };
+            let byte_offset = view.byte_offset();
+            if array_buffer.detach(None) != Some(true) {
+                self.state.get_mut(scope).exposed[channel] = Some(exposed);
+                return Err(JsErrorBox::generic(
+                    "failed to detach acquired AudioBuffer channel view",
+                ));
+            }
+            let destination = self
+                .state
+                .get_mut(scope)
+                .canonical
+                .get_channel_data_mut(channel);
+            for (sample, destination) in destination.iter_mut().enumerate() {
+                let offset = byte_offset + sample * BYTES_PER_SAMPLE;
+                let source = &store[offset..offset + BYTES_PER_SAMPLE];
+                *destination = f32::from_ne_bytes([
+                    source[0].get(),
+                    source[1].get(),
+                    source[2].get(),
+                    source[3].get(),
+                ]);
+            }
+        }
+        Ok(complete)
+    }
 }
 
 #[op2]
@@ -716,63 +790,7 @@ impl NativeAudioBuffer {
     /// detached; canonical PCM is not overwritten for that channel.
     #[fast]
     fn acquire(&self, scope: &mut v8::PinScope<'_, '_>) -> Result<bool, JsErrorBox> {
-        let channel_count = self.state.get(scope).exposed.len();
-        let expected_length = self.state.get(scope).canonical.length();
-        let mut complete = true;
-        for channel in 0..channel_count {
-            let Some(exposed) = self.state.get_mut(scope).exposed[channel].take() else {
-                continue;
-            };
-            let Some(view) = exposed.get(scope) else {
-                self.state.get_mut(scope).exposed[channel] = Some(exposed);
-                return Err(JsErrorBox::generic(
-                    "traced AudioBuffer channel view disappeared",
-                ));
-            };
-            let Some(array_buffer) = view.buffer(scope) else {
-                complete = false;
-                continue;
-            };
-            if array_buffer.was_detached() {
-                complete = false;
-                continue;
-            }
-            if view.length() != expected_length {
-                self.state.get_mut(scope).exposed[channel] = Some(exposed);
-                return Err(JsErrorBox::generic(
-                    "AudioBuffer channel view length changed unexpectedly",
-                ));
-            }
-            let Some(store) = view.get_backing_store() else {
-                self.state.get_mut(scope).exposed[channel] = Some(exposed);
-                return Err(JsErrorBox::generic(
-                    "AudioBuffer channel backing store is inconsistent",
-                ));
-            };
-            let byte_offset = view.byte_offset();
-            if array_buffer.detach(None) != Some(true) {
-                self.state.get_mut(scope).exposed[channel] = Some(exposed);
-                return Err(JsErrorBox::generic(
-                    "failed to detach acquired AudioBuffer channel view",
-                ));
-            }
-            let destination = self
-                .state
-                .get_mut(scope)
-                .canonical
-                .get_channel_data_mut(channel);
-            for (sample, destination) in destination.iter_mut().enumerate() {
-                let offset = byte_offset + sample * BYTES_PER_SAMPLE;
-                let source = &store[offset..offset + BYTES_PER_SAMPLE];
-                *destination = f32::from_ne_bytes([
-                    source[0].get(),
-                    source[1].get(),
-                    source[2].get(),
-                    source[3].get(),
-                ]);
-            }
-        }
-        Ok(complete)
+        self.acquire_channels(scope)
     }
 }
 

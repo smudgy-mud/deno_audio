@@ -819,6 +819,31 @@ impl NativePhase0OnlineContext {
             channel_interpretation(interpretation)?,
         )
     }
+
+    #[cppgc]
+    #[allow(clippy::too_many_arguments)]
+    fn create_buffer_source(
+        &self,
+        detune: f32,
+        loop_: bool,
+        loop_start: f64,
+        loop_end: f64,
+        playback_rate: f32,
+        channel_count: u32,
+        count_mode: u32,
+        interpretation: u32,
+    ) -> Result<NativeAudioNode, JsErrorBox> {
+        self.graph.create_buffer_source(
+            detune,
+            loop_,
+            loop_start,
+            loop_end,
+            playback_rate,
+            channel_count as usize,
+            channel_count_mode(count_mode)?,
+            channel_interpretation(interpretation)?,
+        )
+    }
 }
 
 fn request_state_change(
