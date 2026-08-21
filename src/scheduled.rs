@@ -1175,6 +1175,7 @@ mod tests {
             AudioLimits::unlimited(),
             Arc::new(SystemAudioOutput::new()),
             AudioEventPumpLiveness::Unref,
+            None,
         ));
         let hub = ContextEventHub::new(Arc::clone(&runtime));
 
@@ -1204,6 +1205,7 @@ mod tests {
             AudioLimits::unlimited(),
             Arc::new(SystemAudioOutput::new()),
             AudioEventPumpLiveness::Unref,
+            None,
         ));
         let hub = ContextEventHub::new(runtime);
         hub.next_source_id.store(u32::MAX, Ordering::Release);

@@ -159,7 +159,14 @@ default `AudioEventPumpLiveness::Unref` lets an otherwise idle `JsRuntime`
 finish even while a context is open; session-style embedders can select
 `AudioEventPumpLiveness::Ref` to keep the event loop alive until online context
 observers retire. Neither mode weakens cancellation-independent native
-teardown. Decode requests
+teardown. Embedders that replace whole runtime generations can create an
+`AudioLifecycleOwner`/`AudioLifecycleRegistrar` pair, install registrar clones
+through `AudioExtensionOptions::lifecycle_registrar`, consume the owner to seal
+the generation, drop its runtimes, and await the exact retirement receipt
+before constructing a replacement. The receipt covers every admitted online
+context across those extension instances and succeeds only after confirmed
+native shutdown releases its host and isolate permits. Offline contexts are
+unchanged and are not part of this drain. Decode requests
 reserve their encoded copy, concurrent job, result dimensions, and every
 wrapper-owned PCM allocation before spawning or growing. Offline render
 requests likewise reserve dimensions, output PCM, and a job slot before native

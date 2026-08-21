@@ -22,6 +22,7 @@ use crate::host::{
     release_atomic, AudioHost, AudioHostLimitError, AudioHostOnlineContextPermit,
     AudioHostReservation, AudioHostResourceKind,
 };
+use crate::lifecycle::{AudioLifecycleLease, AudioLifecycleRegistrar};
 use crate::node::{NativeAudioNode, NativePeriodicWave, OnlineGraph};
 use crate::options::{AudioEventPumpLiveness, AudioLimits, AudioPermissions};
 use crate::scheduled::ContextEventHub;
@@ -32,6 +33,7 @@ pub(crate) struct AudioRuntimeState {
     limits: AudioLimits,
     output: Arc<dyn AudioOutputFactory>,
     event_pump_liveness: AudioEventPumpLiveness,
+    lifecycle_registrar: Option<AudioLifecycleRegistrar>,
     online_contexts: AtomicUsize,
     decode_jobs: AtomicUsize,
     offline_render_jobs: AtomicUsize,
@@ -50,6 +52,7 @@ impl AudioRuntimeState {
         limits: AudioLimits,
         output: Arc<dyn AudioOutputFactory>,
         event_pump_liveness: AudioEventPumpLiveness,
+        lifecycle_registrar: Option<AudioLifecycleRegistrar>,
     ) -> Self {
         Self {
             host,
@@ -57,6 +60,7 @@ impl AudioRuntimeState {
             limits,
             output,
             event_pump_liveness,
+            lifecycle_registrar,
             online_contexts: AtomicUsize::new(0),
             decode_jobs: AtomicUsize::new(0),
             offline_render_jobs: AtomicUsize::new(0),
@@ -79,6 +83,17 @@ impl AudioRuntimeState {
 
     pub(crate) const fn event_pump_refed(&self) -> bool {
         self.event_pump_liveness.is_refed()
+    }
+
+    fn try_admit_lifecycle_observer(&self) -> Result<Option<AudioLifecycleLease>, JsErrorBox> {
+        self.lifecycle_registrar
+            .as_ref()
+            .map(|registrar| {
+                registrar.try_admit().ok_or_else(|| {
+                    JsErrorBox::generic("InvalidStateError: audio runtime generation is retired")
+                })
+            })
+            .transpose()
     }
 
     pub(crate) fn try_reserve_decode_job(
@@ -337,6 +352,7 @@ struct LifecycleObservation {
     isolate_permit: IsolateOnlineContextPermit,
     event_hub: Option<Arc<ContextEventHub>>,
     lifecycle_requests: Option<Weak<LifecycleRequestCoordinator>>,
+    lifecycle_lease: Option<AudioLifecycleLease>,
 }
 
 fn lifecycle_observer(receiver: &mpsc::Receiver<LifecycleObservation>) {
@@ -349,6 +365,7 @@ fn lifecycle_observer(receiver: &mpsc::Receiver<LifecycleObservation>) {
         isolate_permit,
         event_hub,
         lifecycle_requests,
+        lifecycle_lease,
     } = observation;
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| receipt.wait()));
     if let Some(coordinator) = lifecycle_requests.and_then(|weak| weak.upgrade()) {
@@ -360,6 +377,9 @@ fn lifecycle_observer(receiver: &mpsc::Receiver<LifecycleObservation>) {
     if matches!(outcome, Ok(AudioContextShutdownOutcome::Confirmed(_))) {
         host_permit.release_confirmed();
         isolate_permit.release_confirmed();
+        if let Some(lease) = lifecycle_lease {
+            lease.confirm();
+        }
     }
     // Every other result intentionally drops committed permits without
     // decrementing their counters. Unconfirmed output ownership must remain
@@ -701,6 +721,7 @@ fn publish_online_context(
         thread::JoinHandle<()>,
     ),
     permits: (AudioHostOnlineContextPermit, IsolateOnlineContextPermit),
+    mut lifecycle_lease: Option<AudioLifecycleLease>,
 ) -> Result<NativePhase0OnlineContext, JsErrorBox> {
     // Successful build means a physical or logical endpoint may already exist. From this point
     // onward, every unwind must retain accounting unless the observer sees confirmed shutdown.
@@ -708,6 +729,9 @@ fn publish_online_context(
     let (mut host_permit, mut isolate_permit) = permits;
     host_permit.commit();
     isolate_permit.commit();
+    if let Some(lease) = &mut lifecycle_lease {
+        lease.commit();
+    }
 
     let Ok(receipt) = context.shutdown_receipt() else {
         drop(observer_sender);
@@ -728,6 +752,7 @@ fn publish_online_context(
             isolate_permit,
             event_hub: Some(Arc::clone(&event_hub)),
             lifecycle_requests: Some(Arc::downgrade(&lifecycle_requests)),
+            lifecycle_lease,
         })
         .is_err()
     {
@@ -770,6 +795,7 @@ impl NativePhase0OnlineContext {
         let options =
             exact_context_options(&runtime, sample_rate, sink_id, latency_hint, custom_latency)?;
         runtime.permissions.check_playback("AudioContext")?;
+        let mut lifecycle_lease = runtime.try_admit_lifecycle_observer()?;
         let isolate_permit = runtime.try_reserve_online_context()?;
         let host_permit = runtime
             .host
@@ -799,6 +825,9 @@ impl NativePhase0OnlineContext {
                     let mut isolate_permit = isolate_permit;
                     host_permit.commit();
                     isolate_permit.commit();
+                    if let Some(lease) = &mut lifecycle_lease {
+                        lease.commit();
+                    }
                     if observer_sender
                         .send(LifecycleObservation {
                             receipt,
@@ -806,6 +835,7 @@ impl NativePhase0OnlineContext {
                             isolate_permit,
                             event_hub: None,
                             lifecycle_requests: None,
+                            lifecycle_lease,
                         })
                         .is_err()
                     {
@@ -823,6 +853,9 @@ impl NativePhase0OnlineContext {
                 drop(observer_sender);
                 let _ = observer_join.join();
                 abandon_committed(host_permit, isolate_permit);
+                if let Some(mut lease) = lifecycle_lease {
+                    lease.commit();
+                }
                 return Err(JsErrorBox::generic(
                     "AudioContext construction panicked and was quarantined",
                 ));
@@ -835,6 +868,7 @@ impl NativePhase0OnlineContext {
             byte_budget,
             (observer_sender, observer_join),
             (host_permit, isolate_permit),
+            lifecycle_lease,
         )
     }
 
@@ -1195,6 +1229,7 @@ mod tests {
             AudioLimits::default().max_online_contexts(Some(1)),
             Arc::new(web_audio_api::output::SystemAudioOutput::new()),
             AudioEventPumpLiveness::Unref,
+            None,
         ));
         drop(runtime.try_reserve_online_context().unwrap());
         assert_eq!(runtime.online_contexts(), 0);

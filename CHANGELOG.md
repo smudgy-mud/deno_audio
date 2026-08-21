@@ -8,6 +8,14 @@ Web Audio surface.
 
 ## [Unreleased]
 
+### Added
+
+- Embedder-owned runtime-generation lifecycle drain through
+  `AudioLifecycleOwner`, cloneable `AudioLifecycleRegistrar`, and an exact
+  asynchronous retirement receipt. Sealing rejects later online contexts
+  before output preparation and waits for confirmed shutdown of every context
+  admitted across the generation's extension instances.
+
 ## [0.1.0-alpha.1] - 2026-08-19
 
 ### Added

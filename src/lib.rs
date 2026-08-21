@@ -12,6 +12,7 @@ mod binding;
 mod buffer;
 mod decode;
 mod host;
+mod lifecycle;
 mod node;
 mod offline;
 mod online;
@@ -20,6 +21,10 @@ mod scheduled;
 
 pub use host::{
     AudioHost, AudioHostLimitError, AudioHostLimits, AudioHostResourceKind, AudioHostUsage,
+};
+pub use lifecycle::{
+    AudioLifecycleOwner, AudioLifecycleRegistrar, AudioLifecycleRetirement,
+    AudioLifecycleRetirementError,
 };
 pub use options::{
     AllowAllAudioPermissions, AudioEventPumpLiveness, AudioExtensionOptions, AudioLimits,
@@ -77,6 +82,7 @@ deno_core::extension!(
             limits,
             output,
             event_pump_liveness,
+            lifecycle_registrar,
         } = extension_options.options.into_parts();
         let native_audio_byte_limit = limits
             .live_audio_bytes()
@@ -95,6 +101,7 @@ deno_core::extension!(
             limits,
             output,
             event_pump_liveness,
+            lifecycle_registrar,
         )));
     },
 );

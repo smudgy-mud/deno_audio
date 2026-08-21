@@ -5,6 +5,7 @@ use deno_error::JsErrorBox;
 use web_audio_api::output::{AudioOutputFactory, SystemAudioOutput};
 
 use crate::host::AudioHost;
+use crate::lifecycle::AudioLifecycleRegistrar;
 
 /// Whether an online context's native-event observer keeps Deno's event loop alive.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -377,6 +378,7 @@ pub struct AudioExtensionOptions {
     limits: AudioLimits,
     output: Arc<dyn AudioOutputFactory>,
     event_pump_liveness: AudioEventPumpLiveness,
+    lifecycle_registrar: Option<AudioLifecycleRegistrar>,
 }
 
 pub(crate) struct AudioExtensionParts {
@@ -385,6 +387,7 @@ pub(crate) struct AudioExtensionParts {
     pub(crate) limits: AudioLimits,
     pub(crate) output: Arc<dyn AudioOutputFactory>,
     pub(crate) event_pump_liveness: AudioEventPumpLiveness,
+    pub(crate) lifecycle_registrar: Option<AudioLifecycleRegistrar>,
 }
 
 impl fmt::Debug for AudioExtensionOptions {
@@ -394,6 +397,7 @@ impl fmt::Debug for AudioExtensionOptions {
             .field("host", &self.host)
             .field("limits", &self.limits)
             .field("event_pump_liveness", &self.event_pump_liveness)
+            .field("lifecycle_registrar", &self.lifecycle_registrar)
             .finish_non_exhaustive()
     }
 }
@@ -414,6 +418,7 @@ impl AudioExtensionOptions {
             limits: AudioLimits::default(),
             output: Arc::new(SystemAudioOutput::new()),
             event_pump_liveness: AudioEventPumpLiveness::default(),
+            lifecycle_registrar: None,
         }
     }
 
@@ -445,6 +450,18 @@ impl AudioExtensionOptions {
         self
     }
 
+    /// Tracks online-context shutdown for an embedder-defined runtime generation.
+    ///
+    /// Clone one registrar into every extension instance belonging to the
+    /// generation. Retiring its paired [`crate::AudioLifecycleOwner`] seals
+    /// construction and provides an exact, cancellation-independent drain
+    /// receipt. Omitting a registrar preserves detached lifecycle behavior.
+    #[must_use]
+    pub fn lifecycle_registrar(mut self, registrar: AudioLifecycleRegistrar) -> Self {
+        self.lifecycle_registrar = Some(registrar);
+        self
+    }
+
     /// Shared accounting domain used by this extension instance.
     #[must_use]
     pub fn host(&self) -> &Arc<AudioHost> {
@@ -458,6 +475,7 @@ impl AudioExtensionOptions {
             limits: self.limits,
             output: self.output,
             event_pump_liveness: self.event_pump_liveness,
+            lifecycle_registrar: self.lifecycle_registrar,
         }
     }
 }
