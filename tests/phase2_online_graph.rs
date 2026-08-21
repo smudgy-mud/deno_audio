@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use deno_audio::{
     AudioEventPumpLiveness, AudioExtensionOptions, AudioHost, AudioHostLimits, AudioLimits,
-    AudioPermissions,
+    AudioPermissions, SilentAudioOutput,
 };
 use deno_core::{JsRuntime, RuntimeOptions};
 use deno_error::JsErrorBox;
@@ -106,6 +106,69 @@ fn collect_until_online_audio_bytes_retire(runtime: &mut JsRuntime, host: &Audio
         );
         std::thread::yield_now();
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_default_context_renders_with_embedder_selected_silent_output() {
+    let host = Arc::new(AudioHost::default());
+    let mut runtime = runtime_with_options(
+        AudioExtensionOptions::new(Arc::clone(&host))
+            .limits(AudioLimits::unlimited())
+            .output_factory(Arc::new(SilentAudioOutput::new()))
+            .event_pump_liveness(AudioEventPumpLiveness::Ref),
+    );
+    runtime
+        .execute_script(
+            "phase2_silent_default_output.js",
+            r#"
+              const context = new AudioContext();
+              if (context.sinkId !== "") {
+                throw new Error("default sink identity changed");
+              }
+              if (context.state !== "running") {
+                throw new Error("default context did not start");
+              }
+              globalThis.__phase2SilentDefault = (async () => {
+                const assert = (condition, message) => {
+                  if (!condition) throw new Error(message);
+                };
+
+                const oscillator = new OscillatorNode(context, { frequency: 220 });
+                oscillator.connect(context.destination);
+                const ended = new Promise((resolve) => {
+                  oscillator.onended = resolve;
+                });
+                const startedAt = context.currentTime;
+                oscillator.start();
+                oscillator.stop(startedAt + 0.01);
+                await ended;
+                assert(context.currentTime > startedAt,
+                  "silent output did not render or advance time");
+
+                await context.suspend();
+                assert(context.state === "suspended", "suspend did not settle");
+                await context.resume();
+                assert(context.state === "running", "resume did not settle");
+                await context.close();
+                assert(context.state === "closed", "close did not settle");
+                globalThis.__phase2SilentDefaultDone = true;
+              })().catch((error) => {
+                globalThis.__phase2SilentDefaultError = error;
+              });
+            "#,
+        )
+        .expect("default context must not synchronously reject silent output");
+    runtime
+        .run_event_loop(deno_core::PollEventLoopOptions::default())
+        .await
+        .expect("silent default-output scenario should settle");
+    runtime
+        .execute_script(
+            "phase2_silent_default_output_result.js",
+            "if (globalThis.__phase2SilentDefaultError !== undefined) throw globalThis.__phase2SilentDefaultError; if (globalThis.__phase2SilentDefaultDone !== true) throw new Error('silent default-output scenario did not finish'); globalThis.__phase2SilentDefault = undefined; globalThis.__phase2SilentDefaultError = undefined;",
+        )
+        .expect("silent default-output scenario should finish");
+    wait_for_online_retirement(&host);
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -2,7 +2,7 @@ use deno_audio::{
     AudioContextLatencyCategory, AudioContextRenderSizeCategory, AudioOutputConfig,
     AudioOutputContextId, AudioOutputEndpointShutdown, AudioOutputError, AudioOutputEventSink,
     AudioOutputFactory, AudioOutputRequest, AudioOutputStartFailure, AudioRenderCallback,
-    AudioRenderFormat, PreparedAudioOutput, RunningAudioOutput,
+    AudioRenderFormat, PreparedAudioOutput, RunningAudioOutput, SilentAudioOutput,
 };
 
 struct ExternalFactory;
@@ -76,6 +76,7 @@ fn external_factory_can_use_only_deno_audio_contract_names() {
     ) {
     }
     assert_factory::<ExternalFactory>();
+    assert_factory::<SilentAudioOutput>();
     assert_request_getters(
         AudioOutputRequest::context_id,
         AudioOutputRequest::latency_hint,
