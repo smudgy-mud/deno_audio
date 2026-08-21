@@ -6,14 +6,11 @@ use std::time::{Duration, Instant};
 
 use deno_audio::{
     AudioEventPumpLiveness, AudioExtensionOptions, AudioHost, AudioHostLimits, AudioLimits,
-    AudioPermissions, SilentAudioOutput,
+    AudioOutputConfig, AudioOutputError, AudioOutputFactory, AudioOutputRequest, AudioPermissions,
+    AudioRenderFormat, PreparedAudioOutput, SilentAudioOutput, SystemAudioOutput,
 };
 use deno_core::{JsRuntime, RuntimeOptions};
 use deno_error::JsErrorBox;
-use web_audio_api::output::{
-    AudioOutputError, AudioOutputFactory, AudioOutputRequest, PreparedAudioOutput,
-    SystemAudioOutput,
-};
 
 struct CountingSystemOutput {
     calls: Arc<AtomicUsize>,
@@ -27,6 +24,33 @@ impl AudioOutputFactory for CountingSystemOutput {
     ) -> Result<Box<dyn PreparedAudioOutput>, AudioOutputError> {
         self.calls.fetch_add(1, Ordering::AcqRel);
         self.system.prepare(request)
+    }
+}
+
+#[derive(Clone)]
+struct ExactSilentOutput {
+    config: AudioOutputConfig,
+}
+
+impl ExactSilentOutput {
+    fn negotiated_44k1() -> Self {
+        Self {
+            config: AudioOutputConfig::new(
+                AudioRenderFormat::new(44_100., 2, 441).unwrap(),
+                "negotiated-physical-device",
+                0.0125,
+            )
+            .unwrap(),
+        }
+    }
+}
+
+impl AudioOutputFactory for ExactSilentOutput {
+    fn prepare(
+        &self,
+        request: &AudioOutputRequest,
+    ) -> Result<Box<dyn PreparedAudioOutput>, AudioOutputError> {
+        SilentAudioOutput::new().prepare_with_config(request, &self.config)
     }
 }
 
@@ -114,7 +138,7 @@ async fn public_default_context_renders_with_embedder_selected_silent_output() {
     let mut runtime = runtime_with_options(
         AudioExtensionOptions::new(Arc::clone(&host))
             .limits(AudioLimits::unlimited())
-            .output_factory(Arc::new(SilentAudioOutput::new()))
+            .output_factory(Arc::new(ExactSilentOutput::negotiated_44k1()))
             .event_pump_liveness(AudioEventPumpLiveness::Ref),
     );
     runtime
@@ -127,6 +151,12 @@ async fn public_default_context_renders_with_embedder_selected_silent_output() {
               }
               if (context.state !== "running") {
                 throw new Error("default context did not start");
+              }
+              if (context.sampleRate !== 44100) {
+                throw new Error("negotiated sample rate changed");
+              }
+              if (context.outputLatency !== 0.0125) {
+                throw new Error("negotiated output latency changed");
               }
               globalThis.__phase2SilentDefault = (async () => {
                 const assert = (condition, message) => {
