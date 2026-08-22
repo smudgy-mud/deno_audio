@@ -92,6 +92,8 @@ fn tokio_context() -> tokio::runtime::Runtime {
     reason = "one embedded JavaScript conformance scenario keeps descriptor, conversion, and copy assertions in the same realm"
 )]
 fn public_audio_buffer_has_webidl_shape_errors_and_copy_semantics() {
+    let tokio_runtime = tokio_context();
+    let _tokio_context = tokio_runtime.enter();
     let host = Arc::new(AudioHost::default());
     let mut runtime = runtime(Arc::clone(&host), AudioLimits::default());
 

@@ -444,6 +444,8 @@ async fn public_offline_graph_has_brands_overloads_and_closed_connection_semanti
     reason = "the four reservation families share one compact construction/rejection/retirement matrix"
 )]
 fn graph_resource_limits_reject_before_mutation_and_recover_on_drop() {
+    let tokio_runtime = tokio_context();
+    let _tokio_context = tokio_runtime.enter();
     let node_host = Arc::new(AudioHost::default());
     {
         let mut runtime = runtime(
