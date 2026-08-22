@@ -43,7 +43,7 @@ web-audio-api = { git = "https://github.com/smudgy-mud/web-audio-api-rs", rev = 
 
 [dev-dependencies]
 deno_core = { version = "=0.410.0", features = ["unsafe_runtime_options"] }
-tokio = { version = "=1.53.1", features = ["macros", "rt"] }
+tokio = { version = "=1.53.1", features = ["macros", "rt", "time"] }
 web-audio-api = { git = "https://github.com/smudgy-mud/web-audio-api-rs", rev = "13ffdcd0f6c3472526653516f52a9320ef77a893", default-features = false, features = ["diagnostics"] }
 
 [workspace]

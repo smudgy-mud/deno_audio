@@ -127,8 +127,21 @@ mod tests {
             .request_garbage_collection_for_testing(v8::GarbageCollectionType::Full);
     }
 
+    /// V8 posts delayed garbage-collector tasks that `deno_core` schedules on
+    /// the tokio handle captured at `JsRuntime` construction and aborts the
+    /// process when none exists; synchronous tests enter this runtime's
+    /// context before constructing a `JsRuntime`.
+    fn tokio_context() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("the test tokio runtime must build")
+    }
+
     #[test]
     fn cppgc_dispatch_tracing_and_finalization_are_real() {
+        let tokio_runtime = tokio_context();
+        let _tokio_context = tokio_runtime.enter();
         let mut runtime = runtime();
         let metrics = metrics(&runtime);
 

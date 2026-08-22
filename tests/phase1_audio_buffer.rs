@@ -75,6 +75,17 @@ fn collect_until(runtime: &mut JsRuntime, host: &AudioHost, expected: usize) {
     }
 }
 
+/// V8 posts delayed garbage-collector tasks that `deno_core` schedules on the
+/// tokio handle captured at `JsRuntime` construction and aborts the process
+/// when none exists; synchronous tests enter this runtime's context before
+/// constructing a `JsRuntime`.
+fn tokio_context() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("the test tokio runtime must build")
+}
+
 #[test]
 #[allow(
     clippy::too_many_lines,
@@ -278,6 +289,8 @@ fn public_audio_buffer_has_webidl_shape_errors_and_copy_semantics() {
 
 #[test]
 fn copies_do_not_expose_channels_and_quota_failures_recover() {
+    let tokio_runtime = tokio_context();
+    let _tokio_context = tokio_runtime.enter();
     let host = Arc::new(AudioHost::new(
         AudioHostLimits::unlimited().max_live_audio_bytes(Some(31)),
     ));
@@ -345,6 +358,8 @@ fn copies_do_not_expose_channels_and_quota_failures_recover() {
 
 #[test]
 fn configured_buffer_dimensions_refuse_before_native_allocation() {
+    let tokio_runtime = tokio_context();
+    let _tokio_context = tokio_runtime.enter();
     let host = Arc::new(AudioHost::default());
     let mut runtime = runtime(
         Arc::clone(&host),
@@ -397,6 +412,8 @@ fn configured_buffer_dimensions_refuse_before_native_allocation() {
 
 #[test]
 fn bootstrap_installation_is_idempotent_and_refuses_collisions() {
+    let tokio_runtime = tokio_context();
+    let _tokio_context = tokio_runtime.enter();
     let _runtime = JsRuntime::new(RuntimeOptions {
         extensions: vec![
             deno_webidl::deno_webidl::init(),
@@ -418,6 +435,8 @@ fn bootstrap_installation_is_idempotent_and_refuses_collisions() {
 
 #[test]
 fn public_buffer_paths_resist_prototype_pollution_and_reject_cloning() {
+    let tokio_runtime = tokio_context();
+    let _tokio_context = tokio_runtime.enter();
     let host = Arc::new(AudioHost::new(
         AudioHostLimits::unlimited().max_live_audio_bytes(Some(31)),
     ));

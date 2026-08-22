@@ -846,8 +846,21 @@ mod tests {
         }
     }
 
+    /// V8 posts delayed garbage-collector tasks that `deno_core` schedules on
+    /// the tokio handle captured at `JsRuntime` construction and aborts the
+    /// process when none exists; synchronous tests enter this runtime's
+    /// context before constructing a `JsRuntime`.
+    fn tokio_context() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("the test tokio runtime must build")
+    }
+
     #[test]
     fn exposure_acquisition_transfer_reservations_and_gc_are_coherent() {
+        let tokio_runtime = tokio_context();
+        let _tokio_context = tokio_runtime.enter();
         let mut runtime = runtime(256);
         let budget = budget(&runtime);
 
@@ -958,6 +971,8 @@ mod tests {
 
     #[test]
     fn reservation_refuses_before_canonical_or_v8_allocation() {
+        let tokio_runtime = tokio_context();
+        let _tokio_context = tokio_runtime.enter();
         let mut runtime = runtime(31);
         let budget = budget(&runtime);
         runtime

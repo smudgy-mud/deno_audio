@@ -36,8 +36,21 @@ fn wait_until(mut predicate: impl FnMut() -> bool) {
     }
 }
 
+/// V8 posts delayed garbage-collector tasks that `deno_core` schedules on the
+/// tokio handle captured at `JsRuntime` construction and aborts the process
+/// when none exists; synchronous tests enter this runtime's context before
+/// constructing a `JsRuntime`.
+fn tokio_context() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("the test tokio runtime must build")
+}
+
 #[test]
 fn dimensions_jobs_and_output_bytes_reject_before_render_construction() {
+    let tokio_runtime = tokio_context();
+    let _tokio_context = tokio_runtime.enter();
     let host = Arc::new(AudioHost::default());
     let mut isolate = runtime(
         Arc::clone(&host),
@@ -173,6 +186,8 @@ async fn accepted_offline_work_is_single_use_and_outlives_its_waiter() {
 
 #[test]
 fn shared_offline_jobs_reject_a_second_isolate_and_recover() {
+    let tokio_runtime = tokio_context();
+    let _tokio_context = tokio_runtime.enter();
     let host = Arc::new(AudioHost::new(
         AudioHostLimits::default().max_offline_render_jobs(Some(1)),
     ));

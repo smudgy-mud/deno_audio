@@ -13,8 +13,21 @@ fn extensions() -> Vec<Extension> {
     ]
 }
 
+/// V8 posts delayed garbage-collector tasks that `deno_core` schedules on the
+/// tokio handle captured at `JsRuntime` construction and aborts the process
+/// when none exists; synchronous tests enter this runtime's context before
+/// constructing a `JsRuntime`.
+fn tokio_context() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("the test tokio runtime must build")
+}
+
 #[test]
 fn extension_loads_after_web_platform_dependencies() {
+    let tokio_runtime = tokio_context();
+    let _tokio_context = tokio_runtime.enter();
     let mut runtime = JsRuntime::new(RuntimeOptions {
         extensions: extensions(),
         ..Default::default()
@@ -60,6 +73,8 @@ fn extension_loads_after_web_platform_dependencies() {
 
 #[test]
 fn extension_bootstrap_survives_a_startup_snapshot() {
+    let tokio_runtime = tokio_context();
+    let _tokio_context = tokio_runtime.enter();
     let snapshot = {
         let runtime = JsRuntimeForSnapshot::new(RuntimeOptions {
             extensions: extensions(),

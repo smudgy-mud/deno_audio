@@ -79,6 +79,17 @@ fn collect_until_all_public_graph_resources_retire(runtime: &mut JsRuntime, host
     }
 }
 
+/// V8 posts delayed garbage-collector tasks that `deno_core` schedules on the
+/// tokio handle captured at `JsRuntime` construction and aborts the process
+/// when none exists; synchronous tests enter this runtime's context before
+/// constructing a `JsRuntime`.
+fn tokio_context() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("the test tokio runtime must build")
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn public_offline_buffer_source_acquires_pcm_and_renders_once() {
     let host = Arc::new(AudioHost::default());
@@ -860,6 +871,8 @@ fn periodic_wave_reserves_coefficients_before_copy_and_storage_until_gc() {
     const TABLE_BYTES: usize = 32 * 1024;
     const TWO_COMPONENT_INPUT_BYTES: usize = 4 * std::mem::size_of::<f32>();
 
+    let tokio_runtime = tokio_context();
+    let _tokio_context = tokio_runtime.enter();
     let rejected_host = Arc::new(AudioHost::default());
     {
         let mut runtime = runtime(
