@@ -132,6 +132,17 @@ fn collect_until_online_audio_bytes_retire(runtime: &mut JsRuntime, host: &Audio
     }
 }
 
+/// V8 posts delayed garbage-collector tasks that `deno_core` schedules on the
+/// tokio handle captured at `JsRuntime` construction and aborts the process
+/// when none exists; synchronous tests enter this runtime's context before
+/// constructing a `JsRuntime`.
+fn tokio_context() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("the test tokio runtime must build")
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn public_default_context_renders_with_embedder_selected_silent_output() {
     let host = Arc::new(AudioHost::default());
@@ -635,6 +646,8 @@ async fn public_online_graph_runs_lifecycle_and_exact_ended() {
 
 #[test]
 fn public_options_and_playback_permission_reject_before_output_prepare() {
+    let tokio_runtime = tokio_context();
+    let _tokio_context = tokio_runtime.enter();
     let host = Arc::new(AudioHost::default());
     let calls = Arc::new(AtomicUsize::new(0));
     let output = Arc::new(CountingSystemOutput {

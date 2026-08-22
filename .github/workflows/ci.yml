@@ -32,9 +32,11 @@ jobs:
             webaudio/resources
             webaudio/the-audio-api/the-audiobuffer-interface
             webaudio/the-audio-api/the-audionode-interface
+            webaudio/the-audio-api/the-constantsourcenode-interface
             webaudio/the-audio-api/the-gainnode-interface
             webaudio/the-audio-api/the-offlineaudiocontext-interface
             webaudio/the-audio-api/the-oscillatornode-interface
+            webaudio/the-audio-api/the-periodicwave-interface
       - uses: dtolnay/rust-toolchain@1.91.0
       - name: Install Linux audio headers
         if: runner.os == 'Linux'

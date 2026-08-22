@@ -1,4 +1,9 @@
-use deno_core::{Extension, JsRuntime, JsRuntimeForSnapshot, RuntimeOptions};
+//! Extension bootstrap evidence for a plain (non-snapshot) runtime. The
+//! startup-snapshot variant lives in `snapshot_smoke.rs`: `JsRuntimeForSnapshot`
+//! configures process-global V8 differently, and the two constructions must not
+//! race one another in a single process.
+
+use deno_core::{Extension, JsRuntime, RuntimeOptions};
 
 fn extensions() -> Vec<Extension> {
     vec![
@@ -13,8 +18,21 @@ fn extensions() -> Vec<Extension> {
     ]
 }
 
+/// V8 posts delayed garbage-collector tasks that `deno_core` schedules on the
+/// tokio handle captured at `JsRuntime` construction and aborts the process
+/// when none exists; synchronous tests enter this runtime's context before
+/// constructing a `JsRuntime`.
+fn tokio_context() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("the test tokio runtime must build")
+}
+
 #[test]
 fn extension_loads_after_web_platform_dependencies() {
+    let tokio_runtime = tokio_context();
+    let _tokio_context = tokio_runtime.enter();
     let mut runtime = JsRuntime::new(RuntimeOptions {
         extensions: extensions(),
         ..Default::default()
@@ -56,37 +74,4 @@ fn extension_loads_after_web_platform_dependencies() {
       "#,
         )
         .expect("the pinned Deno tuple and public extension should initialize");
-}
-
-#[test]
-fn extension_bootstrap_survives_a_startup_snapshot() {
-    let snapshot = {
-        let runtime = JsRuntimeForSnapshot::new(RuntimeOptions {
-            extensions: extensions(),
-            ..RuntimeOptions::default()
-        });
-        runtime.snapshot()
-    };
-    let snapshot = Box::leak(snapshot);
-    let mut runtime = JsRuntime::new(RuntimeOptions {
-        startup_snapshot: Some(snapshot),
-        extensions: extensions(),
-        ..RuntimeOptions::default()
-    });
-
-    runtime
-        .execute_script(
-            "phase1_snapshot_smoke.js",
-            r#"
-              const buffer = new AudioBuffer({ length: 2, sampleRate: 48000 });
-              if (buffer.length !== 2 || buffer.numberOfChannels !== 1) {
-                throw new Error("snapshotted AudioBuffer bootstrap is unusable");
-              }
-              const context = new OfflineAudioContext(1, 128, 48000);
-              if (!(context.createGain() instanceof GainNode)) {
-                throw new Error("snapshotted offline graph bootstrap is unusable");
-              }
-            "#,
-        )
-        .expect("the public bootstrap should be snapshot-friendly");
 }

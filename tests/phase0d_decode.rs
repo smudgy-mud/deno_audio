@@ -118,6 +118,17 @@ async fn assert_decode_rejection(
     });
 }
 
+/// V8 posts delayed garbage-collector tasks that `deno_core` schedules on the
+/// tokio handle captured at `JsRuntime` construction and aborts the process
+/// when none exists; synchronous tests enter this runtime's context before
+/// constructing a `JsRuntime`.
+fn tokio_context() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("the test tokio runtime must build")
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn every_decode_dimension_and_pcm_stage_refuses_and_recovers() {
     let mono_four = pcm16_wav(1, 3_000, &[1, 2, 3, 4]);
@@ -175,6 +186,8 @@ async fn every_decode_dimension_and_pcm_stage_refuses_and_recovers() {
 
 #[test]
 fn configured_decode_sample_rate_rejects_before_input_copy() {
+    let tokio_runtime = tokio_context();
+    let _tokio_context = tokio_runtime.enter();
     let host = Arc::new(AudioHost::default());
     let mut runtime = runtime(
         Arc::clone(&host),
@@ -328,6 +341,8 @@ async fn encoded_job_corrupt_and_canceled_requests_release_all_reservations() {
 
 #[test]
 fn shared_encoded_bytes_and_jobs_exhaust_before_copy_and_recover() {
+    let tokio_runtime = tokio_context();
+    let _tokio_context = tokio_runtime.enter();
     let job_host = Arc::new(AudioHost::new(
         AudioHostLimits::default().max_decode_jobs(Some(1)),
     ));

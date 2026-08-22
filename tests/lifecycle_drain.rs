@@ -221,6 +221,17 @@ async fn poll_once(
     poll_fn(|context| Poll::Ready(retirement.as_mut().poll(context))).await
 }
 
+/// V8 posts delayed garbage-collector tasks that `deno_core` schedules on the
+/// tokio handle captured at `JsRuntime` construction and aborts the process
+/// when none exists; synchronous tests enter this runtime's context before
+/// constructing a `JsRuntime`.
+fn tokio_context() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("the test tokio runtime must build")
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn seal_waits_for_exact_observer_and_rejects_later_construction() {
     let host = Arc::new(AudioHost::new(
@@ -297,6 +308,8 @@ async fn unconfirmed_observer_fails_drain_and_keeps_host_accounting() {
 
 #[test]
 fn dropping_owner_seals_registration_before_output_preparation() {
+    let tokio_runtime = tokio_context();
+    let _tokio_context = tokio_runtime.enter();
     let host = Arc::new(AudioHost::default());
     let (owner, registrar) = AudioLifecycleOwner::new();
     drop(owner);
