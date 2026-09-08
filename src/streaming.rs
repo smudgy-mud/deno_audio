@@ -4,7 +4,7 @@ use std::fs::File;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 use std::thread;
 use std::time::Duration;
@@ -39,6 +39,7 @@ struct Cancellation {
     joined: AtomicBool,
     queued: AtomicUsize,
     source: Weak<PcmSourceNode>,
+    result: Mutex<Option<Result<AudioFileStreamOutcome, String>>>,
 }
 
 impl Cancellation {
@@ -46,6 +47,30 @@ impl Cancellation {
         self.cancelled.store(true, Ordering::Release);
         if let Some(source) = self.source.upgrade() {
             source.stop();
+        }
+    }
+}
+
+/// Context shutdown retains completion without retaining the PCM node or a JS handle.
+#[derive(Clone)]
+pub(crate) struct FileStreamActivity(Arc<Cancellation>);
+
+impl FileStreamActivity {
+    pub(crate) fn complete(&self) -> bool {
+        self.0
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.0.cancel();
+    }
+
+    pub(crate) async fn joined(&self) {
+        while !self.complete() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 }
@@ -114,6 +139,9 @@ pub struct AudioFileStream {
 }
 
 impl AudioFileStream {
+    pub(crate) fn activity(&self) -> FileStreamActivity {
+        FileStreamActivity(Arc::clone(&self.cancellation))
+    }
     /// Admits a paused source using the extension's per-isolate and shared budgets.
     ///
     /// The embedder must authorize the source before calling. `open` runs on the
@@ -149,6 +177,7 @@ impl AudioFileStream {
         let source_limits = SourceLimits {
             channels: runtime.limits().channels(),
             sample_rate: runtime.limits().sample_rate(),
+            file_bytes: runtime.limits().streaming_file_bytes(),
         };
         let lease = lifecycle
             .as_ref()
@@ -251,6 +280,14 @@ impl AudioFileStream {
     pub fn stop(&self) {
         self.cancellation.cancel();
     }
+
+    pub(crate) fn result(&self) -> Option<Result<AudioFileStreamOutcome, String>> {
+        self.cancellation
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 impl Drop for AudioFileStream {
@@ -267,6 +304,7 @@ fn limit_error(error: impl std::fmt::Display) -> JsErrorBox {
 struct SourceLimits {
     channels: Option<usize>,
     sample_rate: Option<u32>,
+    file_bytes: Option<u64>,
 }
 
 struct WorkerReservations {
@@ -338,6 +376,10 @@ fn spawn_observer(
         if let Some(lease) = reservations.lifecycle {
             lease.confirm();
         }
+        *cancellation
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result.clone());
         let _ = sender.send(result);
     })
 }
@@ -364,6 +406,15 @@ fn decode(
         return Ok(AudioFileStreamOutcome::Cancelled);
     }
     let file = open().map_err(|error| format!("file open failed: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("audio file metadata failed: {error}"))?;
+    if limits
+        .file_bytes
+        .is_some_and(|limit| metadata.len() > limit)
+    {
+        return Err("audio file exceeds the configured streaming file-size limit".to_owned());
+    }
     if cancelled(&writer) {
         return Ok(AudioFileStreamOutcome::Cancelled);
     }

@@ -1,9 +1,38 @@
-# Native decoder-worker ownership
+# Streaming audio files
+
+`await context.createFileSource(source)` creates a paused `AudioFileSourceNode`
+after a small PCM prefill (or EOF for a short file). It uses the normal graph's
+connection quotas and context identity checks. The host must install an
+`AudioFileResolver` in the calling isolate with `install_audio_file_resolver`.
+No resolver is installed by default. The host checks read authority and provides
+a single-use opener; source strings do not grant file access.
+
+```js
+const context = new AudioContext();
+const source = await context.createFileSource("/authorized/path/cue.wav");
+const gain = context.createGain();
+gain.gain.value = 0.25;
+source.connect(gain);
+gain.connect(context.destination);
+source.onended = () => context.close();
+source.onerror = () => console.error(source.error);
+source.start();
+```
+
+`start()` and `stop()` are immediate and accept no scheduling arguments. A source
+can start only once; stop permanently silences and cancels it. A failed quota
+admission on start leaves it retryable. Each started source dispatches `ended`
+once, including cancellation. Load errors reject the factory promise; decoder
+errors after start set `source.error` and dispatch `error` before `ended`.
+`context.close()` cancels and joins admitted file workers, including unstarted
+sources, before resolving. Stop itself does not wait for the worker to join.
+Disconnecting a source does not stop it. Seek, looping, playback-rate controls,
+HTTP fetching, and offline file nodes are outside this API.
 
 `AudioFileStream::open` is an experimental Rust embedder API. It uses the current
 extension's `OpState`, a hosted native `AudioContext`, and an already-authorized
 file-opening closure. The closure runs on the decoder thread after admission.
-No JavaScript global, file permission, URL fetch, or package resolver is added.
+The native API grants no file permissions, URL fetch, or package resolver.
 
 The existing engine handles WAV, MP3, FLAC, Ogg/Vorbis, AAC-LC/M4A, ALAC/M4A, and
 AIFF within its mono/stereo and 8–192 kHz limits. Its file decoder is seekable and
@@ -29,9 +58,8 @@ Both paths still share `max_live_audio_bytes`, `max_graph_nodes`, and
 `max_queued_control_commands`. Eight streams reserve 32.125 MiB for working storage
 and queues, leaving 31.875 MiB in a 64 MiB host budget before other audio charges.
 Cached buffers can play repeatedly without holding decoder jobs. Shared memory
-exhaustion can still refuse a buffer load. Connections remain the native
-caller's responsibility; this API does not substitute for the script graph's
-connection admission and identity checks.
+exhaustion can still refuse a buffer load. Native callers connect their own graph;
+the JavaScript factory uses the existing script graph's admission checks.
 
 The 4 MiB working charge is a conservative allowance for the pinned engine's
 bounded PCM packet, resampler, transfer storage, and associated working overhead.
@@ -40,8 +68,10 @@ has fixed 1024-frame input, 256-tap filters, and a maximum 24:1 rate ratio.
 The allowance is held even when the file uses less storage. It is not an
 allocator-enforced limit on process memory. Container indexes, aggregate metadata,
 codec-private allocations, thread stacks, and arbitrary native opener captures
-are not measured by this charge. Before enabling untrusted media, those need an
-additional enforceable policy. Whole-buffer `max_encoded_bytes`,
+are not measured by this charge. The practical default policy also caps encoded
+file size at 256 MiB (`max_streaming_file_bytes`) before decoder construction,
+alongside the engine's packet, metadata-entry, channel and rate limits. This
+does not claim a hard RSS ceiling against hostile codecs or containers. Whole-buffer `max_encoded_bytes`,
 `max_decoded_frames`, and `max_decoded_samples` are not stream-duration limits.
 
 ## Ownership and completion

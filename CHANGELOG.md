@@ -20,6 +20,11 @@ Web Audio surface.
 
 ### Added
 
+- Host-authorized `AudioContext.createFileSource(source)` and `AudioFileSourceNode`
+  with bounded prefill, ordinary graph connections, immediate start/stop, and
+  error/ended events. Context close drains decoder workers, including sources
+  never started. Hosts install an isolate-aware resolver; absent resolvers deny
+  file access. Encoded files default to a 256 MiB size limit.
 - Separate `max_streaming_jobs` admission and `AudioHostUsage::streaming_jobs()`
   accounting from whole-buffer decoding. Per-isolate defaults allow eight streams
   alongside four buffer decodes; both still share the audio byte budget. Cancelled
@@ -29,7 +34,7 @@ Web Audio surface.
   An independent observer joins each decoder before releasing its job/workspace
   charges. Source/isolate/context drop and generation retirement cancel workers;
   generation receipts include their joins even when completion observers disappear.
-  No JavaScript file API or untrusted-media memory ceiling is introduced.
+  The working charge is not an allocator-enforced memory ceiling.
 
 - Embedder-owned runtime-generation lifecycle drain through
   `AudioLifecycleOwner`, cloneable `AudioLifecycleRegistrar`, and an exact

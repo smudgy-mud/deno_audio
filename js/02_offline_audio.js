@@ -21,6 +21,9 @@ import {
   op_phase0_online_close,
   op_phase0_online_resume,
   op_phase0_online_suspend,
+  op_file_source_ready,
+  op_file_source_ended,
+  op_online_close_files,
 } from "ext:core/ops";
 
 const { markNotSerializable } = core.loadExtScript(
@@ -1033,6 +1036,7 @@ class AudioContext extends BaseAudioContext {
       eventPumpPromise: undefined,
       eventPumpRefed: native.eventPumpRefed,
       eventPumpRetired: false,
+      fileWaits: new SafeSet(),
       identity: Symbol("AudioContext identity"),
       native,
       online: true,
@@ -1052,6 +1056,33 @@ class AudioContext extends BaseAudioContext {
 
   get baseLatency() {
     return contextRecord(this).native.baseLatency;
+  }
+
+  async createFileSource(source) {
+    const record = contextRecord(this);
+    if (record.eventPumpClosing || record.state === "closed") {
+      throw domException("The AudioContext is closing or closed.", "InvalidStateError");
+    }
+    webidl.requiredArguments(arguments.length, 1, "AudioContext.createFileSource");
+    source = webidl.converters.DOMString(source, "AudioContext.createFileSource", "Argument 1");
+    const native = callNative("Audio file source", () => record.native.createFileSource(source));
+    const node = new AudioFileSourceNode(constructNode);
+    initializeNode(node, this, native, 0, 1);
+    const file = nodeRecord(node);
+    file.fileSource = true;
+    file.started = false;
+    file.ended = false;
+    file.error = null;
+    try {
+      await op_file_source_ready(native);
+      if (record.eventPumpClosing || record.state === "closed") {
+        throw domException("Audio file load cancelled by context close.", "AbortError");
+      }
+    } catch (error) {
+      native.stopFile();
+      rethrowNativeError(error, "Audio file load");
+    }
+    return node;
   }
 
   get outputLatency() {
@@ -1099,7 +1130,9 @@ class AudioContext extends BaseAudioContext {
 }
 
 async function closeOnlineContext(context, record) {
-  if (record.eventPumpRetired) return;
+  const fileWorkers = op_online_close_files(record.native);
+  for (const pending of new SafeSetIterator(record.fileWaits)) core.refOpPromise(pending);
+  if (record.eventPumpRetired) { await fileWorkers; return drainFileSources(record); }
   record.eventPumpClosing = true;
   if (record.eventPumpPending !== undefined) {
     core.refOpPromise(record.eventPumpPending);
@@ -1108,10 +1141,14 @@ async function closeOnlineContext(context, record) {
     await op_phase0_online_close(record.native);
   } catch (error) {
     record.eventPumpClosing = false;
+    if (!record.eventPumpRefed) {
+      for (const pending of new SafeSetIterator(record.fileWaits)) core.unrefOpPromise(pending);
+    }
     if (!record.eventPumpRefed && record.eventPumpPending !== undefined) {
       core.unrefOpPromise(record.eventPumpPending);
     }
     updateOnlineState(context, record);
+    await fileWorkers;
     rethrowNativeError(error, "AudioContext close");
   }
   try {
@@ -1121,8 +1158,16 @@ async function closeOnlineContext(context, record) {
     }
   } finally {
     releaseOnlineSources(record);
+    await fileWorkers;
   }
+  await drainFileSources(record);
   updateOnlineState(context, record);
+}
+
+async function drainFileSources(record) {
+  for (const pending of new SafeSetIterator(record.fileWaits)) {
+    try { await pending; } catch { /* The source's observer publishes its error. */ }
+  }
 }
 
 class AudioNode extends EventTarget {
@@ -1333,6 +1378,54 @@ function retainStartedSource(source, record) {
   if (contextState.online) {
     const id = record.native.sourceId;
     MapPrototypeSet(contextState.sourceById, id, source);
+  }
+}
+
+function fileSourceRecord(source) {
+  const record = nodeRecord(source);
+  if (record.fileSource !== true) throw new TypeError("Illegal AudioFileSourceNode receiver");
+  return record;
+}
+
+class AudioFileSourceNode extends AudioNode {
+  constructor(key = undefined) { super(key); }
+
+  get error() { return fileSourceRecord(this).error; }
+
+  start() {
+    const record = fileSourceRecord(this);
+    if (contextRecord(record.context).eventPumpClosing) {
+      throw domException("The AudioContext is closing.", "InvalidStateError");
+    }
+    if (arguments.length !== 0) {
+      throw domException("Scheduled file starts are not supported.", "NotSupportedError");
+    }
+    callNative("Audio file start", () => record.native.startFile());
+    record.started = true;
+    const contextState = contextRecord(record.context);
+    const pending = op_file_source_ended(record.native);
+    SetPrototypeAdd(contextState.fileWaits, pending);
+    if (!contextState.eventPumpRefed && !contextState.eventPumpClosing) core.unrefOpPromise(pending);
+    const finish = (error = undefined) => {
+      SetPrototypeDelete(contextState.fileWaits, pending);
+      if (record.ended) return;
+      record.ended = true;
+      if (error !== undefined) {
+        try { rethrowNativeError(error, "Audio file playback"); }
+        catch (converted) { record.error = converted; }
+        dispatch(this, new Event("error"));
+      }
+      dispatch(this, new Event("ended"));
+    };
+    PromisePrototypeThen(pending, () => finish(), finish);
+  }
+
+  stop() {
+    const record = fileSourceRecord(this);
+    if (arguments.length !== 0) {
+      throw domException("Scheduled file stops are not supported.", "NotSupportedError");
+    }
+    callNative("Audio file stop", () => record.native.stopFile());
   }
 }
 
@@ -1870,6 +1963,8 @@ const PeriodicWavePrototype = PeriodicWave.prototype;
 webidl.configureInterface(OscillatorNode);
 const OscillatorNodePrototype = OscillatorNode.prototype;
 webidl.configureInterface(AudioParam);
+webidl.configureInterface(AudioFileSourceNode);
+const AudioFileSourceNodePrototype = AudioFileSourceNode.prototype;
 const AudioParamPrototype = AudioParam.prototype;
 webidl.configureInterface(OfflineAudioCompletionEvent);
 const OfflineAudioCompletionEventPrototype = OfflineAudioCompletionEvent.prototype;
@@ -1877,6 +1972,8 @@ const OfflineAudioCompletionEventPrototype = OfflineAudioCompletionEvent.prototy
 defineEventHandler(BaseAudioContextPrototype, "statechange");
 defineEventHandler(OfflineAudioContextPrototype, "complete");
 defineEventHandler(AudioScheduledSourceNodePrototype, "ended");
+defineEventHandler(AudioFileSourceNodePrototype, "ended");
+defineEventHandler(AudioFileSourceNodePrototype, "error");
 
 webidl.converters.BaseAudioContext = webidl.createInterfaceConverter(
   "BaseAudioContext",
@@ -1896,6 +1993,7 @@ webidl.converters.PeriodicWave = webidl.createInterfaceConverter(
 );
 
 const publicPrototypes = [
+  AudioFileSourceNodePrototype,
   BaseAudioContextPrototype,
   AudioContextPrototype,
   OfflineAudioContextPrototype,
@@ -1915,6 +2013,7 @@ for (let i = 0; i < publicPrototypes.length; ++i) {
 }
 
 export {
+  AudioFileSourceNode,
   AudioContext,
   AudioBufferSourceNode,
   ConstantSourceNode,

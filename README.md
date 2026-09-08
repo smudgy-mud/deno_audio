@@ -48,10 +48,12 @@ automation, further node families, and full browser conformance are future
 work. The precise guarantees behind each of these are recorded in
 [`SEMANTICS.md`](SEMANTICS.md).
 
-The experimental Rust-only [`AudioFileStream`](STREAMING.md) API adds incremental
-local-file workers with per-isolate/shared admission and cancellation-independent
-join ownership. Its fixed workspace charge is not a complete untrusted-media
-memory limit; source authorization and script bindings remain embedder work.
+[`AudioContext.createFileSource(source)`](STREAMING.md) plays local audio files
+incrementally through the existing graph, without assembling the file or decoded
+sound in memory. File access requires an embedder-installed `AudioFileResolver`;
+it is denied by default. The Rust `AudioFileStream` API supplies admitted workers
+with cancellation-independent join ownership. Its workspace charge is an allowance,
+not an allocator-enforced process memory ceiling.
 
 ## Usage
 

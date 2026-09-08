@@ -11,6 +11,7 @@
 mod binding;
 mod buffer;
 mod decode;
+mod file_source;
 mod host;
 mod lifecycle;
 mod node;
@@ -19,6 +20,8 @@ mod online;
 mod options;
 mod scheduled;
 mod streaming;
+
+pub use file_source::{install_audio_file_resolver, AudioFileOpener, AudioFileResolver};
 
 pub use streaming::{
     AudioFileStream, AudioFileStreamCompletion, AudioFileStreamOutcome,
@@ -58,6 +61,9 @@ deno_core::extension!(
         online::op_phase0_online_close,
         scheduled::op_phase0_wait_ended,
         scheduled::op_online_wait_events,
+        file_source::op_file_source_ready,
+        file_source::op_file_source_ended,
+        file_source::op_online_close_files,
     ],
     objects = [
         binding::NativePhase0Probe,

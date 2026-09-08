@@ -4,6 +4,7 @@ import { installGlobal } from "ext:deno_audio/00_webidl.js";
 import { AudioBuffer } from "ext:deno_audio/01_audio_buffer.js";
 import {
   AudioBufferSourceNode,
+  AudioFileSourceNode,
   AudioContext,
   ConstantSourceNode,
   AudioDestinationNode,
@@ -20,6 +21,7 @@ import {
 
 installGlobal("AudioBuffer", AudioBuffer);
 installGlobal("AudioBufferSourceNode", AudioBufferSourceNode);
+installGlobal("AudioFileSourceNode", AudioFileSourceNode);
 installGlobal("AudioContext", AudioContext);
 installGlobal("ConstantSourceNode", ConstantSourceNode);
 installGlobal("AudioDestinationNode", AudioDestinationNode);

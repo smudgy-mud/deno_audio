@@ -550,6 +550,9 @@ pub(crate) struct NativePhase0OnlineContext {
 }
 
 impl NativePhase0OnlineContext {
+    pub(crate) fn take_file_workers(&self) -> Vec<crate::streaming::FileStreamActivity> {
+        self.graph.take_file_workers()
+    }
     pub(crate) fn event_hub(&self) -> Arc<ContextEventHub> {
         Arc::clone(&self.state.event_hub)
     }
@@ -955,6 +958,15 @@ impl NativePhase0OnlineContext {
     #[cppgc]
     fn destination(&self) -> Result<NativeAudioNode, JsErrorBox> {
         self.graph.destination()
+    }
+
+    #[cppgc]
+    fn create_file_source(
+        &self,
+        state: &mut OpState,
+        #[string] source: &str,
+    ) -> Result<NativeAudioNode, JsErrorBox> {
+        self.graph.create_file_source(state, source)
     }
 
     #[cppgc]
