@@ -15,15 +15,21 @@ Each stream reserves, before opening or spawning:
 
 | Resource | Charge | Release point |
 | --- | --- | --- |
-| Decoder job | One, per isolate and shared host | Observer has joined the decoder |
+| Streaming job | One, per isolate and shared host | Observer has joined the decoder |
 | Working storage | 4 MiB, per isolate and shared host | Observer has joined the decoder |
 | PCM queue | 16 KiB, per isolate and shared host | Graph reclamation and all queue/state handles released |
 | Graph node | One, per isolate and shared host | Same physical lifetime as the PCM queue |
 | Construction command | One, per isolate and shared host | Existing engine command-consumption/rollback contract |
 
-These reuse `max_decode_jobs`, `max_live_audio_bytes`, `max_graph_nodes`, and
-`max_queued_control_commands`; streams compete with existing audio work rather
-than maintaining a separate unbounded quota pool. Connections remain the native
+`max_streaming_jobs` limits streaming workers independently of the whole-buffer
+`max_decode_jobs` slots used by `decodeAudioData`. Default per-isolate limits allow
+eight streams and four buffer decodes. Set an explicit shared-host streaming limit
+as well: `AudioHostLimits::default()` and `unlimited()` have no aggregate ceiling.
+Both paths still share `max_live_audio_bytes`, `max_graph_nodes`, and
+`max_queued_control_commands`. Eight streams reserve 32.125 MiB for working storage
+and queues, leaving 31.875 MiB in a 64 MiB host budget before other audio charges.
+Cached buffers can play repeatedly without holding decoder jobs. Shared memory
+exhaustion can still refuse a buffer load. Connections remain the native
 caller's responsibility; this API does not substitute for the script graph's
 connection admission and identity checks.
 
@@ -80,3 +86,7 @@ worker panic, and injected observer/decoder spawn failures. A gated thread-local
 pending until actual thread exit, even after the completion receipt and isolate
 are dropped. A real `JsRuntime` teardown test verifies the extension installs the
 owner and cancels a blocked opener without abandoning its join obligation.
+An output-capture test mixes eight synthetic speech streams with three voices
+sharing a cached cue, then verifies cancelling one stream leaves the other audio
+playing. A JavaScript integration test admits four concurrent `decodeAudioData`
+calls and plays a cached cue eight times while all eight streaming slots are held.

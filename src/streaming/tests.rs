@@ -9,6 +9,8 @@ use std::time::Instant;
 use web_audio_api::node::AudioNode;
 use web_audio_api::output::SilentAudioOutput;
 
+mod playback;
+
 fn state(host: Arc<AudioHost>, limits: AudioLimits, registrar: AudioLifecycleRegistrar) -> OpState {
     let mut state = OpState::new(None);
     state.put(DecoderWorkerOwner::default());
@@ -101,7 +103,7 @@ async fn eof_releases_worker_charges_but_keeps_queued_pcm_until_graph_reclamatio
         AudioFileStreamOutcome::Eof
     );
     assert_eq!(stream.queued_frames(), 129);
-    assert_eq!(host.usage().decode_jobs(), 0);
+    assert_eq!(host.usage().streaming_jobs(), 0);
     assert_eq!(host.usage().live_audio_bytes(), STREAM_PCM_QUEUE_BYTES);
     assert_eq!(host.usage().graph_nodes(), 1);
     stream.node().connect(&context.destination());
@@ -124,14 +126,14 @@ async fn refusal_precedes_open_and_leaves_local_and_shared_budgets_reusable() {
                 AudioHostLimits::unlimited()
                     .max_live_audio_bytes(Some(STREAM_DECODER_WORKING_BYTES))
             } else {
-                AudioHostLimits::unlimited().max_decode_jobs(Some(0))
+                AudioHostLimits::unlimited().max_streaming_jobs(Some(0))
             };
             let limits = if !local {
                 AudioLimits::unlimited()
             } else if bytes {
                 AudioLimits::unlimited().max_live_audio_bytes(Some(STREAM_DECODER_WORKING_BYTES))
             } else {
-                AudioLimits::unlimited().max_decode_jobs(Some(0))
+                AudioLimits::unlimited().max_streaming_jobs(Some(0))
             };
             let host = Arc::new(AudioHost::new(host_limits));
             let (owner, registrar) = AudioLifecycleOwner::new();
@@ -145,7 +147,7 @@ async fn refusal_precedes_open_and_leaves_local_and_shared_budgets_reusable() {
                     Err(std::io::Error::other("must not open"))
                 })
                 .is_err());
-                assert_eq!(host.usage().decode_jobs(), 0);
+                assert_eq!(host.usage().streaming_jobs(), 0);
                 assert_eq!(host.usage().live_audio_bytes(), 0);
                 assert_eq!(state.borrow::<Arc<NativeAudioByteBudget>>().used(), 0);
                 assert_eq!(host.usage().graph_nodes(), 0);
@@ -160,7 +162,7 @@ async fn refusal_precedes_open_and_leaves_local_and_shared_budgets_reusable() {
 #[tokio::test]
 async fn shared_job_limit_applies_across_isolates_and_recovers_after_join() {
     let host = Arc::new(AudioHost::new(
-        AudioHostLimits::unlimited().max_decode_jobs(Some(1)),
+        AudioHostLimits::unlimited().max_streaming_jobs(Some(1)),
     ));
     let (owner, registrar) = AudioLifecycleOwner::new();
     let mut first = state(Arc::clone(&host), AudioLimits::default(), registrar.clone());
@@ -215,7 +217,7 @@ async fn source_drop_isolate_drop_context_close_and_generation_seal_cancel_full_
                 .unwrap(),
             AudioFileStreamOutcome::Cancelled
         );
-        assert_eq!(host.usage().decode_jobs(), 0);
+        assert_eq!(host.usage().streaming_jobs(), 0);
         if let Some(retirement) = retirement {
             retirement.await.unwrap();
         }
@@ -233,14 +235,14 @@ async fn existing_audio_charges_and_graph_refusal_block_streams_before_open() {
     let mut state = state(
         Arc::clone(&host),
         AudioLimits::unlimited()
-            .max_decode_jobs(Some(1))
+            .max_streaming_jobs(Some(1))
             .max_live_audio_bytes(Some(STREAM_DECODER_WORKING_BYTES + STREAM_PCM_QUEUE_BYTES)),
         registrar,
     );
     let context = context();
     let runtime = Arc::clone(state.borrow::<Arc<AudioRuntimeState>>());
     let budget = Arc::clone(state.borrow::<Arc<NativeAudioByteBudget>>());
-    let other_job = runtime.try_reserve_decode_job().unwrap();
+    let other_job = runtime.try_reserve_streaming_job().unwrap();
     assert!(AudioFileStream::open(&mut state, &context, || panic!(
         "job refusal must precede open"
     ))
@@ -259,7 +261,7 @@ async fn existing_audio_charges_and_graph_refusal_block_streams_before_open() {
         "closed graph must precede open"
     ))
     .is_err());
-    assert_eq!(host.usage().decode_jobs(), 0);
+    assert_eq!(host.usage().streaming_jobs(), 0);
     assert_eq!(host.usage().live_audio_bytes(), 0);
     assert_eq!(host.usage().graph_nodes(), 0);
     assert_eq!(host.usage().queued_control_commands(), 0);
@@ -283,7 +285,7 @@ async fn source_dimensions_respect_isolate_policy_before_publishing_pcm() {
         .unwrap_err()
         .contains("channel/sample-rate limit"));
     assert_eq!(stream.queued_frames(), 0);
-    assert_eq!(host.usage().decode_jobs(), 0);
+    assert_eq!(host.usage().streaming_jobs(), 0);
     drop(stream);
     owner.retire().await.unwrap();
     context.close_sync();
@@ -314,7 +316,7 @@ async fn observer_and_decoder_spawn_failure_roll_back_without_opening() {
             drop(stream);
         }
         assert!(!called.load(Ordering::Acquire));
-        assert_eq!(host.usage().decode_jobs(), 0);
+        assert_eq!(host.usage().streaming_jobs(), 0);
         wait_for(|| host.usage().live_audio_bytes() == 0 && host.usage().graph_nodes() == 0).await;
         owner.retire().await.unwrap();
         context.close_sync();
@@ -361,14 +363,14 @@ async fn dropped_observer_and_isolate_do_not_release_a_worker_blocked_in_thread_
             .await
             .is_err()
     );
-    assert_eq!(host.usage().decode_jobs(), 1);
+    assert_eq!(host.usage().streaming_jobs(), 1);
     assert!(host.usage().live_audio_bytes() >= STREAM_DECODER_WORKING_BYTES);
     release_tx.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), retirement)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(host.usage().decode_jobs(), 0);
+    assert_eq!(host.usage().streaming_jobs(), 0);
     wait_for(|| host.usage().live_audio_bytes() == 0).await;
     context.close_sync();
 }
@@ -390,7 +392,7 @@ async fn open_decode_and_panic_failures_join_and_return_admission() {
         })
         .unwrap();
         assert!(completed(&mut stream).await.is_err());
-        assert_eq!(host.usage().decode_jobs(), 0);
+        assert_eq!(host.usage().streaming_jobs(), 0);
         assert_eq!(host.usage().live_audio_bytes(), STREAM_PCM_QUEUE_BYTES);
         drop(stream);
         wait_for(|| host.usage().live_audio_bytes() == 0).await;

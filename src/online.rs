@@ -36,6 +36,7 @@ pub(crate) struct AudioRuntimeState {
     lifecycle_registrar: Option<AudioLifecycleRegistrar>,
     online_contexts: AtomicUsize,
     decode_jobs: AtomicUsize,
+    streaming_jobs: AtomicUsize,
     offline_render_jobs: AtomicUsize,
     graph_nodes: AtomicUsize,
     graph_connections: AtomicUsize,
@@ -63,6 +64,7 @@ impl AudioRuntimeState {
             lifecycle_registrar,
             online_contexts: AtomicUsize::new(0),
             decode_jobs: AtomicUsize::new(0),
+            streaming_jobs: AtomicUsize::new(0),
             offline_render_jobs: AtomicUsize::new(0),
             graph_nodes: AtomicUsize::new(0),
             graph_connections: AtomicUsize::new(0),
@@ -108,6 +110,12 @@ impl AudioRuntimeState {
         self: &Arc<Self>,
     ) -> Result<IsolateReservation, JsErrorBox> {
         self.try_reserve_resource(IsolateResourceKind::DecodeJobs, 1)
+    }
+
+    pub(crate) fn try_reserve_streaming_job(
+        self: &Arc<Self>,
+    ) -> Result<IsolateReservation, JsErrorBox> {
+        self.try_reserve_resource(IsolateResourceKind::StreamingJobs, 1)
     }
 
     pub(crate) fn try_reserve_offline_render_job(
@@ -182,6 +190,11 @@ impl AudioRuntimeState {
             IsolateResourceKind::DecodeJobs => {
                 (&self.decode_jobs, self.limits.decode_jobs(), "decode job")
             }
+            IsolateResourceKind::StreamingJobs => (
+                &self.streaming_jobs,
+                self.limits.streaming_jobs(),
+                "streaming job",
+            ),
             IsolateResourceKind::OfflineRenderJobs => (
                 &self.offline_render_jobs,
                 self.limits.offline_render_jobs(),
@@ -290,6 +303,7 @@ impl AudioRuntimeState {
 #[derive(Clone, Copy)]
 enum IsolateResourceKind {
     DecodeJobs,
+    StreamingJobs,
     OfflineRenderJobs,
     GraphNodes,
     GraphConnections,
@@ -314,6 +328,7 @@ impl Drop for IsolateReservation {
     fn drop(&mut self) {
         let counter = match self.resource {
             IsolateResourceKind::DecodeJobs => &self.runtime.decode_jobs,
+            IsolateResourceKind::StreamingJobs => &self.runtime.streaming_jobs,
             IsolateResourceKind::OfflineRenderJobs => &self.runtime.offline_render_jobs,
             IsolateResourceKind::GraphNodes => &self.runtime.graph_nodes,
             IsolateResourceKind::GraphConnections => &self.runtime.graph_connections,

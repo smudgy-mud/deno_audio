@@ -159,10 +159,10 @@ impl AudioFileStream {
             })
             .transpose()?;
         // All charges precede queue allocation, source opening, and thread creation.
-        let isolate_job = runtime.try_reserve_decode_job()?;
+        let isolate_job = runtime.try_reserve_streaming_job()?;
         let host_job = runtime
             .host()
-            .try_reserve(AudioHostResourceKind::DecodeJobs, 1)
+            .try_reserve(AudioHostResourceKind::StreamingJobs, 1)
             .map_err(limit_error)?;
         let working_bytes = bytes
             .reserve(STREAM_DECODER_WORKING_BYTES)

@@ -20,6 +20,10 @@ Web Audio surface.
 
 ### Added
 
+- Separate `max_streaming_jobs` admission and `AudioHostUsage::streaming_jobs()`
+  accounting from whole-buffer decoding. Per-isolate defaults allow eight streams
+  alongside four buffer decodes; both still share the audio byte budget. Cancelled
+  workers retain streaming slots until joined.
 - Experimental Rust `AudioFileStream` host API: reserve shared/per-isolate jobs,
   working bytes, queue bytes, node, and control admission before opening or spawning.
   An independent observer joins each decoder before releasing its job/workspace
