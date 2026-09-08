@@ -14,6 +14,8 @@ Web Audio surface.
   onto upstream `c01bb99712c1a68387d2898cfcbab55caf92d0b1`. This incorporates
   upstream's borrowed-reader decoding support and preserves the hosted resource
   and lifecycle contracts. The Deno dependency tuple and JavaScript API are unchanged.
+- Update the transitive `rtrb` lockfile entry to 0.3.5, addressing
+  [RUSTSEC-2026-0274](https://rustsec.org/advisories/RUSTSEC-2026-0274.html).
 
 ### Added
 
