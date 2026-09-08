@@ -10,14 +10,22 @@ Web Audio surface.
 
 ### Changed
 
-- Pin the hosted-output engine to `2eb60e4625e677f9510a6c420c9bbd5c74c47e52`, rebased
+- Pin the hosted-output engine to `75dfdeb992f9ae8e63a76e3fcf471ac56f31836d`, rebased
   onto upstream `c01bb99712c1a68387d2898cfcbab55caf92d0b1`. This incorporates
-  upstream's borrowed-reader decoding support and preserves the hosted resource
+  upstream's borrowed-reader decoding support, bounded native PCM streaming,
+  incremental common-format file decoding, and paused-source reclamation. It preserves the hosted resource
   and lifecycle contracts. The Deno dependency tuple and JavaScript API are unchanged.
 - Update the transitive `rtrb` lockfile entry to 0.3.5, addressing
   [RUSTSEC-2026-0274](https://rustsec.org/advisories/RUSTSEC-2026-0274.html).
 
 ### Added
+
+- Experimental Rust `AudioFileStream` host API: reserve shared/per-isolate jobs,
+  working bytes, queue bytes, node, and control admission before opening or spawning.
+  An independent observer joins each decoder before releasing its job/workspace
+  charges. Source/isolate/context drop and generation retirement cancel workers;
+  generation receipts include their joins even when completion observers disappear.
+  No JavaScript file API or untrusted-media memory ceiling is introduced.
 
 - Embedder-owned runtime-generation lifecycle drain through
   `AudioLifecycleOwner`, cloneable `AudioLifecycleRegistrar`, and an exact

@@ -3356,7 +3356,7 @@ dependencies = [
 [[package]]
 name = "web-audio-api"
 version = "1.7.0"
-source = "git+https://github.com/smudgy-mud/web-audio-api-rs?rev=2eb60e4625e677f9510a6c420c9bbd5c74c47e52#2eb60e4625e677f9510a6c420c9bbd5c74c47e52"
+source = "git+https://github.com/smudgy-mud/web-audio-api-rs?rev=75dfdeb992f9ae8e63a76e3fcf471ac56f31836d#75dfdeb992f9ae8e63a76e3fcf471ac56f31836d"
 dependencies = [
  "almost",
  "arc-swap",
@@ -3378,6 +3378,7 @@ dependencies = [
  "no_denormals",
  "num-complex",
  "realfft",
+ "rtrb",
  "rubato 0.16.2",
  "smallvec",
  "symphonia 0.6.1",

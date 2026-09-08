@@ -77,6 +77,14 @@ impl AudioRuntimeState {
         &self.host
     }
 
+    pub(crate) fn decoder_lifecycle(&self) -> Option<AudioLifecycleRegistrar> {
+        self.lifecycle_registrar.clone()
+    }
+
+    pub(crate) fn check_stream_playback(&self) -> Result<(), JsErrorBox> {
+        self.permissions.check_playback("AudioFileStream")
+    }
+
     pub(crate) fn limits(&self) -> &AudioLimits {
         &self.limits
     }

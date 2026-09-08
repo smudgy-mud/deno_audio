@@ -18,6 +18,12 @@ mod offline;
 mod online;
 mod options;
 mod scheduled;
+mod streaming;
+
+pub use streaming::{
+    AudioFileStream, AudioFileStreamCompletion, AudioFileStreamOutcome,
+    STREAM_DECODER_WORKING_BYTES, STREAM_PCM_QUEUE_BYTES,
+};
 
 pub use host::{
     AudioHost, AudioHostLimitError, AudioHostLimits, AudioHostResourceKind, AudioHostUsage,
@@ -76,6 +82,7 @@ deno_core::extension!(
         options: AudioExtensionOptions,
     },
     state = |state, extension_options| {
+        state.put(streaming::DecoderWorkerOwner::default());
         let options::AudioExtensionParts {
             host,
             permissions,

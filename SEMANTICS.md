@@ -19,6 +19,11 @@ so this is not yet a complete Web Audio API.
 
 ## Context lifecycle
 
+Native file-worker admission, accounting, cancellation, and generation-join
+semantics are recorded separately in [STREAMING.md](STREAMING.md). This host API
+does not extend the exposed JavaScript surface or establish an untrusted-media
+memory ceiling.
+
 Same-context `suspend()` and `resume()` calls enter one FIFO coordinator before
 native admission. An accepted transition remains owned after its JavaScript
 promise is discarded; later callers observe that receipt before submitting

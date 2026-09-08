@@ -20,6 +20,7 @@ include = [
   "/LICENSE",
   "/README.md",
   "/SECURITY.md",
+  "/STREAMING.md",
   "/THIRD_PARTY_NOTICES.md",
 ]
 
@@ -39,12 +40,12 @@ deno_web = "=0.288.0"
 deno_webidl = "=0.257.0"
 serde_v8 = "=0.319.0"
 tokio = { version = "=1.53.1", features = ["sync"] }
-web-audio-api = { git = "https://github.com/smudgy-mud/web-audio-api-rs", rev = "2eb60e4625e677f9510a6c420c9bbd5c74c47e52", default-features = false }
+web-audio-api = { git = "https://github.com/smudgy-mud/web-audio-api-rs", rev = "75dfdeb992f9ae8e63a76e3fcf471ac56f31836d", default-features = false }
 
 [dev-dependencies]
 deno_core = { version = "=0.410.0", features = ["unsafe_runtime_options"] }
 tokio = { version = "=1.53.1", features = ["macros", "rt", "time"] }
-web-audio-api = { git = "https://github.com/smudgy-mud/web-audio-api-rs", rev = "2eb60e4625e677f9510a6c420c9bbd5c74c47e52", default-features = false, features = ["diagnostics"] }
+web-audio-api = { git = "https://github.com/smudgy-mud/web-audio-api-rs", rev = "75dfdeb992f9ae8e63a76e3fcf471ac56f31836d", default-features = false, features = ["diagnostics"] }
 
 [workspace]
 resolver = "2"

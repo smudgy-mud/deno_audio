@@ -48,6 +48,11 @@ automation, further node families, and full browser conformance are future
 work. The precise guarantees behind each of these are recorded in
 [`SEMANTICS.md`](SEMANTICS.md).
 
+The experimental Rust-only [`AudioFileStream`](STREAMING.md) API adds incremental
+local-file workers with per-isolate/shared admission and cancellation-independent
+join ownership. Its fixed workspace charge is not a complete untrusted-media
+memory limit; source authorization and script bindings remain embedder work.
+
 ## Usage
 
 The extension installs after Deno's Web Platform base extensions:
