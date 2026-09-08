@@ -48,11 +48,11 @@ automation, further node families, and full browser conformance are future
 work. The precise guarantees behind each of these are recorded in
 [`SEMANTICS.md`](SEMANTICS.md).
 
-[`AudioContext.createFileSource(source)`](STREAMING.md) plays local audio files
-incrementally through the existing graph, without assembling the file or decoded
-sound in memory. File access requires an embedder-installed `AudioFileResolver`;
-it is denied by default. The Rust `AudioFileStream` API supplies admitted workers
-with cancellation-independent join ownership. Its workspace charge is an allowance,
+The native [`AudioFileStream`](STREAMING.md) API supplies incremental file
+workers with admission and cancellation-independent join ownership. File access
+requires an embedder-installed resolver and is denied by default. Embedders own
+their custom script helpers; deno_audio does not add file-source methods or
+constructors to Web Audio globals. The working-storage charge is an allowance,
 not an allocator-enforced process memory ceiling.
 
 ## Usage

@@ -20,11 +20,11 @@ Web Audio surface.
 
 ### Added
 
-- Host-authorized `AudioContext.createFileSource(source)` and `AudioFileSourceNode`
-  with bounded prefill, ordinary graph connections, immediate start/stop, and
-  error/ended events. Context close drains decoder workers, including sources
-  never started. Hosts install an isolate-aware resolver; absent resolvers deny
-  file access. Encoded files default to a 256 MiB size limit.
+- Extension-private graph integration for embedder-owned file-source modules.
+  Web Audio globals and prototypes have no custom file factory or constructor.
+  Context close drains native decoder workers, including sources never started.
+  Hosts install an isolate-aware resolver; absent resolvers deny access.
+  Encoded files default to a 256 MiB size limit.
 - Separate `max_streaming_jobs` admission and `AudioHostUsage::streaming_jobs()`
   accounting from whole-buffer decoding. Per-isolate defaults allow eight streams
   alongside four buffer decodes; both still share the audio byte budget. Cancelled

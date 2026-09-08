@@ -1036,7 +1036,7 @@ class AudioContext extends BaseAudioContext {
       eventPumpPromise: undefined,
       eventPumpRefed: native.eventPumpRefed,
       eventPumpRetired: false,
-      fileWaits: new SafeSet(),
+      hostSourceWaits: new SafeSet(),
       identity: Symbol("AudioContext identity"),
       native,
       online: true,
@@ -1056,33 +1056,6 @@ class AudioContext extends BaseAudioContext {
 
   get baseLatency() {
     return contextRecord(this).native.baseLatency;
-  }
-
-  async createFileSource(source) {
-    const record = contextRecord(this);
-    if (record.eventPumpClosing || record.state === "closed") {
-      throw domException("The AudioContext is closing or closed.", "InvalidStateError");
-    }
-    webidl.requiredArguments(arguments.length, 1, "AudioContext.createFileSource");
-    source = webidl.converters.DOMString(source, "AudioContext.createFileSource", "Argument 1");
-    const native = callNative("Audio file source", () => record.native.createFileSource(source));
-    const node = new AudioFileSourceNode(constructNode);
-    initializeNode(node, this, native, 0, 1);
-    const file = nodeRecord(node);
-    file.fileSource = true;
-    file.started = false;
-    file.ended = false;
-    file.error = null;
-    try {
-      await op_file_source_ready(native);
-      if (record.eventPumpClosing || record.state === "closed") {
-        throw domException("Audio file load cancelled by context close.", "AbortError");
-      }
-    } catch (error) {
-      native.stopFile();
-      rethrowNativeError(error, "Audio file load");
-    }
-    return node;
   }
 
   get outputLatency() {
@@ -1131,8 +1104,8 @@ class AudioContext extends BaseAudioContext {
 
 async function closeOnlineContext(context, record) {
   const fileWorkers = op_online_close_files(record.native);
-  for (const pending of new SafeSetIterator(record.fileWaits)) core.refOpPromise(pending);
-  if (record.eventPumpRetired) { await fileWorkers; return drainFileSources(record); }
+  for (const pending of new SafeSetIterator(record.hostSourceWaits)) core.refOpPromise(pending);
+  if (record.eventPumpRetired) { await fileWorkers; return drainHostSources(record); }
   record.eventPumpClosing = true;
   if (record.eventPumpPending !== undefined) {
     core.refOpPromise(record.eventPumpPending);
@@ -1142,7 +1115,7 @@ async function closeOnlineContext(context, record) {
   } catch (error) {
     record.eventPumpClosing = false;
     if (!record.eventPumpRefed) {
-      for (const pending of new SafeSetIterator(record.fileWaits)) core.unrefOpPromise(pending);
+      for (const pending of new SafeSetIterator(record.hostSourceWaits)) core.unrefOpPromise(pending);
     }
     if (!record.eventPumpRefed && record.eventPumpPending !== undefined) {
       core.unrefOpPromise(record.eventPumpPending);
@@ -1160,12 +1133,12 @@ async function closeOnlineContext(context, record) {
     releaseOnlineSources(record);
     await fileWorkers;
   }
-  await drainFileSources(record);
+  await drainHostSources(record);
   updateOnlineState(context, record);
 }
 
-async function drainFileSources(record) {
-  for (const pending of new SafeSetIterator(record.fileWaits)) {
+async function drainHostSources(record) {
+  for (const pending of new SafeSetIterator(record.hostSourceWaits)) {
     try { await pending; } catch { /* The source's observer publishes its error. */ }
   }
 }
@@ -1381,53 +1354,38 @@ function retainStartedSource(source, record) {
   }
 }
 
-function fileSourceRecord(source) {
-  const record = nodeRecord(source);
-  if (record.fileSource !== true) throw new TypeError("Illegal AudioFileSourceNode receiver");
-  return record;
-}
-
-class AudioFileSourceNode extends AudioNode {
-  constructor(key = undefined) { super(key); }
-
-  get error() { return fileSourceRecord(this).error; }
-
-  start() {
-    const record = fileSourceRecord(this);
-    if (contextRecord(record.context).eventPumpClosing) {
-      throw domException("The AudioContext is closing.", "InvalidStateError");
-    }
-    if (arguments.length !== 0) {
-      throw domException("Scheduled file starts are not supported.", "NotSupportedError");
-    }
-    callNative("Audio file start", () => record.native.startFile());
-    record.started = true;
-    const contextState = contextRecord(record.context);
-    const pending = op_file_source_ended(record.native);
-    SetPrototypeAdd(contextState.fileWaits, pending);
-    if (!contextState.eventPumpRefed && !contextState.eventPumpClosing) core.unrefOpPromise(pending);
-    const finish = (error = undefined) => {
-      SetPrototypeDelete(contextState.fileWaits, pending);
-      if (record.ended) return;
-      record.ended = true;
-      if (error !== undefined) {
-        try { rethrowNativeError(error, "Audio file playback"); }
-        catch (converted) { record.error = converted; }
-        dispatch(this, new Event("error"));
-      }
-      dispatch(this, new Event("ended"));
-    };
-    PromisePrototypeThen(pending, () => finish(), finish);
-  }
-
-  stop() {
-    const record = fileSourceRecord(this);
-    if (arguments.length !== 0) {
-      throw domException("Scheduled file stops are not supported.", "NotSupportedError");
-    }
-    callNative("Audio file stop", () => record.native.stopFile());
+// Extension-private host integration. Nothing here is installed on Web Audio
+// globals or prototypes; embedders own their custom source API and naming.
+class HostAudioNode extends AudioNode {
+  constructor(context, native) {
+    super(constructNode);
+    hostContextNative(context);
+    initializeNode(this, context, native, 0, 1);
   }
 }
+
+function hostContextNative(context) {
+  const record = contextRecord(context);
+  if (!record.online) throw new TypeError("An online AudioContext is required");
+  if (record.eventPumpClosing || record.state === "closed") {
+    throw domException("The AudioContext is closing or closed.", "InvalidStateError");
+  }
+  return record.native;
+}
+
+function observeHostSource(context, pending, finish) {
+  const record = contextRecord(context);
+  SetPrototypeAdd(record.hostSourceWaits, pending);
+  if (!record.eventPumpRefed && !record.eventPumpClosing) core.unrefOpPromise(pending);
+  const complete = (error = undefined) => {
+    SetPrototypeDelete(record.hostSourceWaits, pending);
+    finish(error);
+  };
+  PromisePrototypeThen(pending, () => complete(), complete);
+}
+
+function hostSourceReady(native) { return op_file_source_ready(native); }
+function hostSourceEnded(native) { return op_file_source_ended(native); }
 
 class AudioBufferSourceNode extends AudioScheduledSourceNode {
   constructor(context, options = undefined) {
@@ -1963,8 +1921,6 @@ const PeriodicWavePrototype = PeriodicWave.prototype;
 webidl.configureInterface(OscillatorNode);
 const OscillatorNodePrototype = OscillatorNode.prototype;
 webidl.configureInterface(AudioParam);
-webidl.configureInterface(AudioFileSourceNode);
-const AudioFileSourceNodePrototype = AudioFileSourceNode.prototype;
 const AudioParamPrototype = AudioParam.prototype;
 webidl.configureInterface(OfflineAudioCompletionEvent);
 const OfflineAudioCompletionEventPrototype = OfflineAudioCompletionEvent.prototype;
@@ -1972,8 +1928,6 @@ const OfflineAudioCompletionEventPrototype = OfflineAudioCompletionEvent.prototy
 defineEventHandler(BaseAudioContextPrototype, "statechange");
 defineEventHandler(OfflineAudioContextPrototype, "complete");
 defineEventHandler(AudioScheduledSourceNodePrototype, "ended");
-defineEventHandler(AudioFileSourceNodePrototype, "ended");
-defineEventHandler(AudioFileSourceNodePrototype, "error");
 
 webidl.converters.BaseAudioContext = webidl.createInterfaceConverter(
   "BaseAudioContext",
@@ -1993,7 +1947,6 @@ webidl.converters.PeriodicWave = webidl.createInterfaceConverter(
 );
 
 const publicPrototypes = [
-  AudioFileSourceNodePrototype,
   BaseAudioContextPrototype,
   AudioContextPrototype,
   OfflineAudioContextPrototype,
@@ -2013,7 +1966,13 @@ for (let i = 0; i < publicPrototypes.length; ++i) {
 }
 
 export {
-  AudioFileSourceNode,
+  HostAudioNode,
+  hostContextNative,
+  observeHostSource,
+  hostSourceReady,
+  hostSourceEnded,
+  callNative,
+  rethrowNativeError,
   AudioContext,
   AudioBufferSourceNode,
   ConstantSourceNode,

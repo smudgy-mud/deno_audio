@@ -1,33 +1,23 @@
-# Streaming audio files
+# Streaming audio files for embedders
 
-`await context.createFileSource(source)` creates a paused `AudioFileSourceNode`
-after a small PCM prefill (or EOF for a short file). It uses the normal graph's
-connection quotas and context identity checks. The host must install an
-`AudioFileResolver` in the calling isolate with `install_audio_file_resolver`.
-No resolver is installed by default. The host checks read authority and provides
-a single-use opener; source strings do not grant file access.
+The Rust `AudioFileStream` API and extension-private graph bridge let embedders
+provide their own file-playback module. deno_audio adds no file-source globals
+and no `createFileSource` method to `AudioContext`. Smudgy owns the custom
+`smudgy:media` factory and node class; these are not Web Audio standards APIs.
 
-```js
-const context = new AudioContext();
-const source = await context.createFileSource("/authorized/path/cue.wav");
-const gain = context.createGain();
-gain.gain.value = 0.25;
-source.connect(gain);
-gain.connect(context.destination);
-source.onended = () => context.close();
-source.onerror = () => console.error(source.error);
-source.start();
-```
+Hosts install an `AudioFileResolver` in the calling isolate using
+`install_audio_file_resolver`. No resolver is installed by default. The host
+checks read authority and provides a single-use opener; source strings do not
+grant access. Native file nodes use normal graph identity and admission checks.
 
-`start()` and `stop()` are immediate and accept no scheduling arguments. A source
-can start only once; stop permanently silences and cancels it. A failed quota
-admission on start leaves it retryable. Each started source dispatches `ended`
-once, including cancellation. Load errors reject the factory promise; decoder
-errors after start set `source.error` and dispatch `error` before `ended`.
-`context.close()` cancels and joins admitted file workers, including unstarted
-sources, before resolving. Stop itself does not wait for the worker to join.
-Disconnecting a source does not stop it. Seek, looping, playback-rate controls,
-HTTP fetching, and offline file nodes are outside this API.
+The extension-private `HostAudioNode`, `hostContextNative`, and
+`observeHostSource` exports in `02_offline_audio.js` support trusted embedder
+modules. They wrap native sources as ordinary connected nodes, validate online
+context lifetime, and retain completion observers through close. They are not
+installed as public JavaScript globals. The embedder defines its constructor,
+factory, events and playback methods. Context close cancels and joins admitted
+file workers, including sources never started. Native waits expose prefill,
+joined decoder outcome and playback completion without render-thread I/O.
 
 `AudioFileStream::open` is an experimental Rust embedder API. It uses the current
 extension's `OpState`, a hosted native `AudioContext`, and an already-authorized
