@@ -8,6 +8,13 @@ Web Audio surface.
 
 ## [Unreleased]
 
+### Changed
+
+- Pin the hosted-output engine to `2eb60e4625e677f9510a6c420c9bbd5c74c47e52`, rebased
+  onto upstream `c01bb99712c1a68387d2898cfcbab55caf92d0b1`. This incorporates
+  upstream's borrowed-reader decoding support and preserves the hosted resource
+  and lifecycle contracts. The Deno dependency tuple and JavaScript API are unchanged.
+
 ### Added
 
 - Embedder-owned runtime-generation lifecycle drain through

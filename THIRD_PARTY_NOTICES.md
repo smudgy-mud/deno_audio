@@ -11,14 +11,14 @@ each package remains governed by its own license.
 | `deno_web` | 0.288.0 | MIT | <https://crates.io/crates/deno_web/0.288.0> |
 | `deno_webidl` | 0.257.0 | MIT | <https://crates.io/crates/deno_webidl/0.257.0> |
 | `serde_v8` | 0.319.0 | MIT | <https://crates.io/crates/serde_v8/0.319.0> |
-| `web-audio-api` | 1.7.0 hosted-output fork | MIT | <https://github.com/smudgy-mud/web-audio-api-rs/tree/faf6ec34878cc9add6f9e1326508669e8dd7cd4d> |
+| `web-audio-api` | 1.7.0 hosted-output fork | MIT | <https://github.com/smudgy-mud/web-audio-api-rs/tree/2eb60e4625e677f9510a6c420c9bbd5c74c47e52> |
 | Web Platform Tests | `fbc1b90e28b38e919acabeeb14d1b074f2c125ec` | BSD-3-Clause | <https://github.com/web-platform-tests/wpt/tree/fbc1b90e28b38e919acabeeb14d1b074f2c125ec> |
 
 The Deno tuple corresponds to [Deno 2.9.5 commit
 `17fadf33a8df3af9488b9f42efd1f2290d6dc7a3`](https://github.com/denoland/deno/commit/17fadf33a8df3af9488b9f42efd1f2290d6dc7a3).
-The Smudgy fork is based on upstream `web-audio-api` 1.7.0 and is pinned here at
-reviewed hosted-output commit
-`faf6ec34878cc9add6f9e1326508669e8dd7cd4d`. The unmodified upstream commit
+The Smudgy fork is rebased onto upstream `web-audio-api` commit
+`c01bb99712c1a68387d2898cfcbab55caf92d0b1` after 1.7.0 and is pinned here at
+hosted-output commit `2eb60e4625e677f9510a6c420c9bbd5c74c47e52`. The unmodified upstream commit
 `2af21af6ff2bbee17201b2dd2a5ebc56f55c3511` remains the research baseline; the
 pinned fork revision is the selected native production engine.
 

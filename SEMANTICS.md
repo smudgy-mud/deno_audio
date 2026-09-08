@@ -152,7 +152,8 @@ The research baseline is deliberately locked to one compatibility set:
   `Cargo.toml` (the reviewed hosted-output compatibility stack plus exact
   node, connection, scheduled-source, buffer-source, ConstantSource,
   PeriodicWave, PCM-storage, and control-command reservation lifetimes,
-  based on upstream 1.7.0)
+  rebased onto upstream `c01bb99712c1a68387d2898cfcbab55caf92d0b1`, which
+  adds borrowed-reader decoding after 1.7.0)
 
 The Deno crates move as a coordinated tuple. Upgrade them together in one
 reviewed change, and keep `Cargo.lock` committed so Phase 0 evidence remains
