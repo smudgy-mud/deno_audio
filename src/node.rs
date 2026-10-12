@@ -4,7 +4,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
-use deno_core::{op2, v8, GarbageCollected};
+use deno_core::{op2, v8, GarbageCollected, OpState};
 use deno_error::JsErrorBox;
 use web_audio_api::context::{
     AudioContext, AudioControlBatchReservation, AudioControlBatchReservationProvider,
@@ -872,9 +872,33 @@ pub(crate) struct OnlineGraph {
     state: Arc<NativeOnlineContextState>,
     runtime: Arc<AudioRuntimeState>,
     byte_budget: Arc<NativeAudioByteBudget>,
+    file_workers: Mutex<Vec<crate::streaming::FileStreamActivity>>,
 }
 
 impl OnlineGraph {
+    pub(crate) fn create_file_source(
+        self: &Arc<Self>,
+        state: &mut OpState,
+        source: &str,
+    ) -> Result<NativeAudioNode, JsErrorBox> {
+        let context = self.context()?;
+        let opener = crate::file_source::resolve(state, source)?;
+        let stream = crate::AudioFileStream::open(state, &context, opener)?;
+        {
+            let mut workers = mutex(&self.file_workers);
+            workers.retain(|worker| !worker.complete());
+            workers.push(stream.activity());
+        }
+        Ok(NativeAudioNode::from_handle(Arc::new(NativeNodeHandle {
+            graph: NativeGraph::Online(Arc::clone(self)),
+            id: 0,
+            kind: NativeNodeKind::FileSource(Arc::new(crate::file_source::FileSource::new(
+                stream,
+                &self.state,
+                Arc::clone(&self.runtime),
+            ))),
+        })))
+    }
     pub(crate) fn new(
         state: Arc<NativeOnlineContextState>,
         runtime: Arc<AudioRuntimeState>,
@@ -884,7 +908,12 @@ impl OnlineGraph {
             state,
             runtime,
             byte_budget,
+            file_workers: Mutex::default(),
         })
+    }
+
+    pub(crate) fn take_file_workers(&self) -> Vec<crate::streaming::FileStreamActivity> {
+        std::mem::take(&mut *mutex(&self.file_workers))
     }
 
     fn context(&self) -> Result<Arc<AudioContext>, JsErrorBox> {
@@ -1470,6 +1499,7 @@ unsafe impl GarbageCollected for NativePeriodicWave {
 impl NativePeriodicWave {}
 
 enum NativeNodeKind {
+    FileSource(Arc<crate::file_source::FileSource>),
     Destination(AudioDestinationNode),
     Gain {
         node: GainNode,
@@ -1515,6 +1545,7 @@ struct NativeNodeHandle {
 impl NativeNodeHandle {
     fn with_audio_node<T>(&self, operation: impl FnOnce(&dyn AudioNode) -> T) -> T {
         match &self.kind {
+            NativeNodeKind::FileSource(source) => operation(source.stream.node()),
             NativeNodeKind::Destination(node) => operation(node),
             NativeNodeKind::Gain { node, .. } => operation(node),
             NativeNodeKind::Oscillator { node, .. } => operation(&*mutex(node)),
@@ -1551,6 +1582,12 @@ pub(crate) struct NativeAudioNode {
 }
 
 impl NativeAudioNode {
+    pub(crate) fn file_source(&self) -> Result<Arc<crate::file_source::FileSource>, JsErrorBox> {
+        match &self.handle.kind {
+            NativeNodeKind::FileSource(source) => Ok(Arc::clone(source)),
+            _ => Err(JsErrorBox::type_error("expected an audio file source")),
+        }
+    }
     fn from_handle(handle: Arc<NativeNodeHandle>) -> Self {
         Self { handle }
     }
@@ -1580,9 +1617,21 @@ unsafe impl GarbageCollected for NativeAudioNode {
 
 #[op2]
 impl NativeAudioNode {
+    #[fast]
+    fn start_file(&self) -> Result<(), JsErrorBox> {
+        self.file_source()?.start()
+    }
+
+    #[fast]
+    fn stop_file(&self) -> Result<(), JsErrorBox> {
+        self.file_source()?.stop();
+        Ok(())
+    }
+
     #[getter]
     fn kind(&self) -> u32 {
         match &self.handle.kind {
+            NativeNodeKind::FileSource(_) => 6,
             NativeNodeKind::Destination(_) => 0,
             NativeNodeKind::Gain { .. } => 1,
             NativeNodeKind::Oscillator { .. } | NativeNodeKind::OnlineOscillator { .. } => 2,

@@ -11,6 +11,7 @@
 mod binding;
 mod buffer;
 mod decode;
+mod file_source;
 mod host;
 mod lifecycle;
 mod node;
@@ -18,6 +19,14 @@ mod offline;
 mod online;
 mod options;
 mod scheduled;
+mod streaming;
+
+pub use file_source::{install_audio_file_resolver, AudioFileOpener, AudioFileResolver};
+
+pub use streaming::{
+    AudioFileStream, AudioFileStreamCompletion, AudioFileStreamOutcome,
+    STREAM_DECODER_WORKING_BYTES, STREAM_PCM_QUEUE_BYTES,
+};
 
 pub use host::{
     AudioHost, AudioHostLimitError, AudioHostLimits, AudioHostResourceKind, AudioHostUsage,
@@ -52,6 +61,9 @@ deno_core::extension!(
         online::op_phase0_online_close,
         scheduled::op_phase0_wait_ended,
         scheduled::op_online_wait_events,
+        file_source::op_file_source_ready,
+        file_source::op_file_source_ended,
+        file_source::op_online_close_files,
     ],
     objects = [
         binding::NativePhase0Probe,
@@ -76,6 +88,7 @@ deno_core::extension!(
         options: AudioExtensionOptions,
     },
     state = |state, extension_options| {
+        state.put(streaming::DecoderWorkerOwner::default());
         let options::AudioExtensionParts {
             host,
             permissions,

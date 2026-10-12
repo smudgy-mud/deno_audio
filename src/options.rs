@@ -47,6 +47,8 @@ pub struct AudioLimits {
     max_decoded_samples: Option<usize>,
     max_encoded_bytes: Option<usize>,
     max_decode_jobs: Option<usize>,
+    max_streaming_jobs: Option<usize>,
+    max_streaming_file_bytes: Option<u64>,
     max_offline_frames: Option<usize>,
     max_offline_samples: Option<usize>,
     max_offline_render_jobs: Option<usize>,
@@ -76,6 +78,8 @@ impl Default for AudioLimits {
             max_decoded_samples: Some(16 * 1024 * 1024),
             max_encoded_bytes: Some(32 * 1024 * 1024),
             max_decode_jobs: Some(4),
+            max_streaming_jobs: Some(8),
+            max_streaming_file_bytes: Some(256 * 1024 * 1024),
             max_offline_frames: Some(16 * 1024 * 1024),
             max_offline_samples: Some(16 * 1024 * 1024),
             max_offline_render_jobs: Some(2),
@@ -104,6 +108,8 @@ impl AudioLimits {
             max_decoded_samples: None,
             max_encoded_bytes: None,
             max_decode_jobs: None,
+            max_streaming_jobs: None,
+            max_streaming_file_bytes: None,
             max_offline_frames: None,
             max_offline_samples: None,
             max_offline_render_jobs: None,
@@ -178,6 +184,24 @@ impl AudioLimits {
     pub const fn max_decode_jobs(mut self, limit: Option<usize>) -> Self {
         self.max_decode_jobs = limit;
         self
+    }
+
+    /// Sets the active streaming-decoder ceiling independently of whole-buffer decoding.
+    #[must_use]
+    pub const fn max_streaming_jobs(mut self, limit: Option<usize>) -> Self {
+        self.max_streaming_jobs = limit;
+        self
+    }
+
+    /// Sets the encoded file-size ceiling checked before opening the decoder.
+    #[must_use]
+    pub const fn max_streaming_file_bytes(mut self, limit: Option<u64>) -> Self {
+        self.max_streaming_file_bytes = limit;
+        self
+    }
+
+    pub(crate) const fn streaming_file_bytes(&self) -> Option<u64> {
+        self.max_streaming_file_bytes
     }
 
     /// Sets the maximum frame count accepted by one offline render.
@@ -291,6 +315,10 @@ impl AudioLimits {
 
     pub(crate) const fn decode_jobs(&self) -> Option<usize> {
         self.max_decode_jobs
+    }
+
+    pub(crate) const fn streaming_jobs(&self) -> Option<usize> {
+        self.max_streaming_jobs
     }
 
     pub(crate) const fn offline_frames(&self) -> Option<usize> {

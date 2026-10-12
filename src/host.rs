@@ -24,6 +24,7 @@ pub struct AudioHostLimits {
     max_queued_control_commands: Option<usize>,
     max_queued_events: Option<usize>,
     max_decode_jobs: Option<usize>,
+    max_streaming_jobs: Option<usize>,
     max_offline_render_jobs: Option<usize>,
 }
 
@@ -41,6 +42,7 @@ impl AudioHostLimits {
             max_queued_control_commands: None,
             max_queued_events: None,
             max_decode_jobs: None,
+            max_streaming_jobs: None,
             max_offline_render_jobs: None,
         }
     }
@@ -101,10 +103,17 @@ impl AudioHostLimits {
         self
     }
 
-    /// Sets the aggregate concurrent decode-job ceiling.
+    /// Sets the aggregate whole-buffer decode-job ceiling, independent of streams.
     #[must_use]
     pub const fn max_decode_jobs(mut self, limit: Option<usize>) -> Self {
         self.max_decode_jobs = limit;
+        self
+    }
+
+    /// Sets the aggregate streaming-decoder ceiling, independent of buffer loading.
+    #[must_use]
+    pub const fn max_streaming_jobs(mut self, limit: Option<usize>) -> Self {
+        self.max_streaming_jobs = limit;
         self
     }
 
@@ -136,8 +145,10 @@ pub enum AudioHostResourceKind {
     QueuedControlCommands,
     /// Queued native events.
     QueuedEvents,
-    /// Concurrent decode jobs.
+    /// Concurrent whole-buffer decode jobs.
     DecodeJobs,
+    /// Concurrent streaming decoders, including cancelled workers awaiting join.
+    StreamingJobs,
     /// Concurrent offline-render jobs.
     OfflineRenderJobs,
 }
@@ -202,6 +213,7 @@ pub struct AudioHostUsage {
     queued_control_commands: usize,
     queued_events: usize,
     decode_jobs: usize,
+    streaming_jobs: usize,
     offline_render_jobs: usize,
 }
 
@@ -254,10 +266,16 @@ impl AudioHostUsage {
         self.queued_events
     }
 
-    /// Concurrent decode jobs.
+    /// Concurrent whole-buffer decode jobs.
     #[must_use]
     pub const fn decode_jobs(self) -> usize {
         self.decode_jobs
+    }
+
+    /// Concurrent streaming decoders, including cancelled workers awaiting join.
+    #[must_use]
+    pub const fn streaming_jobs(self) -> usize {
+        self.streaming_jobs
     }
 
     /// Concurrent offline-render jobs.
@@ -278,6 +296,7 @@ struct AudioHostCounters {
     queued_control_commands: AtomicUsize,
     queued_events: AtomicUsize,
     decode_jobs: AtomicUsize,
+    streaming_jobs: AtomicUsize,
     offline_render_jobs: AtomicUsize,
 }
 
@@ -324,6 +343,7 @@ impl AudioHost {
                 .load(Ordering::Acquire),
             queued_events: self.counters.queued_events.load(Ordering::Acquire),
             decode_jobs: self.counters.decode_jobs.load(Ordering::Acquire),
+            streaming_jobs: self.counters.streaming_jobs.load(Ordering::Acquire),
             offline_render_jobs: self.counters.offline_render_jobs.load(Ordering::Acquire),
         }
     }
@@ -388,6 +408,10 @@ impl AudioHost {
             AudioHostResourceKind::DecodeJobs => {
                 (&self.counters.decode_jobs, self.limits.max_decode_jobs)
             }
+            AudioHostResourceKind::StreamingJobs => (
+                &self.counters.streaming_jobs,
+                self.limits.max_streaming_jobs,
+            ),
             AudioHostResourceKind::OfflineRenderJobs => (
                 &self.counters.offline_render_jobs,
                 self.limits.max_offline_render_jobs,

@@ -10,19 +10,20 @@ use std::task::{Context, Poll, Waker};
 /// Create an owner/registrar pair with [`AudioLifecycleOwner::new`], clone the
 /// registrar into every extension instance belonging to the generation, then
 /// consume the owner with [`AudioLifecycleOwner::retire`] before dropping those
-/// runtimes. The returned receipt resolves only after every online context
-/// admitted before the seal has confirmed native shutdown.
+/// runtimes. The returned receipt resolves only after every online context and
+/// streaming decoder admitted before the seal has confirmed shutdown or join.
 pub struct AudioLifecycleOwner {
     inner: Arc<AudioLifecycleState>,
 }
 
-/// Cloneable admission authority for online contexts in one runtime generation.
+/// Cloneable admission authority for contexts and streaming decoders in one generation.
 ///
 /// Install clones with
 /// [`AudioExtensionOptions::lifecycle_registrar`](crate::AudioExtensionOptions::lifecycle_registrar).
 /// Registration is linearized with generation retirement: once the owner is
 /// retired (or dropped), later online-context construction is rejected before
-/// output preparation or native context construction.
+/// output preparation or native context construction. Streaming decoders also
+/// reject later admission and observe the seal as a cancellation request.
 #[derive(Clone)]
 pub struct AudioLifecycleRegistrar {
     inner: Arc<AudioLifecycleState>,
@@ -31,18 +32,18 @@ pub struct AudioLifecycleRegistrar {
 /// Receipt for exact retirement of one audio runtime generation.
 ///
 /// Waiting is cancellation-independent. Dropping this future never cancels
-/// native context shutdown or the lifecycle observers proving it.
+/// native context shutdown, decoder joins, or the lifecycle observers proving them.
 #[must_use = "the generation is not proven retired unless this receipt is awaited"]
 pub struct AudioLifecycleRetirement {
     inner: Arc<AudioLifecycleState>,
 }
 
-/// Failure to prove exact retirement of an admitted online context.
+/// Failure to prove exact retirement of an admitted native audio operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum AudioLifecycleRetirementError {
-    /// At least one admitted context lost or returned no confirmed native
-    /// shutdown acknowledgement. Its committed host accounting remains held.
+    /// At least one admitted operation lost or returned no confirmed native
+    /// shutdown acknowledgement. Unconfirmed context accounting remains held.
     UnconfirmedShutdown,
 }
 
@@ -50,7 +51,7 @@ impl fmt::Display for AudioLifecycleRetirementError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnconfirmedShutdown => formatter
-                .write_str("an admitted AudioContext did not provide confirmed native shutdown"),
+                .write_str("an admitted audio operation did not provide confirmed native shutdown"),
         }
     }
 }
@@ -76,9 +77,9 @@ impl AudioLifecycleOwner {
 
     /// Atomically seals this generation and returns its exact drain receipt.
     ///
-    /// Context registrations linearized before this call are included in the
+    /// Context and decoder registrations linearized before this call are included in the
     /// receipt. Registrations linearized afterward are rejected. The receipt
-    /// succeeds only if every included context confirms shutdown.
+    /// succeeds only if every included operation confirms shutdown or join.
     pub fn retire(self) -> AudioLifecycleRetirement {
         self.inner.seal();
         AudioLifecycleRetirement {
@@ -233,6 +234,14 @@ pub(crate) struct AudioLifecycleLease {
 }
 
 impl AudioLifecycleRegistrar {
+    pub(crate) fn is_retired(&self) -> bool {
+        self.inner
+            .status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sealed
+    }
+
     pub(crate) fn try_admit(&self) -> Option<AudioLifecycleLease> {
         self.inner.try_admit()
     }

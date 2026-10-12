@@ -21,6 +21,9 @@ import {
   op_phase0_online_close,
   op_phase0_online_resume,
   op_phase0_online_suspend,
+  op_file_source_ready,
+  op_file_source_ended,
+  op_online_close_files,
 } from "ext:core/ops";
 
 const { markNotSerializable } = core.loadExtScript(
@@ -1033,6 +1036,7 @@ class AudioContext extends BaseAudioContext {
       eventPumpPromise: undefined,
       eventPumpRefed: native.eventPumpRefed,
       eventPumpRetired: false,
+      hostSourceWaits: new SafeSet(),
       identity: Symbol("AudioContext identity"),
       native,
       online: true,
@@ -1099,7 +1103,9 @@ class AudioContext extends BaseAudioContext {
 }
 
 async function closeOnlineContext(context, record) {
-  if (record.eventPumpRetired) return;
+  const fileWorkers = op_online_close_files(record.native);
+  for (const pending of new SafeSetIterator(record.hostSourceWaits)) core.refOpPromise(pending);
+  if (record.eventPumpRetired) { await fileWorkers; return drainHostSources(record); }
   record.eventPumpClosing = true;
   if (record.eventPumpPending !== undefined) {
     core.refOpPromise(record.eventPumpPending);
@@ -1108,10 +1114,14 @@ async function closeOnlineContext(context, record) {
     await op_phase0_online_close(record.native);
   } catch (error) {
     record.eventPumpClosing = false;
+    if (!record.eventPumpRefed) {
+      for (const pending of new SafeSetIterator(record.hostSourceWaits)) core.unrefOpPromise(pending);
+    }
     if (!record.eventPumpRefed && record.eventPumpPending !== undefined) {
       core.unrefOpPromise(record.eventPumpPending);
     }
     updateOnlineState(context, record);
+    await fileWorkers;
     rethrowNativeError(error, "AudioContext close");
   }
   try {
@@ -1121,8 +1131,16 @@ async function closeOnlineContext(context, record) {
     }
   } finally {
     releaseOnlineSources(record);
+    await fileWorkers;
   }
+  await drainHostSources(record);
   updateOnlineState(context, record);
+}
+
+async function drainHostSources(record) {
+  for (const pending of new SafeSetIterator(record.hostSourceWaits)) {
+    try { await pending; } catch { /* The source's observer publishes its error. */ }
+  }
 }
 
 class AudioNode extends EventTarget {
@@ -1335,6 +1353,39 @@ function retainStartedSource(source, record) {
     MapPrototypeSet(contextState.sourceById, id, source);
   }
 }
+
+// Extension-private host integration. Nothing here is installed on Web Audio
+// globals or prototypes; embedders own their custom source API and naming.
+class HostAudioNode extends AudioNode {
+  constructor(context, native) {
+    super(constructNode);
+    hostContextNative(context);
+    initializeNode(this, context, native, 0, 1);
+  }
+}
+
+function hostContextNative(context) {
+  const record = contextRecord(context);
+  if (!record.online) throw new TypeError("An online AudioContext is required");
+  if (record.eventPumpClosing || record.state === "closed") {
+    throw domException("The AudioContext is closing or closed.", "InvalidStateError");
+  }
+  return record.native;
+}
+
+function observeHostSource(context, pending, finish) {
+  const record = contextRecord(context);
+  SetPrototypeAdd(record.hostSourceWaits, pending);
+  if (!record.eventPumpRefed && !record.eventPumpClosing) core.unrefOpPromise(pending);
+  const complete = (error = undefined) => {
+    SetPrototypeDelete(record.hostSourceWaits, pending);
+    finish(error);
+  };
+  PromisePrototypeThen(pending, () => complete(), complete);
+}
+
+function hostSourceReady(native) { return op_file_source_ready(native); }
+function hostSourceEnded(native) { return op_file_source_ended(native); }
 
 class AudioBufferSourceNode extends AudioScheduledSourceNode {
   constructor(context, options = undefined) {
@@ -1915,6 +1966,13 @@ for (let i = 0; i < publicPrototypes.length; ++i) {
 }
 
 export {
+  HostAudioNode,
+  hostContextNative,
+  observeHostSource,
+  hostSourceReady,
+  hostSourceEnded,
+  callNative,
+  rethrowNativeError,
   AudioContext,
   AudioBufferSourceNode,
   ConstantSourceNode,

@@ -48,6 +48,13 @@ automation, further node families, and full browser conformance are future
 work. The precise guarantees behind each of these are recorded in
 [`SEMANTICS.md`](SEMANTICS.md).
 
+The native [`AudioFileStream`](STREAMING.md) API supplies incremental file
+workers with admission and cancellation-independent join ownership. File access
+requires an embedder-installed resolver and is denied by default. Embedders own
+their custom script helpers; deno_audio does not add file-source methods or
+constructors to Web Audio globals. The working-storage charge is an allowance,
+not an allocator-enforced process memory ceiling.
+
 ## Usage
 
 The extension installs after Deno's Web Platform base extensions:
